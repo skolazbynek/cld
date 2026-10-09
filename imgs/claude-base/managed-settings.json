@@ -8,5 +8,19 @@
   },
   "env": {
 	  "OTEL_EXPORTER_OTLP_ENDPOINT": "host.docker.internal:4318"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{"type": "command", "command": "python3 -P /opt/cld/cld/vcs/anchor_guard.py", "timeout": 15}]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": "python3 -P /opt/cld/cld/vcs/anchor_guard.py", "timeout": 15}]
+      }
+    ]
   }
 }

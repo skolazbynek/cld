@@ -16,6 +16,7 @@ if [ -n "${TICKET_MODE:-}" ]; then
     # start`) still sees the previous boot's sentinel. Clear it before any
     # per-repo work, or the host-side readiness wait returns early.
     rm -f /tmp/cld-ticket-ready
+    : > "$CLD_ANCHORS_FILE"
     # /tmp/bin survives too, and it is first on PATH (container-init.sh), so
     # the previous boot's generated wrapper shadows `which claude` on a warm
     # start: the regenerated wrapper would exec the stale wrapper's own path,
@@ -90,6 +91,11 @@ if [ -n "${TICKET_MODE:-}" ]; then
         fi
         REPO_ANCHOR="${CLD_BOOT_ANCHOR:-$REPO_BASE}"
         cld_record_anchor_env "$REPO_NAME" "$REPO_ANCHOR"
+        if ! cld_guard_anchor "$REPO_NAME" "$REPO_WORKSPACE" "$REPO_ANCHOR" \
+                "$REPO_MODE" "$REPO_BACKEND"; then
+            echo "Error: repo '${REPO_NAME}': anchor guard setup failed" >&2
+            exit 1
+        fi
         TICKET_ROWS="${TICKET_ROWS}| ${REPO_NAME} | ${REPO_ANCHOR:0:12} | ${REPO_MODE} | ${REPO_BACKEND} |
 "
     done < <(printf '%s' "$CLD_TICKET_MANIFEST" | jq -c '.repos[]')
@@ -150,6 +156,13 @@ if ! cld_boot_workspace "$WORKSPACE_ORIGIN" /workspace/current "$BOOKMARK" \
 fi
 AGENT_ANCHOR_HASH="$CLD_BOOT_ANCHOR"
 export AGENT_ANCHOR_HASH
+
+: > "$CLD_ANCHORS_FILE"
+if ! cld_guard_anchor current /workspace/current "$AGENT_ANCHOR_HASH" \
+        "${AGENT_ANCHOR_MODE:-isolated}" jj; then
+    echo "Error: anchor guard setup failed" >&2
+    exit 1
+fi
 
 cld_enable_watchman /workspace/current
 

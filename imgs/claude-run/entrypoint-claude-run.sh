@@ -62,6 +62,13 @@ export AGENT_ANCHOR_HASH
 echo "[cld] anchor=${AGENT_ANCHOR_HASH:0:12} (mode=$AGENT_ANCHOR_MODE, base=${A_HASH:0:12}, scratch=${B_HASH:0:12})"
 (cd /workspace/current && jj bookmark set "$BOOKMARK" -r @ --allow-backwards)
 
+: > "$CLD_ANCHORS_FILE"
+if ! cld_guard_anchor current /workspace/current "$AGENT_ANCHOR_HASH" \
+        "$AGENT_ANCHOR_MODE" jj; then
+    echo "Error: anchor guard setup failed" >&2
+    exit 1
+fi
+
 (cd /workspace/current && \
     jj config set --workspace fsmonitor.backend watchman && \
     jj config set --workspace fsmonitor.watchman.register-snapshot-trigger true && \

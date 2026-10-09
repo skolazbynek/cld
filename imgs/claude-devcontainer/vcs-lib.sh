@@ -12,6 +12,9 @@
 
 VCS_TYPE=""
 
+# Registry read by the anchor guard hooks (cld.vcs.anchor_guard).
+CLD_ANCHORS_FILE="${CLD_ANCHORS_FILE:-/tmp/cld-anchors.jsonl}"
+
 # --- Workspace isolation -----------------------------------------------------
 
 cld_detect_backend() {
@@ -201,6 +204,31 @@ cld_enable_watchman() {
         jj config set --workspace fsmonitor.backend watchman && \
         jj config set --workspace fsmonitor.watchman.register-snapshot-trigger true && \
         jj status >/dev/null)
+}
+
+cld_guard_anchor() {
+    # Register a workspace with the anchor guard hooks and, for jj, make every
+    # commit outside the anchor's descendants immutable in this workspace only
+    # (workspace config lives in the container's home, so the host and sibling
+    # containers sharing the store never see it; docs/design-anchor-guard.md
+    # sections 3-4). An empty anchor is skipped: the revset would match nothing
+    # and lock the whole repo. Returns non-zero when the jj config call fails;
+    # the caller decides whether that kills the boot.
+    # Args: $1=repo $2=workspace $3=anchor $4=mode $5=backend
+    local repo="$1" workspace="$2" anchor="$3" mode="$4" backend="$5"
+    if [ -z "$anchor" ]; then
+        echo "[WARN] repo '${repo}': no anchor recorded, anchor guard skipped" >&2
+        return 0
+    fi
+    jq -nc --arg repo "$repo" --arg workspace "$workspace" --arg anchor "$anchor" \
+        --arg mode "$mode" --arg backend "$backend" \
+        '{repo: $repo, workspace: $workspace, anchor: $anchor, mode: $mode, backend: $backend}' \
+        >> "$CLD_ANCHORS_FILE"
+    if [ "$backend" = "jj" ]; then
+        (cd "$workspace" && \
+            jj config set --workspace 'revset-aliases."immutable_heads()"' \
+                "builtin_immutable_heads() | ~(change_id($anchor)+::)")
+    fi
 }
 
 # --- Committing --------------------------------------------------------------
