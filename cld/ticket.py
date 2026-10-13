@@ -294,7 +294,8 @@ def exec_claude(ticket: str, extra_args: list[str]) -> None:
     """Exec the harness at the ticket root (spec section 7).
 
     ``/tmp/bin/claude`` is the in-container wrapper: it owns
-    ``--dangerously-skip-permissions --add-dir /opt/cld`` and the
+    ``--dangerously-skip-permissions --add-dir /opt/cld``, one ``--add-dir``
+    per repo workspace (repo skills) and the
     single-session flock, whose refusal prints straight onto this tty because
     the exec is interactive -- no host-side probe needed (design section 4.5).
     Everything after ``--`` on the command line arrives here as *extra_args*

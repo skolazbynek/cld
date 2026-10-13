@@ -277,7 +277,8 @@ failing repo is named.
 2. `build_claude_config` + `copy_host_configs` as today.
 3. Generate the claude wrapper **without** a baked `AGENT_MODEL`
    (v1 `:172-182`); `--dangerously-skip-permissions --add-dir /opt/cld` stay
-   in the wrapper (the in-container half), model comes per-invocation from
+   in the wrapper (the in-container half), plus one `--add-dir` per repo
+   workspace so each repo's `.claude/skills/` loads at startup, model comes per-invocation from
    `cld claude -- --model …`.
 4. Touch `/tmp/cld-ticket-ready`; PID 1 idles (`sleep infinity` + traps).
    **Traps:** TERM → plain `exit 0`. Unlike v1 master

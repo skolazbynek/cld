@@ -33,6 +33,7 @@ if [ -n "${TICKET_MODE:-}" ]; then
     N_REPOS=$(printf '%s' "$CLD_TICKET_MANIFEST" | jq '.repos | length')
     mkdir -p "$TICKET_ROOT"
     TICKET_ROWS=""
+    TICKET_ADD_DIRS=""
     REPO_INDEX=0
     export CLD_TICKET_ANCHOR_ENV_FILE="/tmp/cld-ticket-anchors.sh"
     : > "$CLD_TICKET_ANCHOR_ENV_FILE"
@@ -98,6 +99,10 @@ if [ -n "${TICKET_MODE:-}" ]; then
         fi
         TICKET_ROWS="${TICKET_ROWS}| ${REPO_NAME} | ${REPO_ANCHOR:0:12} | ${REPO_MODE} | ${REPO_BACKEND} |
 "
+        # Sessions start at the ticket root, above every repo, where claude
+        # loads a repo's .claude/skills/ only once it touches a file there;
+        # --add-dir loads them at startup.
+        TICKET_ADD_DIRS="${TICKET_ADD_DIRS} --add-dir $(printf '%q' "$REPO_WORKSPACE")"
     done < <(printf '%s' "$CLD_TICKET_MANIFEST" | jq -c '.repos[]')
 
     write_ticket_claude_md "$TICKET_ROOT" "$TICKET" "$TICKET_ROWS"
@@ -123,7 +128,7 @@ if ! flock -n 9; then
     exit 1
 fi
 printf 'pid=%s start=%s\n' "\$\$" "\$(date -Is)" > /tmp/cld-session.lock
-exec $CLAUDE_BIN --dangerously-skip-permissions --add-dir /opt/cld "\$@"
+exec $CLAUDE_BIN --dangerously-skip-permissions --add-dir /opt/cld${TICKET_ADD_DIRS} "\$@"
 EOF
     chmod +x /tmp/bin/claude
 
