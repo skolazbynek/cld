@@ -239,6 +239,9 @@ class TestBashRules:
             "jj rebase -r @ --onto {sibling}",
             "jj rebase -r @ -d {sibling}",
             "jj rebase -r @ -A {base}",
+            "jj rebase -r @ -A '{anchor} | {sibling}'",
+            "jj rebase -r @ -o '{sibling} | {base}'",
+            "jj duplicate @ -o '{anchor} | {sibling}'",
             "jj duplicate @ -o {sibling}",
             "jj revert -r @ -A {sibling}",
             "jj split -r @ -o {sibling}",
@@ -261,6 +264,8 @@ class TestBashRules:
             "bash -c 'jj new {sibling}'",
             "FOO=1 jj new {sibling}",
             "jj --at-op @ -R {repo} new {sibling}",
+            "jj new {sibling} # don't",
+            "jj new {sibling} \\",
         ],
     )
     def test_deny(self, shared_repo: Repo, command: str) -> None:
@@ -296,6 +301,8 @@ class TestBashRules:
             "jj rebase -r @ -o {anchor}",
             "jj rebase -r @ -o {mine}",
             "jj rebase -r @ -B {sibling}",
+            "jj rebase -b '{anchor}::' --onto '{anchor} | {sibling}'",
+            "jj rebase -b @ -o '{mine} | {sibling}'",
             "jj describe -m x",
             "jj describe {sibling} -m x",
             "jj edit {mine}",
@@ -326,6 +333,10 @@ class TestBashRules:
             f"cd {FOREIGN} && jj st",
             "jj -R /tmp/not-a-workspace describe -m x",
             "cd /tmp && jj new",
+            "echo hi # don't",
+            "cat <<'EOF'\nit's\nEOF",
+            "echo foo \\",
+            "jj describe -m \"$(cat <<'EOF'\nit's\nEOF\n)\"",
         ],
     )
     def test_allow(self, shared_repo: Repo, command: str) -> None:

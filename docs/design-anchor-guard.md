@@ -205,6 +205,11 @@ input's `cwd`, which follows Claude's own `cd` (docs). Strip leading
 `bash -c` / `sh -c`. Any command whose program basename is not `jj` is
 ignored.
 
+`shlex` rejects some lines bash accepts: an apostrophe in a comment or an
+unquoted heredoc body, a trailing backslash. Such a line is allowed when the
+word `jj` does not appear in it, and denied otherwise, since its jj commands
+cannot be checked.
+
 For each `jj` command:
 
 - Workspace = `-R/--repository` value, else the command's directory,
@@ -220,7 +225,7 @@ Rules, first match wins:
 | Config tamper | `config set`/`unset`/`edit` touching `revset-aliases` or with `--workspace` | deny |
 | Workspace ops | `workspace add`/`forget`/`rename` | deny (already forbidden by the agent persona) |
 | Foreign workspace | any mutating subcommand whose workspace is not in the registry (for example `-R /workspace/origin/<repo>`) | deny — layer 1 config does not apply there |
-| Destination | `new` (positional, `-o`, `-A`), `rebase`/`duplicate`/`revert`/`split`/`squash` (`-o`/`--onto`, `-d`/`--destination`, `-A`/`--insert-after`/`--after`) | deny if `(<rev>) ~ change_id(A)::` is non-empty |
+| Destination | `new` (positional, `-o`, `-A`), `rebase`/`duplicate`/`revert`/`split`/`squash` (`-o`/`--onto`, `-d`/`--destination`, `-A`/`--insert-after`/`--after`) | deny if `(<rev>) ~ change_id(A)::` is non-empty. Exception: a `rebase` `-o`/`--onto`/`-d`/`--destination` revset that also contains a commit in `change_id(A)::` is allowed, since the rebased commits keep that parent (the rebase skill uses `--onto 'A \| trunk()'`) |
 | Bookmarks | `bookmark create`/`set`/`move`/`advance` (`-r`, `--to`, `--from`) | deny if the target is outside `change_id(A)::` |
 | Bookmarks | `bookmark delete`/`forget`/`rename`/`move`/`set`/`advance` of a bookmark that now points outside `change_id(A)::` | deny — not this container's ref |
 | Everything else | read-only commands, `edit`, `describe`, `abandon`, `undo`, `op *`, unknown subcommands | allow — layer 1 covers rewrites |

@@ -24,6 +24,7 @@ FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 _PUNCTUATION = ";()<>|&\n"
 _ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=")
 _SHELL_COMMAND_FLAG = re.compile(r"-[A-Za-z]*c")
+_JJ_WORD = re.compile(r"\bjj\b")
 _STRING_PATTERN_KINDS = {"exact", "glob", "substring", "regex"}
 
 _GLOBAL_VALUE_FLAGS = {"-R", "--repository", "--config", "--config-file", "--at-op", "--at-operation", "--color"}
@@ -33,7 +34,8 @@ _VALUE_FLAGS = _GLOBAL_VALUE_FLAGS | {
     "-f", "--from", "-t", "--to", "--into", "-m", "--message", "--tool", "--file",
     "-T", "--template", "-n", "--limit",
 }
-_DESTINATION_FLAGS = ("-o", "--onto", "-d", "--destination", "-A", "--insert-after", "--after")
+_ONTO_FLAGS = ("-o", "--onto", "-d", "--destination")
+_DESTINATION_FLAGS = (*_ONTO_FLAGS, "-A", "--insert-after", "--after")
 _DESTINATION_COMMANDS = {"rebase", "duplicate", "revert", "split", "squash"}
 
 _COMMAND_ALIASES = {"b": "bookmark", "operation": "op"}
@@ -117,6 +119,10 @@ def _outside_parent_set(anchor: Anchor, revset: str) -> bool:
     the real command fails the same way."""
     result = _log(anchor.workspace, f"({revset}) ~ change_id({anchor.anchor})::")
     return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _touches_tree(anchor: Anchor, revset: str) -> bool:
+    return bool(_log(anchor.workspace, f"({revset}) & change_id({anchor.anchor})::").stdout.strip())
 
 
 def _outside_tree_reason(anchor: Anchor) -> str:
@@ -318,8 +324,11 @@ def check_jj(call: JjCall, directory: str, anchors: list[Anchor]) -> str | None:
         f"outside the anchor tree: it must be `change_id({anchor.anchor})` or a descendant. "
         f"Use a commit in that tree, e.g. `change_id({anchor.anchor})` or `@`."
     )
+    # A rebased commit gets every `--onto` revision as a parent, so one in the tree keeps it
+    # in the tree: `jj rebase -b 'A::' -o 'A | trunk()'` (the rebase skill) must pass.
+    mixed_ok = set(call.values(*_ONTO_FLAGS)) if command == "rebase" else set()
     for revset in _destinations(call, command):
-        if _outside_parent_set(anchor, revset):
+        if _outside_parent_set(anchor, revset) and not (revset in mixed_ok and _touches_tree(anchor, revset)):
             return f"Rule 'destination': `{revset}` is {outside}"
 
     if command == "bookmark":
@@ -340,7 +349,19 @@ def check_jj(call: JjCall, directory: str, anchors: list[Anchor]) -> str | None:
 
 
 def check_bash(command: str, cwd: str, anchors: list[Anchor]) -> str | None:
-    for words, directory in _simple_commands(command, cwd):
+    try:
+        commands = _simple_commands(command, cwd)
+    except ValueError:
+        # shlex rejects lines bash accepts (an apostrophe in a comment or heredoc body, a trailing
+        # backslash). Without jj in the line there is nothing to check; with it, fail closed.
+        if not _JJ_WORD.search(command):
+            return None
+        return (
+            "Rule 'unparsable command': the anchor guard could not split this line into words, so it cannot "
+            "check its jj commands. Run the jj command on its own, without heredocs or comments containing "
+            "unbalanced quotes."
+        )
+    for words, directory in commands:
         if os.path.basename(words[0]) != "jj":
             continue
         if reason := check_jj(parse_jj(words[1:]), directory, anchors):
