@@ -145,7 +145,8 @@ new anchor at once.
 scratch anchor commit onto a new revision instead of leaving it where first
 launch put it -- see the anchor-move design doc, sections 3 to 5, for the jj
 rebase mechanics, the overlap-check exclusion, the stop/move/rm/relaunch
-ordering and its undo. `jj` only; refuses on a live claude session.
+ordering and its undo. A bare `<repo>` (or `<repo>@`) means `<repo>@@`: the
+revision defaults to `@`, the repo's working copy on the host. `jj` only; refuses on a live claude session.
 
 ## 3. The effective-anchor problem
 
@@ -280,6 +281,11 @@ failing repo is named.
    in the wrapper (the in-container half), plus one `--add-dir` per repo
    workspace so each repo's `.claude/skills/` loads at startup, model comes per-invocation from
    `cld claude -- --model …`.
+   Plugin marketplaces sourced from a host directory or file (host
+   `known_marketplaces.json`, `extraKnownMarketplaces` in host and per-repo
+   settings) are mounted RO at their identical host path
+   (`stage_plugin_marketplaces`), so Claude's plugin registry resolves them
+   instead of failing with `cache-miss`.
 4. Touch `/tmp/cld-ticket-ready`; PID 1 idles (`sleep infinity` + traps).
    **Traps:** TERM → plain `exit 0`. Unlike v1 master
    (`:242-251`), the ticket entrypoint never forgets bookmarks — `docker

@@ -17,6 +17,7 @@ from cld.manifest import RepoManifestEntry, TicketManifest, manifest_labels
 from cld.registry import RepoEntry
 from cld.ticket import (
     _echo_new_log_lines,
+    _parse_reanchor,
     _session_state,
     exec_claude,
     exec_shell,
@@ -455,6 +456,18 @@ class TestReanchorRestart:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
         move_mock.assert_not_called()
         run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("spec", "expect"),
+        [
+            ("lide-api", {"lide-api": "@"}),
+            ("lide-api@", {"lide-api": "@"}),
+            ("lide-api@main", {"lide-api": "main"}),
+        ],
+        ids=["bare-repo", "empty-rev", "explicit-rev"],
+    )
+    def test_revision_defaults_to_the_host_working_copy(self, spec, expect):
+        assert _parse_reanchor(self._manifest(), [spec]) == expect
 
     def test_unknown_repo_is_a_parse_error(self):
         manifest = self._manifest()

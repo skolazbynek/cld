@@ -170,7 +170,9 @@ scales with the repo count.
 `--add-dir /opt/cld` (baked skills), `--add-dir` per repo workspace (repo
 skills, which claude would otherwise load only once it touches a file in the
 repo), cwd = ticket root. Model and prompt are
-per-invocation pass-through.
+per-invocation pass-through. Host plugin marketplaces sourced from a directory
+or file are mounted RO at their identical host path so Claude's plugin registry
+resolves them.
 
 - POC: if a session is already live in the container, refuse with a clear
   message naming it [ruled: single session for now].

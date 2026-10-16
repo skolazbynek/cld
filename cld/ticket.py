@@ -358,15 +358,21 @@ def _parse_reanchor(manifest: TicketManifest, specs: list[str]) -> dict[str, str
     """``REPO@REV`` parsing for ``--reanchor`` (design section 4).
 
     A spec splits at the first ``@``; if the part before it names a manifest
-    repo, the rest is the revision. Otherwise, on a one-repo ticket, the whole
-    spec is the revision (so ``main@origin`` works without a repo prefix).
-    Unlike ``_split_rev`` (cld/manifest.py) this never touches the filesystem.
+    repo, the rest is the revision. A bare repo name, or ``REPO@``, defaults
+    the revision to ``@`` -- the repo's working copy on the host. Otherwise,
+    on a one-repo ticket, the whole spec is the revision (so ``main@origin``
+    works without a repo prefix). Unlike ``_split_rev`` (cld/manifest.py)
+    this never touches the filesystem.
     """
     names = {repo.name for repo in manifest.repos}
     result: dict[str, str] = {}
     for spec in specs:
         name, sep, rev = spec.partition("@")
-        if not (sep and name in names):
+        if spec in names:
+            rev = "@"
+        elif sep and name in names:
+            rev = rev or "@"
+        else:
             if len(manifest.repos) != 1:
                 raise RuntimeError(
                     f"'{spec}': not REPO@REV against a known repo, and the ticket "

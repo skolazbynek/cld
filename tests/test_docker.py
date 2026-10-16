@@ -25,6 +25,7 @@ from cld.docker import (
     parse_peers_env,
     resolve_anchor_checked,
     stage_home_ro,
+    stage_plugin_marketplaces,
     stage_broker,
     task_agent_container_name,
     ticket_anchor_resolver,
@@ -206,6 +207,86 @@ class TestStageHomeRo:
         # not, so the host-translated string is just the resolved tmp path.
         args = stage_home_ro(".bashrc", cfg)
         assert args[1].startswith(str(tmp_path.resolve()) + "/.bashrc:")
+
+
+class TestStagePluginMarketplaces:
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / ".claude" / "plugins").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        return home
+
+    @staticmethod
+    def _registry(home, **sources):
+        (home / ".claude/plugins/known_marketplaces.json").write_text(
+            json.dumps({name: {"source": src} for name, src in sources.items()})
+        )
+
+    def test_directory_source(self, home, tmp_path):
+        mp = tmp_path / "mp"
+        mp.mkdir()
+        self._registry(home, local={"source": "directory", "path": str(mp)})
+        assert stage_plugin_marketplaces(Config(), []) == ["-v", f"{mp}:{mp}:ro"]
+
+    def test_file_source_mounts_parent(self, home, tmp_path):
+        mp = tmp_path / "mp"
+        mp.mkdir()
+        (mp / "marketplace.json").write_text("{}")
+        self._registry(home, local={"source": "file", "path": str(mp / "marketplace.json")})
+        assert stage_plugin_marketplaces(Config(), []) == ["-v", f"{mp}:{mp}:ro"]
+
+    def test_tilde_expanded(self, home):
+        (home / "mp").mkdir()
+        self._registry(home, local={"source": "directory", "path": "~/mp"})
+        assert stage_plugin_marketplaces(Config(), []) == ["-v", f"{home}/mp:{home}/mp:ro"]
+
+    def test_other_sources_ignored(self, home):
+        self._registry(
+            home,
+            gh={"source": "github", "repo": "a/b"},
+            git={"source": "git", "url": "https://x/y.git"},
+            url={"source": "url", "url": "https://x/m.json"},
+        )
+        assert stage_plugin_marketplaces(Config(), []) == []
+
+    def test_missing_path_skipped(self, home, tmp_path):
+        self._registry(home, local={"source": "directory", "path": str(tmp_path / "nope")})
+        assert stage_plugin_marketplaces(Config(), []) == []
+
+    def test_dedupe_across_host_and_repo_settings(self, home, tmp_path):
+        mp = tmp_path / "mp"
+        mp.mkdir()
+        src = {"source": {"source": "directory", "path": str(mp)}}
+        self._registry(home, local={"source": "directory", "path": str(mp)})
+        (home / ".claude/settings.json").write_text(json.dumps({"extraKnownMarketplaces": {"a": src}}))
+        repo = tmp_path / "repo"
+        (repo / ".claude").mkdir(parents=True)
+        (repo / ".claude/settings.json").write_text(json.dumps({"extraKnownMarketplaces": {"b": src}}))
+        (repo / ".claude/settings.local.json").write_text(json.dumps({"extraKnownMarketplaces": {"c": src}}))
+        assert stage_plugin_marketplaces(Config(), [repo]) == ["-v", f"{mp}:{mp}:ro"]
+
+    def test_repo_settings_source_and_sorted_order(self, home, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        self._registry(home, bb={"source": "directory", "path": str(b)})
+        repo = tmp_path / "repo"
+        (repo / ".claude").mkdir(parents=True)
+        (repo / ".claude/settings.local.json").write_text(json.dumps(
+            {"extraKnownMarketplaces": {"aa": {"source": {"source": "directory", "path": str(a)}}}}
+        ))
+        assert stage_plugin_marketplaces(Config(), [repo]) == [
+            "-v", f"{a}:{a}:ro", "-v", f"{b}:{b}:ro",
+        ]
+
+    def test_malformed_json_tolerated(self, home, tmp_path):
+        (home / ".claude/plugins/known_marketplaces.json").write_text("{not json")
+        (home / ".claude/settings.json").write_text("[]")
+        repo = tmp_path / "repo"
+        (repo / ".claude").mkdir(parents=True)
+        (repo / ".claude/settings.json").write_text('{"extraKnownMarketplaces": "x"}')
+        assert stage_plugin_marketplaces(Config(), [repo]) == []
 
 
 class TestEnsureImageNested:
@@ -447,6 +528,22 @@ class TestBuildContainerArgsTaskAgent:
             task_agent=TaskAgentSpec(slug="t"),
         )
         assert any("broker-key" in a for a in args)
+
+
+class TestBuildContainerArgsPluginMarketplaces:
+    def test_mount_included(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / ".claude/plugins").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        mp = tmp_path / "mp"
+        mp.mkdir()
+        (home / ".claude/plugins/known_marketplaces.json").write_text(
+            json.dumps({"local": {"source": {"source": "directory", "path": str(mp)}}})
+        )
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        args = build_container_args(repo, "cld_run_x", Config(mailbox_root=str(tmp_path / "mb")))
+        assert f"{mp}:{mp}:ro" in args
 
 
 class TestBuildContainerArgsBrokerWiring:
@@ -1101,6 +1198,17 @@ class TestBuildTicketContainerArgs:
         manifest = self._manifest(("lide-api", str(repo_a)), ("diskuze-api", str(repo_b)))
         cfg = Config(mailbox_root=str(tmp_path / "mb"), **cfg_kwargs)
         return manifest, cfg
+
+    def test_plugin_marketplace_mounts(self, tmp_path, monkeypatch):
+        manifest, cfg = self._setup(tmp_path, monkeypatch)
+        mp = tmp_path / "mp"
+        mp.mkdir()
+        (tmp_path / "diskuze-api/.claude").mkdir()
+        (tmp_path / "diskuze-api/.claude/settings.json").write_text(json.dumps(
+            {"extraKnownMarketplaces": {"x": {"source": {"source": "directory", "path": str(mp)}}}}
+        ))
+        args = build_ticket_container_args(manifest, cfg)
+        assert f"{mp}:{mp}:ro" in args
 
     def test_name_and_no_workdir(self, tmp_path, monkeypatch):
         manifest, cfg = self._setup(tmp_path, monkeypatch)

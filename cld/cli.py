@@ -664,7 +664,8 @@ def restart(
     reanchor: list[str] = typer.Option(
         [], "--reanchor", metavar="REPO@REV",
         help="Move a repo's anchor commit onto REV before recreating "
-        "(repeatable; bare REV allowed on a one-repo ticket).",
+        "(repeatable; REV defaults to '@', the host working copy; "
+        "bare REV allowed on a one-repo ticket).",
     ),
 ):
     """Recreate a ticket container from its persisted manifest; workspaces reattach at their bookmarks.

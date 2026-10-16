@@ -471,6 +471,7 @@ def build_container_args(
         log.error(f"{local_claude_dir} not found -- Claude auth and session state unavailable")
         sys.exit(1)
     args += ["-v", f"{host_home}/.claude:{CONTAINER_HOME}/.claude:rw"]
+    args += stage_plugin_marketplaces(cfg, [repo_root])
 
     # RO $HOME mounts: all staged under /tmp/host-config/<rel>, then copied
     # into $HOME by the entrypoint. Devcontainer-only entries are added by cli.py.
@@ -619,6 +620,7 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
         log.error(f"{home}/.claude not found -- Claude auth and session state unavailable")
         sys.exit(1)
     args += ["-v", f"{host_home}/.claude:{CONTAINER_HOME}/.claude:rw"]
+    args += stage_plugin_marketplaces(cfg, [Path(repo.path) for repo in manifest.repos])
 
     for rel in cfg.home_mounts_always:
         if mnt := stage_home_ro(rel, cfg):
@@ -1248,3 +1250,58 @@ def stage_home_ro(rel_path: str, cfg: Config) -> list[str]:
         return []
     host_path = to_host_path(str(local_path.resolve()), cfg)
     return ["-v", f"{host_path}:{_RO_HOME_MOUNT_ROOT}/{rel_path}:ro"]
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log.warning(f"Cannot read {path}: {e}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def stage_plugin_marketplaces(cfg: Config, repo_roots: list[Path]) -> list[str]:
+    """Mount directory/file-sourced plugin marketplaces RO at their host path.
+
+    Claude's plugin registry stores these as absolute host paths, which do
+    not exist in the container, so the marketplace fails to load. Mounting
+    each at the identical path makes the registry entries resolve as-is.
+    Sources are read from the host registry, the host user settings and each
+    repo's project settings; other source kinds (github, git, ...) need no mount.
+    """
+    claude_dir = Path.home() / ".claude"
+    sources: list[object] = list(_read_json_dict(claude_dir / "plugins/known_marketplaces.json").values())
+    settings_files = [claude_dir / "settings.json"]
+    for root in repo_roots:
+        settings_files += [root / ".claude/settings.json", root / ".claude/settings.local.json"]
+    for settings_file in settings_files:
+        extra = _read_json_dict(settings_file).get("extraKnownMarketplaces")
+        if isinstance(extra, dict):
+            sources += list(extra.values())
+
+    paths: set[str] = set()
+    for entry in sources:
+        source = entry.get("source") if isinstance(entry, dict) else None
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            continue
+        path = Path(source["path"]).expanduser()
+        match source.get("source"):
+            case "directory":
+                pass
+            case "file":
+                path = path.parent
+            case _:
+                continue
+        path = path.resolve()
+        if not path.exists():
+            log.warning(f"Plugin marketplace path {path} not found -- skipping")
+            continue
+        paths.add(to_host_path(str(path), cfg))
+
+    args: list[str] = []
+    for host_path in sorted(paths):
+        args += ["-v", f"{host_path}:{host_path}:ro"]
+    return args
