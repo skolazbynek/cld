@@ -4,7 +4,9 @@
 > ticket container (v2) replaces the master role; a multi-repo ticket mounts
 > its repos directly, with no sibling launches or placeholder directories.
 > The mechanics below still describe the shipped v1 behaviour, which keeps
-> working during coexistence.
+> working during coexistence, except the mounts: no container mounts the host
+> checkout read-write any more. Origin holds only the jj/git store
+> (`docs/design-secrets-containment.md`).
 
 > **Update (docker socket removed).** This document describes the original
 > socket-mediated design, where `cld <cmd>` inside master ran `docker run`

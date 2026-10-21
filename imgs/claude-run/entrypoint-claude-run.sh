@@ -38,12 +38,12 @@ BOOKMARK="$AGENT_NAME"
 
 cd "$WORKSPACE_ORIGIN"
 BASE_REV="${AGENT_REVISION_HINT:-@}"
-if ! A_HASH=$(jj log --no-graph -n 1 -r "$BASE_REV" -T change_id 2>/dev/null); then
+if ! A_HASH=$(cld_store_jj "$WORKSPACE_ORIGIN" log --no-graph -n 1 -r "$BASE_REV" -T change_id 2>/dev/null); then
     echo "Error: could not resolve AGENT_REVISION_HINT='$BASE_REV'" >&2
     exit 1
 fi
 echo "[cld] base=${A_HASH:0:12}"
-jj workspace add --name "$BOOKMARK" -r "$A_HASH" /workspace/current
+cld_add_workspace "$WORKSPACE_ORIGIN" "$BOOKMARK" "$A_HASH" /workspace/current
 if ! B_HASH=$(cd /workspace/current && python3 -m cld.vcs.scratch); then
     echo "Error: peer-side anchor staging failed" >&2
     exit 1

@@ -1,5 +1,7 @@
 """Jujutsu (jj) backend implementation."""
 
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -7,6 +9,63 @@ from cld.log import get_logger
 from cld.vcs.base import VcsBackend
 
 log = get_logger(__name__)
+
+# Both ids must exist before any host jj call: with one missing, jj migrates a
+# legacy config file next to it into the host jj config. cld/docker.py:_JJ_IDS
+# lists the same paths (tests keep them equal).
+JJ_ID_FILES = (".jj/repo/config-id", ".jj/workspace-config-id")
+
+# Where the git dir of a jj repo can be (colocated or internal).
+GIT_DIRS = (".git", ".jj/repo/store/git")
+
+# What the read-only ``commondir`` mount holds. Git and jj take their config and
+# hooks from the folder this file names; "." names the git dir itself, which is
+# what both assume without the file. Any other content is refused.
+COMMONDIR_PLACEHOLDER = "."
+
+
+def _is_commondir_placeholder(path: Path) -> bool:
+    """Whether *path* is a regular file holding exactly the placeholder."""
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        return False
+    with path.open("rb") as f:
+        return f.read(len(COMMONDIR_PLACEHOLDER) + 1) == COMMONDIR_PLACEHOLDER.encode()
+
+
+def check_git_dir(repo: Path, git_dir: str) -> str | None:
+    """Why no host git, and no host jj through its git layer, may run on the
+    git dir *git_dir* of *repo*, None when they may.
+
+    Creates nothing and runs no tool.
+    """
+    commondir = repo / git_dir / "commondir"
+    if os.path.lexists(commondir) and not _is_commondir_placeholder(commondir):
+        return (
+            f"{git_dir}/commondir exists: git and jj would load their config and hooks "
+            "from the folder it names. Check it, then delete it"
+        )
+    if os.path.lexists(repo / git_dir / "modules"):
+        return f"{git_dir}/modules exists: git submodules are not supported yet"
+    return None
+
+
+def check_jj_ids(repo: Path) -> str | None:
+    """Why no host jj may run on *repo*, None when it may: a jj id is missing,
+    or the git dir fails ``check_git_dir``.
+
+    ``lstat`` only: creates nothing and runs no jj. A repo without ``.jj`` has
+    no ids to check.
+    """
+    if not os.path.lexists(repo / ".jj"):
+        return None
+    for rel in JJ_ID_FILES:
+        try:
+            mode = os.lstat(repo / rel).st_mode
+        except FileNotFoundError:
+            return f"{rel} is missing"
+        if not stat.S_ISREG(mode):
+            return f"{rel} is not a regular file"
+    return next((reason for git_dir in GIT_DIRS if (reason := check_git_dir(repo, git_dir))), None)
 
 
 class JjBackend(VcsBackend):

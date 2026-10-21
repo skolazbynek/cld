@@ -22,8 +22,16 @@ RUNTESTS_IMAGE=runtests:latest
 # GRAPHQL_START_TIMEOUT=300
 
 # Venv + poetry download cache mounted into runtests and graphqlserver at
-# /cache (../scripts/venv-cache.sh). Set it empty to disable the cache.
+# /cache (../scripts/venv-cache.sh), one folder per repo below <root>/repos/.
+# Set it empty to disable the cache.
 # VENV_CACHE_ROOT=/home/you/.cld/cache
+
+# Private copies of each repo's .env, the only form in which the broker mounts
+# it into runtests and graphqlserver (docs/design-secrets-containment.md §6.3).
+# Created 0700. It must be owned by you, closed to group and other, and outside
+# the mailbox root, VENV_CACHE_ROOT, TESTS_RUNS_ROOT, ~/.claude and every registry
+# repo -- else every run is refused. Copies older than 24 h are deleted at each use.
+# SECRETS_STAGE_DIR=/home/you/.cld/broker-secrets
 
 # The forced command runs with a minimal PATH; make jj, docker, cld (the
 # `task-agent` action runs host-side `cld task-agent`), and jq/python3 if your `graphql_command`

@@ -6,17 +6,24 @@ function against a faked host.
 """
 
 import base64
+import errno
 import http.server
 import importlib.util
 import json
 import os
+import re
+import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
 import pytest
+
+from cld import docker as cld_docker
+from cld.vcs import jj as cld_jj
 
 BROKER_PY = Path(__file__).resolve().parent.parent / "broker" / "cld-broker.py"
 
@@ -32,6 +39,27 @@ def conf(monkeypatch):
     return settings
 
 
+@pytest.fixture(autouse=True)
+def runner_image_jj(monkeypatch):
+    """Runner and server images label a new enough jj. Tests of other labels still reach the stubbed docker."""
+    real_label = broker._label
+    monkeypatch.setattr(
+        broker, "_label",
+        lambda container, key: "0.45.1" if key == broker._JJ_VERSION_LABEL else real_label(container, key),
+    )
+
+
+@pytest.fixture(autouse=True)
+def host_jj_version(monkeypatch):
+    """The host jj is new enough. Tests of the version check itself put _real_host_jj_version back."""
+    monkeypatch.setattr(broker, "_host_jj_version", lambda: "jj 0.45.1")
+
+
+_real_host_jj_version = broker._host_jj_version
+# First lines of a fake jj run by a full-script test: the broker asks `jj --version` once per process.
+_FAKE_JJ_VERSION = '[ "${1:-}" != --version ] || { echo "jj 0.45.1"; exit 0; }\n'
+
+
 def _fakebin(tmp_path, monkeypatch, **scripts: str) -> Path:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -44,6 +72,27 @@ def _fakebin(tmp_path, monkeypatch, **scripts: str) -> Path:
 
 def _exit_code(excinfo) -> int:
     return excinfo.value.code
+
+
+def _secrets_at(path: Path) -> "broker.Secrets":
+    """The Secrets a resolve of *path* gives, for tests that stub the resolver."""
+    return broker.Secrets(str(path), ".", None, path.read_bytes() if path.exists() else None)
+
+
+def _make_store(path: Path, layout: str = "colocated") -> Path:
+    """*path* holding exactly the files the store mount rows name, as a jj repo
+    (`colocated` git dir or `internal` one) or a git-only repo. Nothing runs jj."""
+    git = {"colocated": ".git", "internal": ".jj/repo/store/git", "git-only": ".git"}[layout]
+    (path / git / "hooks").mkdir(parents=True)
+    (path / git / "config").write_text("")
+    (path / git / "commondir").write_text(".")
+    if layout != "git-only":
+        (path / ".jj/working_copy").mkdir(parents=True)
+        (path / ".jj/repo/store").mkdir(parents=True, exist_ok=True)
+        (path / ".jj/repo/config-id").write_text("id")
+        (path / ".jj/workspace-config-id").write_text("id")
+        (path / ".jj/repo/store/git_target").write_text("../../../.git" if layout == "colocated" else "git")
+    return path
 
 
 class TestParseRepoArg:
@@ -303,7 +352,7 @@ path = "{tmp_path}/mounted"
         result = self._dispatch(home, "task-agent", ["start", "--repo", name, "@task", "-n", "s"])
         assert result.returncode == 0, result.stderr
         assert result.stdout.splitlines() == [
-            f"CWD {home}/{name}", "task-agent", "start", "@task", "-n", "s", "--parent", "cld_ticket_x"]
+            f"CWD {home}/{name}", "task-agent", "start", "--parent", "cld_ticket_x", "@task", "-n", "s"]
 
     def test_start_without_repo_on_several_mounts_denied(self, home):
         result = self._dispatch(home, "task-agent", ["start", "@task", "-n", "s"])
@@ -326,7 +375,7 @@ path = "{tmp_path}/mounted"
         [
             (["status"], ["status", "--parent", "cld_ticket_x"]),
             (["logs", "slug", "-n", "5"], ["logs", "slug", "-n", "5"]),
-            (["shutdown", "--all"], ["shutdown", "--all", "--parent", "cld_ticket_x"]),
+            (["shutdown", "--all"], ["shutdown", "--parent", "cld_ticket_x", "--all"]),
         ],
         ids=["status", "logs", "shutdown"],
     )
@@ -353,6 +402,7 @@ class TestDispatchRunTests:
 
     @pytest.fixture(autouse=True)
     def fakebin(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SECRETS_STAGE_DIR", str(tmp_path / "stage"))
         return _fakebin(tmp_path, monkeypatch, docker="""
 cmd="$1"; shift
 case "$cmd" in
@@ -362,6 +412,7 @@ case "$cmd" in
       case "$1" in --format) fmt="$2"; shift 2 ;; *) shift ;; esac
     done
     case "$fmt" in
+      *org.cld.jj-version*) printf '%s\\n' "${FAKE_JJ_VERSION-0.45.1}" ;;
       *org.cld.kind*)      printf '%s\\n' "${FAKE_KIND:-}" ;;
       *org.cld.repo-root*) printf '%s\\n' "${FAKE_REPO_ROOT:-}" ;;
       *.Mounts*)           printf '%s' "${FAKE_AGENT:-}" ;;
@@ -371,12 +422,12 @@ case "$cmd" in
   image) echo sha256:img123 ;;
   run) echo "DOCKER_RUN $*" ;;
 esac
-""", jj="echo rev123\n")
+""", jj=_FAKE_JJ_VERSION + "echo rev123\n")
 
     @pytest.fixture
     def repos(self, tmp_path):
         for name in ("lide-api", "diskuze-api"):
-            (tmp_path / name / ".jj").mkdir(parents=True)
+            _make_store(tmp_path / name)
         return tmp_path
 
     def _dispatch(self, session: str, argv: list, env_overrides: dict) -> subprocess.CompletedProcess:
@@ -398,7 +449,8 @@ esac
             {"FAKE_KIND": "ticket", "FAKE_LABELS": labels},
         )
         assert result.returncode == 0, result.stderr
-        assert f"-v {repos}/diskuze-api:/repo" in result.stdout
+        assert f"--mount type=bind,src={repos}/diskuze-api/.jj,dst=/repo/.jj " in result.stdout
+        assert f"{repos}/diskuze-api:/repo" not in result.stdout
         assert "-e REVISION=rev123" in result.stdout
         assert result.stdout.rstrip().endswith("runtests:latest -k login")
         assert "--repo" not in result.stdout
@@ -421,8 +473,19 @@ esac
             {"FAKE_KIND": "task-agent", "FAKE_REPO_ROOT": f"{repos}/lide-api"},
         )
         assert result.returncode == 0, result.stderr
-        assert f"-v {repos}/lide-api:/repo" in result.stdout
+        assert f"--mount type=bind,src={repos}/lide-api/.jj,dst=/repo/.jj " in result.stdout
+        assert f"{repos}/lide-api:/repo" not in result.stdout
         assert result.stdout.rstrip().endswith("runtests:latest -k login")
+
+    @pytest.mark.parametrize("version", ["0.37.0", ""], ids=["old-jj", "no-label"])
+    def test_runner_image_with_an_old_jj_denied(self, repos, version):
+        result = self._dispatch(
+            "cld_agent_lide-api_fix", ["-k", "login"],
+            {"FAKE_KIND": "task-agent", "FAKE_REPO_ROOT": f"{repos}/lide-api", "FAKE_JJ_VERSION": version},
+        )
+        assert result.returncode == 3
+        assert "org.cld.jj-version" in result.stderr
+        assert "DOCKER_RUN" not in result.stdout
 
     def test_venv_cache_wired(self, repos, tmp_path):
         cache = tmp_path / "cache"
@@ -432,9 +495,12 @@ esac
              "VENV_CACHE_ROOT": str(cache)},
         )
         assert result.returncode == 0, result.stderr
-        assert f"-v {cache}:/cache" in result.stdout
+        own = broker.venv_cache_dir(str(cache), str(repos / "lide-api"))
+        assert f"-v {own}:/cache" in result.stdout
+        assert f"-v {cache}:/cache" not in result.stdout
         assert "-e VENV_CACHE_IMAGE_ID=sha256:img123" in result.stdout
-        assert all((cache / d).is_dir() for d in ("venvs", "poetry", "locks"))
+        assert all((Path(own) / d).is_dir() for d in ("venvs", "poetry", "locks"))
+        assert not any((cache / d).exists() for d in ("venvs", "poetry", "locks"))
 
     def test_venv_cache_disabled(self, repos):
         result = self._dispatch(
@@ -498,9 +564,13 @@ class TestDispatchCli:
 
     @pytest.fixture(autouse=True)
     def fakebin(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SECRETS_STAGE_DIR", str(tmp_path / "stage"))
         return _fakebin(tmp_path, monkeypatch, docker="""
-[ "$1" = run ] && printf 'DOCKER_RUN\\n' && printf '%s\\n' "$@"
-""", jj="""
+case "$1" in
+  inspect) printf '%s\\n' "${FAKE_JJ_VERSION-0.45.1}" ;;
+  run) printf 'DOCKER_RUN\\n'; printf '%s\\n' "$@" ;;
+esac
+""", jj=_FAKE_JJ_VERSION + """
 printf '%s\\n' "$*" >> "$FAKE_JJ_LOG"
 echo rev123
 """, cld="""
@@ -509,7 +579,7 @@ printf '%s\\n' "$@"
 
     @pytest.fixture
     def repo(self, tmp_path):
-        (tmp_path / "my.repo" / ".jj").mkdir(parents=True)
+        _make_store(tmp_path / "my.repo")
         (tmp_path / "my.repo" / "sub").mkdir()
         return tmp_path / "my.repo"
 
@@ -524,7 +594,8 @@ printf '%s\\n' "$@"
         result = self._run(tmp_path, repo / "sub", "run-tests", "-k", "two words", "-r", "x")
         assert result.returncode == 0, result.stderr
         lines = result.stdout.splitlines()
-        assert f"{repo}:/repo" in lines
+        assert f"type=bind,src={repo}/.jj,dst=/repo/.jj" in lines
+        assert f"{repo}:/repo" not in lines
         assert "REVISION=rev123" in lines
         assert lines[-5:] == ["runtests:latest", "-k", "two words", "-r", "x"]
         assert (tmp_path / "jj.log").read_text().splitlines() == [
@@ -561,7 +632,7 @@ printf '%s\\n' "$@"
         monkeypatch.setenv("HOME", str(tmp_path))
         result = self._run(tmp_path, repo, "task-agent", "start", "--repo", "other", "@task")
         assert result.returncode == 0, result.stderr
-        assert result.stdout.splitlines()[:3] == ["task-agent", "start", "@task"]
+        assert result.stdout.splitlines()[:5] == ["task-agent", "start", "--parent", "cld_host_my-repo", "@task"]
 
     def test_bad_session_denied(self, tmp_path, repo):
         result = self._run(tmp_path, repo, "-s", "../x", "list-containers")
@@ -687,7 +758,7 @@ class TestGraphqlEndpoints:
     file with zero CLD_GRAPHQL_URL_* aliases, or none at all."""
 
     def _endpoints(self, monkeypatch, secrets: Path, capsys) -> str:
-        monkeypatch.setattr(broker, "resolve_secrets_env_file", lambda repo: broker.SecretsEnv(".", str(secrets)))
+        monkeypatch.setattr(broker, "resolve_secrets_env_file", lambda repo, stage: _secrets_at(secrets))
         broker.do_graphql_endpoints(broker.Scope("cld_agent_test", "/repo"))
         return capsys.readouterr().out
 
@@ -716,13 +787,13 @@ class TestResolveTargetAlias:
             "CLD_GRAPHQL_AUTH_STAGING_EU='Bearer abc'\n"
             'CLD_GRAPHQL_COOKIE_STAGING_EU="session=1; x=2"\n'
         )
-        monkeypatch.setattr(broker, "resolve_secrets_env_file", lambda repo: broker.SecretsEnv(".", str(secrets)))
+        monkeypatch.setattr(broker, "resolve_secrets_env_file", lambda repo, stage: _secrets_at(secrets))
         ctx = broker.Scope("cld_agent_test", "/repo")
         assert broker.resolve_target(ctx, "staging-eu") == ("https://staging/graphql", "Bearer abc", "session=1; x=2")
 
     def test_unknown_alias_denied(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(broker, "resolve_secrets_env_file",
-                            lambda repo: broker.SecretsEnv(".", str(tmp_path / ".env")))
+                            lambda repo, stage: _secrets_at(tmp_path / ".env"))
         with pytest.raises(SystemExit) as excinfo:
             broker.resolve_target(broker.Scope("cld_agent_test", "/repo"), "nope")
         assert _exit_code(excinfo) == 3
@@ -741,7 +812,7 @@ class TestResolveTargetLocal:
         return _fakebin(tmp_path, monkeypatch, docker='[ "$1" = port ] && echo "172.17.0.1:32768"\n')
 
     def _resolve(self, monkeypatch, secrets: Path) -> tuple[str, str, str]:
-        monkeypatch.setattr(broker, "resolve_secrets_env_file", lambda repo: broker.SecretsEnv(".", str(secrets)))
+        monkeypatch.setattr(broker, "resolve_secrets_env_file", lambda repo, stage: _secrets_at(secrets))
         return broker.resolve_target(broker.Scope("cld_agent_test", "/repo"), "local")
 
     def test_credentials_come_from_the_env_file(self, tmp_path, monkeypatch):
@@ -763,6 +834,7 @@ class TestGraphqlStatusStale:
 
     @pytest.fixture(autouse=True)
     def fakebin(self, tmp_path, monkeypatch):
+        _make_store(tmp_path)
         return _fakebin(tmp_path, monkeypatch, docker="""
 case "$1" in
   ps) exit 0 ;;
@@ -829,7 +901,7 @@ class TestGraphqlStartRepoMismatch:
     def fakebin(self, tmp_path, monkeypatch):
         monkeypatch.setattr(broker, "sweep_gql_orphans", lambda: None)
         monkeypatch.setattr(broker, "resolve_graphql_context", lambda repo: (
-            broker.SecretsEnv(".", "/none/.env"), broker.GraphqlConfig("serve", "8000", "/graphql")))
+            broker.Secrets("/none/.env", ".", None, None), broker.GraphqlConfig("serve", "8000", "/graphql")))
         monkeypatch.setattr(broker, "do_graphql_status", lambda scope, tip: print("STATUS_CALLED"))
         return _fakebin(tmp_path, monkeypatch, docker="""
 [ "$1" = inspect ] || exit 1
@@ -1004,3 +1076,1248 @@ class TestDecodeArgv:
         with pytest.raises(SystemExit) as excinfo:
             broker.decode_argv("not base64!")
         assert _exit_code(excinfo) == 2
+
+
+@pytest.fixture
+def stage(tmp_path, monkeypatch, conf) -> Path:
+    """A valid secrets stage dir, with HOME away from the operator's real config."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    conf["SECRETS_STAGE_DIR"] = str(tmp_path / "stage")
+    conf["VENV_CACHE_ROOT"] = ""
+    return tmp_path / "stage"
+
+
+@pytest.fixture
+def repo(tmp_path) -> Path:
+    return _make_store(tmp_path / "repo")
+
+
+@pytest.fixture
+def docker_log(tmp_path, monkeypatch) -> Path:
+    """Fake docker for `graphql start`: the argv of its `docker run` lands in the returned file."""
+    log = tmp_path / "docker.log"
+    monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
+    monkeypatch.setattr(broker, "sweep_gql_orphans", lambda: None)
+    monkeypatch.setattr(broker, "do_graphql_status", lambda scope, tip: None)
+    monkeypatch.setattr(broker, "_probe", lambda url, timeout: True)
+    monkeypatch.setattr(broker, "_venv_cache_args", lambda repo, image: [])
+    broker.CONF["GRAPHQL_BIND"] = "127.0.0.1"
+    _fakebin(tmp_path, monkeypatch, docker="""
+case "$1" in
+  run) printf '%s\\n' "$@" > "$FAKE_DOCKER_LOG" ;;
+  port) echo 127.0.0.1:4321 ;;
+  inspect) [ "$2" != "--format" ] && [ "$3" != "--format" ] && exit 1; echo true ;;
+esac
+""")
+    return log
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _refused(callable_, *args, **kwargs) -> str:
+    with pytest.raises(broker.SecretsRefused) as excinfo:
+        callable_(*args, **kwargs)
+    return str(excinfo.value)
+
+
+class TestSecretsResolver:
+    @pytest.fixture(autouse=True)
+    def _stage(self, stage):
+        return stage
+
+    def _resolve(self, repo: Path, rel: str = ".env", **kwargs) -> "broker.Secrets":
+        return broker.resolve_secrets(str(repo), f"{repo}/{rel}", **kwargs)
+
+    def test_copy_is_private_and_equals_the_bytes(self, repo, stage):
+        (repo / ".env").write_bytes(b"A=1\nB='two words'\n")
+        secrets = self._resolve(repo)
+        assert secrets.source == f"{repo}/.env"
+        assert secrets.project_subdir == "."
+        assert Path(secrets.staged).parent == stage
+        assert Path(secrets.staged).read_bytes() == b"A=1\nB='two words'\n"
+        assert _mode(Path(secrets.staged)) == 0o600
+        assert _mode(stage) == 0o700
+        assert secrets.values() == {"A": "1", "B": "two words"}
+
+    def test_subdir_env_gives_project_subdir(self, repo):
+        (repo / "api").mkdir()
+        (repo / "api" / ".env").write_text("A=1\n")
+        secrets = self._resolve(repo, "api/.env")
+        assert secrets.project_subdir == "api"
+        assert Path(secrets.staged).read_text() == "A=1\n"
+
+    def test_values_are_those_read_at_resolve_time(self, repo):
+        (repo / ".env").write_text("A=before\n")
+        secrets = self._resolve(repo)
+        (repo / ".env").write_text("A=after\n")
+        assert secrets.values() == {"A": "before"}
+
+    @pytest.mark.parametrize("layout,part", [("last", ".env"), ("middle", "api")], ids=["last-part", "middle-dir"])
+    def test_symlink_below_the_repo_refused(self, repo, tmp_path, layout, part):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / ".env").write_text("STOLEN=1\n")
+        if layout == "last":
+            (repo / ".env").symlink_to(outside / ".env")
+            rel = ".env"
+        else:
+            (repo / "api").symlink_to(outside)
+            rel = "api/.env"
+        reason = _refused(self._resolve, repo, rel)
+        assert "symlink" in reason
+        assert part in reason
+
+    def test_symlink_to_a_file_inside_the_repo_refused(self, repo):
+        (repo / "real.env").write_text("A=1\n")
+        (repo / ".env").symlink_to(repo / "real.env")
+        assert "symlink" in _refused(self._resolve, repo)
+
+    def test_fifo_refused_without_blocking(self, repo):
+        os.mkfifo(repo / ".env")
+        result = []
+        thread = threading.Thread(target=lambda: result.append(_refused(self._resolve, repo)), daemon=True)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive(), "opening a FIFO blocked the resolver"
+        assert "not a regular file" in result[0]
+
+    def test_directory_refused(self, repo):
+        (repo / ".env").mkdir()
+        assert "not a regular file" in _refused(self._resolve, repo)
+
+    def test_oversize_file_refused(self, repo):
+        (repo / ".env").write_bytes(b"A=" + b"x" * (2 << 20))
+        assert "larger than" in _refused(self._resolve, repo)
+
+    @pytest.mark.parametrize("rel", ["../x/.env", "api/../../x/.env", "/abs/.env", "api//.env"],
+                             ids=["dotdot", "nested-dotdot", "absolute", "empty-part"])
+    def test_non_relative_path_refused(self, repo, rel):
+        assert "relative" in _refused(broker.resolve_secrets, str(repo), f"{repo}/{rel}")
+
+    def test_path_outside_the_repo_refused(self, repo, tmp_path):
+        assert "outside the repo" in _refused(broker.resolve_secrets, str(repo), str(tmp_path / ".env"))
+
+    def test_absent_gives_no_mount_and_deletes_a_stale_copy(self, repo, stage):
+        (repo / ".env").write_text("A=1\n")
+        stale = Path(self._resolve(repo).staged)
+        (repo / ".env").unlink()
+        secrets = self._resolve(repo)
+        assert secrets.staged is None
+        assert secrets.mount_args() == []
+        assert not stale.exists()
+
+    def test_absent_directory_below_the_repo_is_absent(self, repo):
+        assert self._resolve(repo, "nope/.env").staged is None
+
+    def test_copy_is_replaced_atomically(self, repo):
+        (repo / ".env").write_text("A=old\n")
+        first = self._resolve(repo).staged
+        with open(first, "rb") as running:
+            (repo / ".env").write_text("A=new\n")
+            assert self._resolve(repo).staged == first
+            assert running.read() == b"A=old\n"
+        assert Path(first).read_bytes() == b"A=new\n"
+        assert _mode(Path(first)) == 0o600
+        assert [path.name for path in Path(first).parent.iterdir()] == [Path(first).name]
+
+    def test_copy_of_another_file_has_another_name(self, repo):
+        (repo / "api").mkdir()
+        (repo / ".env").write_text("A=1\n")
+        (repo / "api" / ".env").write_text("A=2\n")
+        assert self._resolve(repo).staged != self._resolve(repo, "api/.env").staged
+
+    def test_stage_false_reads_without_copying(self, repo, stage):
+        (repo / ".env").write_text("A=1\n")
+        secrets = self._resolve(repo, stage=False)
+        assert secrets.staged is None
+        assert secrets.values() == {"A": "1"}
+        assert not stage.exists()
+
+    def test_operator_path_follows_symlinks_above_but_not_the_basename(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "my.env").write_text("A=1\n")
+        (tmp_path / "linkdir").symlink_to(real)
+        (real / "evil.env").symlink_to(real / "my.env")
+        assert broker.resolve_secrets("/unused", str(tmp_path / "linkdir" / "my.env"), operator_path=True).values() == {"A": "1"}
+        assert "symlink" in _refused(broker.resolve_secrets, "/unused", str(real / "evil.env"), operator_path=True)
+
+    def test_old_copies_are_swept(self, repo, stage):
+        (repo / ".env").write_text("A=1\n")
+        self._resolve(repo)
+        old = stage / "0123456789abcdef.env"
+        leftover = stage / ".stage-crash123"
+        bystander = stage / "notes.txt"
+        for path in (old, leftover, bystander):
+            path.write_text("A=1\n")
+            os.utime(path, (1, 1))
+        fresh = Path(self._resolve(repo).staged)
+        assert fresh.exists()
+        assert not old.exists()
+        assert not leftover.exists()
+        assert bystander.exists()
+
+    @pytest.mark.parametrize("break_stage", ["open-mode", "symlink", "regular-file", "inside-venv-cache", "inside-runs"],
+                             ids=["open-mode", "symlink", "regular-file", "inside-venv-cache", "inside-runs"])
+    def test_bad_stage_dir_refused(self, repo, stage, tmp_path, conf, break_stage):
+        (repo / ".env").write_text("A=1\n")
+        match break_stage:
+            case "open-mode":
+                stage.mkdir()
+                stage.chmod(0o755)
+            case "symlink":
+                (tmp_path / "elsewhere").mkdir(mode=0o700)
+                stage.symlink_to(tmp_path / "elsewhere")
+            case "regular-file":
+                stage.write_text("")
+            case "inside-venv-cache":
+                conf["VENV_CACHE_ROOT"] = str(tmp_path)
+            case "inside-runs":
+                conf["TESTS_RUNS_ROOT"] = str(tmp_path)
+        assert "stage directory" in _refused(self._resolve, repo)
+
+    def test_stage_dir_inside_claude_dir_refused(self, repo, tmp_path, conf):
+        conf["SECRETS_STAGE_DIR"] = str(tmp_path / "home/.claude/stage")
+        (repo / ".env").write_text("A=1\n")
+        assert "stage directory" in _refused(self._resolve, repo)
+
+    def test_stage_dir_inside_a_registry_repo_refused(self, repo, tmp_path, conf):
+        registered = tmp_path / "registered"
+        registered.mkdir()
+        (tmp_path / "home/.config/cld").mkdir(parents=True)
+        (tmp_path / "home/.config/cld/config.toml").write_text(f'[repos.x]\npath = "{registered}"\n')
+        conf["SECRETS_STAGE_DIR"] = str(registered / "stage")
+        (repo / ".env").write_text("A=1\n")
+        assert "stage directory" in _refused(self._resolve, repo)
+
+    @pytest.mark.parametrize("char", [",", '"'], ids=["comma", "quote"])
+    def test_stage_dir_with_a_mount_separator_refused(self, repo, tmp_path, conf, char):
+        conf["SECRETS_STAGE_DIR"] = str(tmp_path / f"a{char}b")
+        (repo / ".env").write_text("A=1\n")
+        assert "comma or a quote" in _refused(self._resolve, repo)
+
+    def test_root_that_is_not_a_directory_is_refused(self, tmp_path):
+        (tmp_path / "file").write_text("")
+        assert "cannot read" in _refused(broker.read_repo_file, str(tmp_path / "file"), ".env")
+
+    def test_read_error_is_refused(self, repo, monkeypatch):
+        (repo / ".env").write_text("A=1\n")
+
+        def fail(fd):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(os, "fstat", fail)
+        assert "cannot read .env: Input/output error" in _refused(broker.read_repo_file, str(repo), ".env")
+
+    def test_stage_dir_inside_the_mailbox_root_refused(self, repo, tmp_path, conf):
+        conf["CLD_MAILBOX_ROOT"] = str(tmp_path)
+        (repo / ".env").write_text("A=1\n")
+        assert "stage directory" in _refused(self._resolve, repo)
+
+    def _exit3(self, repo, capsys, pyproject_dir: str) -> str:
+        (repo / ".cld").mkdir(exist_ok=True)
+        (repo / ".cld" / "config.toml").write_text(f'pyproject_dir = "{pyproject_dir}"\n')
+        with pytest.raises(SystemExit) as excinfo:
+            broker.resolve_secrets_env_file(str(repo))
+        assert _exit_code(excinfo) == 3
+        return capsys.readouterr().err
+
+    @pytest.mark.parametrize("pyproject_dir", ["{repo}/api", "/etc", "../x", "api/../../x"],
+                             ids=["absolute-inside-repo", "absolute-outside", "dotdot", "nested-dotdot"])
+    def test_pyproject_dir_refused_naming_the_source(self, repo, capsys, pyproject_dir):
+        pyproject_dir = pyproject_dir.format(repo=repo)
+        (repo / "api").mkdir()
+        (repo / "api" / ".env").write_text("A=1\n")
+        err = self._exit3(repo, capsys, pyproject_dir)
+        assert err.startswith(f"denied: secrets file {repo}/{pyproject_dir}/.env: ")
+
+    def test_symlinked_pyproject_dir_folder_refused(self, repo, tmp_path, capsys):
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / ".env").write_text("A=1\n")
+        (repo / "api").symlink_to(tmp_path / "outside")
+        err = self._exit3(repo, capsys, "api")
+        assert f"denied: secrets file {repo}/api/.env: symlink or non-directory at api" in err
+
+    def test_resolve_secrets_env_file_follows_pyproject_dir(self, repo):
+        (repo / ".cld").mkdir()
+        (repo / ".cld" / "config.toml").write_text('pyproject_dir = "api"\n')
+        (repo / "api").mkdir()
+        (repo / "api" / ".env").write_text("A=1\n")
+        secrets = broker.resolve_secrets_env_file(str(repo))
+        assert (secrets.source, secrets.project_subdir) == (f"{repo}/api/.env", "api")
+
+    def test_denial_never_names_the_copy(self, repo, stage, capsys):
+        (repo / ".env").symlink_to(repo / "real")
+        with pytest.raises(SystemExit):
+            broker.resolve_secrets_env_file(str(repo))
+        assert str(stage) not in capsys.readouterr().err
+
+
+class TestSecretMountArgs:
+    @pytest.fixture(autouse=True)
+    def _stage(self, stage):
+        return stage
+
+    def test_mount_is_the_copy_read_only(self):
+        secrets = broker.Secrets("/r/.env", ".", "/stage/abc.env", b"")
+        assert secrets.mount_args() == ["--mount", "type=bind,src=/stage/abc.env,dst=/secrets/.env,readonly"]
+
+    def test_nothing_to_mount_when_absent(self):
+        assert broker.Secrets("/r/.env", ".", None, None).mount_args() == []
+
+    def _run_tests(self, repo: Path, monkeypatch, pytest_argv: list[str]) -> list[str]:
+        """The `docker run` argv of run_tests, with the exec stubbed."""
+        calls = []
+        monkeypatch.setattr(broker, "_exec", calls.append)
+        monkeypatch.setattr(broker, "_venv_cache_args", lambda repo, image: [])
+        broker.run_tests(str(repo), "rev", broker.resolve_secrets_env_file(str(repo)), "", pytest_argv)
+        return calls[0]
+
+    def test_run_tests_mounts_only_the_copy(self, repo, stage, monkeypatch):
+        (repo / ".env").write_text("A=1\n")
+        argv = self._run_tests(repo, monkeypatch, ["-k", "x"])
+        mount = next(spec for spec in _mount_specs(argv) if "dst=/secrets/.env" in spec)
+        copy = mount.split(",")[1].removeprefix("src=")
+        assert mount == f"type=bind,src={copy},dst=/secrets/.env,readonly"
+        assert Path(copy).parent == stage
+        assert _mode(Path(copy)) == 0o600
+        assert not any(str(repo / ".env") in arg for arg in argv)
+
+    def test_run_tests_without_env_mounts_nothing(self, repo, monkeypatch):
+        argv = self._run_tests(repo, monkeypatch, [])
+        assert "/secrets/.env" not in " ".join(argv)
+
+    def test_run_tests_dispatch_refuses_a_symlinked_env(self, repo, tmp_path, monkeypatch, capsys):
+        (tmp_path / "outside.env").write_text("A=1\n")
+        (repo / ".env").symlink_to(tmp_path / "outside.env")
+        monkeypatch.setattr(broker, "_exec", lambda argv: pytest.fail("docker run reached"))
+        monkeypatch.setattr(broker.CliCaller, "revision", lambda self, repo: "rev")
+        caller = broker.CliCaller("cld_cli", str(repo), "@")
+        with pytest.raises(SystemExit) as excinfo:
+            broker.action_run_tests(caller, [])
+        assert _exit_code(excinfo) == 3
+        assert f"denied: secrets file {repo}/.env: symlink at .env" in capsys.readouterr().err
+
+    def test_graphql_start_mounts_only_the_copy(self, repo, stage, docker_log):
+        (repo / ".cld").mkdir()
+        (repo / ".cld" / "config.toml").write_text('graphql_command = "serve"\n')
+        (repo / ".env").write_text("A=1\n")
+        broker.do_graphql_start(broker.Scope("cld_ticket_x", str(repo)), "rev", "")
+        args = docker_log.read_text().splitlines()
+        mount = next(spec for spec in _mount_specs(args) if "dst=/secrets/.env" in spec)
+        copy = Path(mount.split(",")[1].removeprefix("src="))
+        assert mount == f"type=bind,src={copy},dst=/secrets/.env,readonly"
+        assert copy.parent == stage
+        assert _mode(copy) == 0o600
+        assert not any(str(repo / ".env") in arg for arg in args)
+
+    def test_graphql_start_refuses_a_symlinked_env_before_docker_run(self, repo, tmp_path, docker_log, capsys):
+        (repo / ".cld").mkdir()
+        (repo / ".cld" / "config.toml").write_text('graphql_command = "serve"\n')
+        (tmp_path / "outside.env").write_text("A=1\n")
+        (repo / ".env").symlink_to(tmp_path / "outside.env")
+        with pytest.raises(SystemExit) as excinfo:
+            broker.do_graphql_start(broker.Scope("cld_ticket_x", str(repo)), "rev", "")
+        assert _exit_code(excinfo) == 3
+        assert "denied: secrets file" in capsys.readouterr().err
+        assert not docker_log.exists()
+
+
+class TestAliasNoFollow:
+    @pytest.fixture(autouse=True)
+    def _stage(self, stage):
+        return stage
+
+    @pytest.fixture
+    def scope(self, repo) -> "broker.Scope":
+        return broker.Scope("cld_agent_test", str(repo))
+
+    @pytest.fixture
+    def symlinked_env(self, repo, tmp_path) -> Path:
+        (tmp_path / "outside.env").write_text("CLD_GRAPHQL_URL_DEV=http://stolen/graphql\n")
+        (repo / ".env").symlink_to(tmp_path / "outside.env")
+        return repo / ".env"
+
+    def test_alias_query_reads_a_regular_env_without_staging_it(self, repo, scope, stage):
+        (repo / ".env").write_text("CLD_GRAPHQL_URL_DEV=https://dev/graphql\nCLD_GRAPHQL_AUTH_DEV='Bearer abc'\n")
+        assert broker.resolve_target(scope, "dev") == ("https://dev/graphql", "Bearer abc", "")
+        assert not stage.exists()
+
+    @pytest.mark.parametrize("target", ["dev", "local"], ids=["alias", "local"])
+    def test_symlinked_env_denied_naming_the_source(self, tmp_path, scope, symlinked_env, monkeypatch, capsys, target):
+        monkeypatch.setattr(broker, "resolve_graphql_config", lambda repo: broker.GraphqlConfig("serve", "8000", "/graphql"))
+        _fakebin(tmp_path, monkeypatch, docker='[ "$1" = port ] && echo "172.17.0.1:32768"\n')
+        with pytest.raises(SystemExit) as excinfo:
+            broker.resolve_target(scope, target)
+        assert _exit_code(excinfo) == 3
+        assert f"denied: secrets file {symlinked_env}: symlink at .env" in capsys.readouterr().err
+
+    def test_endpoints_denied_for_a_symlinked_env(self, scope, symlinked_env, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            broker.do_graphql_endpoints(scope)
+        assert _exit_code(excinfo) == 3
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"denied: secrets file {symlinked_env}: symlink at .env" in captured.err
+
+    def test_endpoints_lists_aliases_of_a_regular_env(self, repo, scope, capsys):
+        (repo / ".env").write_text("CLD_GRAPHQL_URL_STAGING_EU=https://s/graphql\n")
+        broker.do_graphql_endpoints(scope)
+        assert capsys.readouterr().out == "staging-eu\n"
+
+    def test_endpoints_denied_for_a_symlinked_pyproject_dir(self, repo, scope, tmp_path, capsys):
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / ".env").write_text("CLD_GRAPHQL_URL_DEV=http://stolen/graphql\n")
+        (repo / "api").symlink_to(tmp_path / "outside")
+        (repo / ".cld").mkdir()
+        (repo / ".cld" / "config.toml").write_text('pyproject_dir = "api"\n')
+        with pytest.raises(SystemExit) as excinfo:
+            broker.do_graphql_endpoints(scope)
+        assert _exit_code(excinfo) == 3
+        assert f"denied: secrets file {repo}/api/.env: " in capsys.readouterr().err
+
+    def test_fifo_env_denied_without_blocking(self, repo, scope):
+        os.mkfifo(repo / ".env")
+        outcome = []
+
+        def run() -> None:
+            try:
+                broker.resolve_target(scope, "dev")
+            except SystemExit as e:
+                outcome.append(e.code)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(5)
+        assert outcome == [3]
+
+
+class TestConfigNoFollow:
+    @pytest.fixture(autouse=True)
+    def _stage(self, stage):
+        return stage
+
+    def _denied(self, capsys, callable_, *args) -> str:
+        with pytest.raises(SystemExit) as excinfo:
+            callable_(*args)
+        assert _exit_code(excinfo) == 3
+        return capsys.readouterr().err
+
+    def test_reads_a_quoted_key(self, repo):
+        (repo / ".cld").mkdir()
+        (repo / ".cld" / "config.toml").write_text('graphql_command = "serve"\n  graphql_port = "9000"\nplain = 1\n')
+        assert broker.cld_conf_get(str(repo), "graphql_command") == "serve"
+        assert broker.cld_conf_get(str(repo), "graphql_port") == "9000"
+        assert broker.cld_conf_get(str(repo), "plain") == ""
+
+    def test_absent_file_or_dir_gives_empty(self, repo):
+        assert broker.cld_conf_get(str(repo), "graphql_command") == ""
+        (repo / ".cld").mkdir()
+        assert broker.cld_conf_get(str(repo), "graphql_command") == ""
+
+    def test_graphql_config_reads_through_the_resolver(self, repo):
+        (repo / ".cld").mkdir()
+        (repo / ".cld" / "config.toml").write_text('graphql_command = "serve"\ngraphql_health_path = "/h"\n')
+        assert broker.resolve_graphql_config(str(repo)) == broker.GraphqlConfig("serve", "8000", "/h")
+
+    @pytest.mark.parametrize("layout", ["symlinked-dir", "symlinked-file", "fifo", "directory"])
+    def test_refused_config_denied_naming_it(self, repo, tmp_path, capsys, layout):
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / "config.toml").write_text('graphql_command = "evil"\npyproject_dir = "x"\n')
+        match layout:
+            case "symlinked-dir":
+                (repo / ".cld").symlink_to(tmp_path / "outside")
+            case "symlinked-file":
+                (repo / ".cld").mkdir()
+                (repo / ".cld" / "config.toml").symlink_to(tmp_path / "outside" / "config.toml")
+            case "fifo":
+                (repo / ".cld").mkdir()
+                os.mkfifo(repo / ".cld" / "config.toml")
+            case "directory":
+                (repo / ".cld" / "config.toml").mkdir(parents=True)
+        for call in (broker.cld_conf_get, broker.resolve_secrets_env_file):
+            args = (str(repo), "graphql_command") if call is broker.cld_conf_get else (str(repo),)
+            assert f"denied: config file {repo}/.cld/config.toml: " in self._denied(capsys, call, *args)
+        assert "denied: config file" in self._denied(capsys, broker.resolve_graphql_config, str(repo))
+
+
+# What each layout's mount set must be, written out here rather than derived from either
+# builder (design section 3.1): path -> read-only.
+_EXPECTED_ROWS = {
+    "colocated": {".jj": False, ".jj/working_copy": True, ".jj/repo": False, ".jj/repo/config-id": True,
+                  ".jj/repo/store": False, ".jj/repo/store/git_target": True, ".git": False,
+                  ".git/config": True, ".git/hooks": True, ".git/commondir": True, ".jj/workspace-config-id": True},
+    "internal": {".jj": False, ".jj/working_copy": True, ".jj/repo": False, ".jj/repo/config-id": True,
+                 ".jj/repo/store": False, ".jj/repo/store/git_target": True, ".jj/repo/store/git": False,
+                 ".jj/repo/store/git/config": True, ".jj/repo/store/git/hooks": True,
+                 ".jj/repo/store/git/commondir": True, ".jj/workspace-config-id": True},
+    "git-only": {".git": False, ".git/config": True, ".git/hooks": True, ".git/commondir": True},
+}
+
+
+def _mount_specs(argv: list[str]) -> list[str]:
+    return [argv[i + 1] for i, arg in enumerate(argv) if arg == "--mount"]
+
+
+def _parse_mounts(specs: list[str], host_repo: Path, root: str) -> dict[tuple[str, str], bool]:
+    """{(source relative to the repo, target relative to the root): read-only} of --mount specs."""
+    mounts = {}
+    for spec in specs:
+        kind, src, dst, *flags = spec.split(",")
+        assert kind == "type=bind" and src.startswith("src=") and dst.startswith("dst=")
+        assert flags in ([], ["readonly"])
+        mounts[(os.path.relpath(src.removeprefix("src="), host_repo),
+                os.path.relpath(dst.removeprefix("dst="), root))] = bool(flags)
+    return mounts
+
+
+def _break_secondary_workspace(repo: Path) -> None:
+    shutil.rmtree(repo / ".jj/repo")
+    (repo / ".jj/repo").write_text("../../main/.jj/repo")
+
+
+def _break_git_worktree(repo: Path) -> None:
+    shutil.rmtree(repo / ".git")
+    (repo / ".git").write_text("gitdir: /elsewhere")
+
+
+def _break_git_target(repo: Path) -> None:
+    (repo / ".jj/repo/store/git_target").write_text("/elsewhere/.git")
+
+
+def _break_symlinked_source(repo: Path) -> None:
+    (repo / ".git/config").unlink()
+    (repo / ".git/config").symlink_to("/etc/hostname")
+
+
+def _break_legacy_config_without_id(repo: Path) -> None:
+    (repo / ".jj/workspace-config-id").unlink()
+    (repo / ".jj/workspace-config.toml").write_text('[revset-aliases]\n"trunk()" = "@"\n')
+
+
+def _break_no_store(repo: Path) -> None:
+    shutil.rmtree(repo / ".jj")
+    shutil.rmtree(repo / ".git")
+
+
+def _git_dir(repo: Path) -> Path:
+    return repo / ".git" if (repo / ".git" / "hooks").is_dir() else repo / ".jj/repo/store/git"
+
+
+def _break_commondir_redirect(repo: Path) -> None:
+    (_git_dir(repo) / "commondir").write_text("../elsewhere")
+
+
+def _break_commondir_newline(repo: Path) -> None:
+    (_git_dir(repo) / "commondir").write_text(".\n")
+
+
+def _break_commondir_symlink(repo: Path) -> None:
+    (_git_dir(repo) / "commondir").unlink()
+    (_git_dir(repo) / "commondir").symlink_to(".")
+
+
+def _break_commondir_directory(repo: Path) -> None:
+    (_git_dir(repo) / "commondir").unlink()
+    (_git_dir(repo) / "commondir").mkdir()
+
+
+def _break_modules(repo: Path) -> None:
+    (_git_dir(repo) / "modules").mkdir()
+
+
+def _break_modules_file(repo: Path) -> None:
+    (_git_dir(repo) / "modules").write_text("")
+
+
+class TestStoreMountParity:
+    """The broker cannot import cld, so its mount rows are a copy of cld/docker.py's: every
+    layout must give the same sources, targets and read-only flags."""
+
+    LAYOUTS = [("colocated", cld_docker.StoreLayout(jj=True, git_dir=".git")),
+               ("internal", cld_docker.StoreLayout(jj=True, git_dir=".jj/repo/store/git")),
+               ("git-only", cld_docker.StoreLayout(jj=False, git_dir=".git"))]
+
+    @pytest.mark.parametrize("name,cld_layout", LAYOUTS, ids=[name for name, _ in LAYOUTS])
+    @pytest.mark.parametrize("root", ["/repo", "/workspace/origin/api"])
+    def test_mount_args_match_the_launchers(self, tmp_path, name, cld_layout, root):
+        repo = _make_store(tmp_path / "repo", name)
+        ours = _parse_mounts(_mount_specs(broker.store_mounts(str(repo), root)), repo, root)
+        theirs = _parse_mounts(_mount_specs(cld_docker.store_mount_args(cld_layout, str(repo), root)), repo, root)
+        assert ours == theirs
+        assert len(ours) == len(_EXPECTED_ROWS[name])
+
+    @pytest.mark.parametrize("name,cld_layout", LAYOUTS, ids=[name for name, _ in LAYOUTS])
+    def test_rows_and_layout_match_the_launchers(self, tmp_path, name, cld_layout):
+        layout = broker.store_layout(str(_make_store(tmp_path / "repo", name)))
+        assert tuple(layout) == (cld_layout.jj, cld_layout.git_dir)
+        assert sorted(broker.store_rows(layout)) == sorted(cld_docker._store_rows(cld_layout))
+
+    def test_label_matches_the_launchers(self):
+        assert broker._ORIGIN_MOUNT_LABEL == f"{cld_docker.ORIGIN_MOUNT_LABEL}={cld_docker.ORIGIN_MOUNT_VALUE}"
+
+    def test_jj_ids_match_the_launchers(self):
+        assert broker._JJ_IDS == tuple((rel, legacy) for rel, legacy, _flag in cld_docker._JJ_IDS)
+
+    def test_git_dir_rules_match_the_launchers(self):
+        assert broker._GIT_DIRS == cld_jj.GIT_DIRS
+        assert broker._COMMONDIR_PLACEHOLDER == cld_jj.COMMONDIR_PLACEHOLDER
+        assert broker._JJ_MIN_VERSION == cld_docker._JJ_MIN_VERSION
+
+    GIT_DIR_DAMAGE = [
+        ("colocated", _break_commondir_redirect), ("internal", _break_commondir_redirect),
+        ("git-only", _break_commondir_redirect), ("colocated", _break_commondir_newline),
+        ("colocated", _break_commondir_symlink), ("git-only", _break_commondir_directory),
+        ("colocated", _break_modules), ("internal", _break_modules), ("git-only", _break_modules),
+        ("colocated", _break_modules_file),
+    ]
+    GIT_DIR_IDS = ["commondir-redirect", "commondir-redirect-internal", "commondir-redirect-git-only",
+                   "commondir-with-newline", "commondir-symlink", "commondir-directory", "modules",
+                   "modules-internal", "modules-git-only", "modules-file"]
+
+    @pytest.mark.parametrize(
+        "layout,damage",
+        [("colocated", _break_secondary_workspace), ("git-only", _break_git_worktree),
+         ("colocated", _break_git_target), ("colocated", _break_symlinked_source),
+         ("colocated", _break_legacy_config_without_id), ("colocated", _break_no_store), *GIT_DIR_DAMAGE],
+        ids=["secondary-workspace", "git-worktree", "foreign-git-target", "symlinked-source",
+             "legacy-config-without-id", "no-store", *GIT_DIR_IDS],
+    )
+    def test_refuses_what_the_launcher_refuses(self, tmp_path, monkeypatch, layout, damage):
+        repo = _make_store(tmp_path / "repo", layout)
+        damage(repo)
+        _fakebin(tmp_path, monkeypatch, jj='echo "jj 0.45.1"\n')
+        with pytest.raises(SystemExit):
+            cld_docker.prepare_store_mounts(repo)
+        with pytest.raises(broker.StoreRefused):
+            broker.store_mounts(str(repo), "/repo")
+
+    @pytest.mark.parametrize(
+        "layout,damage",
+        [case for case in GIT_DIR_DAMAGE if case[0] != "git-only"] + [("colocated", _break_legacy_config_without_id)],
+        ids=[i for case, i in zip(GIT_DIR_DAMAGE, GIT_DIR_IDS) if case[0] != "git-only"] + ["legacy-config-without-id"],
+    )
+    def test_host_jj_guard_refuses_what_the_launchers_does(self, tmp_path, layout, damage):
+        """The launcher's guard before any host jj call (cld/vcs/jj.py:check_jj_ids) and the broker's agree."""
+        repo = _make_store(tmp_path / "repo", layout)
+        damage(repo)
+        assert cld_jj.check_jj_ids(repo) is not None
+        with pytest.raises(broker.StoreRefused):
+            broker.check_jj_ids(str(repo))
+
+    @pytest.mark.parametrize("layout", ["colocated", "internal", "git-only"])
+    def test_both_accept_the_prepared_store(self, tmp_path, monkeypatch, layout):
+        repo = _make_store(tmp_path / "repo", layout)
+        _fakebin(tmp_path, monkeypatch, jj='echo "jj 0.45.1"\n')
+        cld_docker.prepare_store_mounts(repo)
+        broker.store_mounts(str(repo), "/repo")
+        assert cld_jj.check_jj_ids(repo) is None
+        if layout != "git-only":
+            broker.check_jj_ids(str(repo))
+
+    def test_the_unused_git_dir_is_guarded_too(self, tmp_path):
+        """A colocated repo's internal git dir is not mounted, but host jj could still use it."""
+        repo = _make_store(tmp_path / "repo")
+        (repo / ".jj/repo/store/git").mkdir()
+        (repo / ".jj/repo/store/git/commondir").write_text("../elsewhere")
+        assert cld_jj.check_jj_ids(repo) is not None
+        with pytest.raises(broker.StoreRefused, match="commondir exists"):
+            broker.check_jj_ids(str(repo))
+
+
+class TestRunnerStoreMounts:
+    """run-tests and graphql start mount the store rows at /repo and never the checkout."""
+
+    @pytest.fixture(autouse=True)
+    def _stage(self, stage):
+        return stage
+
+    @pytest.fixture
+    def run_tests_argv(self, monkeypatch):
+        def run(repo: Path) -> list[str]:
+            calls = []
+            monkeypatch.setattr(broker, "_exec", calls.append)
+            monkeypatch.setattr(broker, "_venv_cache_args", lambda repo, image: [])
+            broker.run_tests(str(repo), "rev", broker.Secrets(f"{repo}/.env", ".", None, None), "", [])
+            return calls[0]
+        return run
+
+    @pytest.fixture
+    def graphql_start_argv(self, docker_log):
+        def start(repo: Path) -> list[str]:
+            (repo / ".cld").mkdir(exist_ok=True)
+            (repo / ".cld" / "config.toml").write_text('graphql_command = "serve"\n')
+            broker.do_graphql_start(broker.Scope("cld_ticket_x", str(repo)), "rev", "")
+            return docker_log.read_text().splitlines()
+        return start
+
+    def _assert_store_only(self, argv: list[str], repo: Path, layout: str) -> None:
+        specs = [spec for spec in _mount_specs(argv) if "dst=/repo" in spec]
+        assert _parse_mounts(specs, repo, "/repo") == {(rel, rel): readonly
+                                                       for rel, readonly in _EXPECTED_ROWS[layout].items()}
+        assert "-v" not in argv
+        assert not any(arg.startswith(f"{repo}:") for arg in argv)
+        assert "org.cld.origin-mount=store-v1" in [argv[i + 1] for i, arg in enumerate(argv) if arg == "--label"]
+        assert "--cap-drop=ALL" in argv
+        assert "--security-opt=no-new-privileges" in argv
+
+    @pytest.mark.parametrize("layout", list(_EXPECTED_ROWS))
+    def test_run_tests_mounts_the_rows_per_layout(self, tmp_path, run_tests_argv, layout):
+        repo = _make_store(tmp_path / "layout-repo", layout)
+        self._assert_store_only(run_tests_argv(repo), repo, layout)
+
+    @pytest.mark.parametrize("layout", list(_EXPECTED_ROWS))
+    def test_graphql_start_mounts_the_rows_per_layout(self, tmp_path, graphql_start_argv, layout):
+        repo = _make_store(tmp_path / "layout-repo", layout)
+        self._assert_store_only(graphql_start_argv(repo), repo, layout)
+
+    def test_the_secrets_copy_is_mounted_beside_the_rows(self, repo, monkeypatch):
+        (repo / ".env").write_text("A=1\n")
+        calls = []
+        monkeypatch.setattr(broker, "_exec", calls.append)
+        monkeypatch.setattr(broker, "_venv_cache_args", lambda repo, image: [])
+        broker.run_tests(str(repo), "rev", broker.resolve_secrets_env_file(str(repo)), "", [])
+        specs = _mount_specs(calls[0])
+        assert len(specs) == 12
+        assert sum("dst=/secrets/.env,readonly" in spec for spec in specs) == 1
+
+    @pytest.mark.parametrize("missing", [".jj/repo/config-id", ".jj/workspace-config-id", ".git/hooks", ".git/commondir"],
+                             ids=["repo-id", "workspace-id", "hooks", "commondir"])
+    def test_unprepared_store_exits_3_without_running_docker(self, repo, run_tests_argv, graphql_start_argv,
+                                                             docker_log, capsys, missing):
+        target = repo / missing
+        shutil.rmtree(target) if target.is_dir() else target.unlink()
+        for start in (run_tests_argv, graphql_start_argv):
+            with pytest.raises(SystemExit) as excinfo:
+                start(repo)
+            assert _exit_code(excinfo) == 3
+            assert f"denied: {repo} store is not prepared -- start a ticket on it once" in capsys.readouterr().err
+        assert not docker_log.exists()
+
+    def test_symlinked_source_exits_3(self, repo, run_tests_argv, capsys):
+        _break_symlinked_source(repo)
+        with pytest.raises(SystemExit) as excinfo:
+            run_tests_argv(repo)
+        assert _exit_code(excinfo) == 3
+        assert ".git/config is a symlink, expected a file -- cannot mount its store safely" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("label", [None, "", "0.37.0", "0.9.1", "garbage"],
+                             ids=["no-image", "no-label", "0.37", "0.9", "unparsable"])
+    def test_image_without_a_jj_of_0_38_exits_3_without_running_docker(
+        self, repo, run_tests_argv, graphql_start_argv, docker_log, monkeypatch, capsys, label,
+    ):
+        monkeypatch.setattr(broker, "_label", lambda container, key: label)
+        for start in (run_tests_argv, graphql_start_argv):
+            with pytest.raises(SystemExit) as excinfo:
+                start(repo)
+            assert _exit_code(excinfo) == 3
+            err = capsys.readouterr().err
+            assert "org.cld.jj-version" in err and "rebuild it with its build.sh" in err
+        assert not docker_log.exists()
+
+    @pytest.mark.parametrize("label", ["0.38.0", "0.45.1", "0.100.0", "1.0.0"])
+    def test_image_with_a_jj_of_0_38_or_newer_is_accepted(self, repo, run_tests_argv, monkeypatch, label):
+        asked = []
+        monkeypatch.setattr(broker, "_label", lambda container, key: asked.append((container, key)) or label)
+        assert "--cap-drop=ALL" in run_tests_argv(repo)
+        assert asked == [(broker._setting("RUNTESTS_IMAGE"), "org.cld.jj-version")]
+
+    @pytest.mark.parametrize("char", [",", '"'], ids=["comma", "quote"])
+    def test_repo_path_with_a_mount_separator_exits_3(self, tmp_path, run_tests_argv, capsys, char):
+        repo = _make_store(tmp_path / f"a{char}b")
+        with pytest.raises(SystemExit) as excinfo:
+            run_tests_argv(repo)
+        assert _exit_code(excinfo) == 3
+        assert "comma or a quote" in capsys.readouterr().err
+
+    def test_dispatch_mounts_no_checkout_file(self, repo, monkeypatch):
+        (repo / ".env").write_text("A=1\n")
+        (repo / "checkout-file.txt").write_text("x")
+        calls = []
+        monkeypatch.setattr(broker, "_exec", calls.append)
+        monkeypatch.setattr(broker, "_venv_cache_args", lambda repo, image: [])
+        monkeypatch.setattr(broker.CliCaller, "revision", lambda self, repo: "rev")
+        broker.action_run_tests(broker.CliCaller("cld_cli", str(repo), "@"), ["-k", "x"])
+        assert not any(str(repo / ".env") in arg or str(repo / "checkout-file.txt") in arg for arg in calls[0])
+        assert calls[0][-2:] == ["-k", "x"]
+
+
+def _drop_id(repo: Path, rel: str) -> None:
+    (repo / rel).unlink()
+
+
+def _symlink_id(repo: Path, rel: str) -> None:
+    (repo / rel).unlink()
+    (repo / rel).symlink_to("/etc/hostname")
+
+
+def _legacy_next_to_missing_id(repo: Path, rel: str) -> None:
+    (repo / rel).unlink()
+    (repo / dict(broker._JJ_IDS)[rel]).write_text("")
+
+
+class TestHostJjNeedsIds:
+    """Host jj runs on a repo only with both jj ids present as regular files: without one,
+    any jj call would migrate a planted legacy config into the host's jj config (design A10)."""
+
+    @pytest.fixture
+    def jj_log(self, tmp_path, monkeypatch) -> Path:
+        """Fake jj and docker that record every call; the docker log only holds `docker run`."""
+        monkeypatch.setenv("FAKE_JJ_LOG", str(tmp_path / "jj.log"))
+        monkeypatch.setenv("FAKE_DOCKER_LOG", str(tmp_path / "docker.log"))
+        _fakebin(tmp_path, monkeypatch, jj='printf "%s\\n" "$*" >> "$FAKE_JJ_LOG"\necho rev123\n', docker="""
+case "$1" in
+  run) echo run >> "$FAKE_DOCKER_LOG" ;;
+  ps) echo cld_gql_cld_gone ;;
+  inspect) [ "$#" -gt 2 ] || exit 1 ;;
+esac
+""")
+        return tmp_path / "jj.log"
+
+    BROKEN = pytest.mark.parametrize(
+        "damage,rel,message",
+        [(_drop_id, ".jj/repo/config-id", "store is not prepared -- start a ticket on it once"),
+         (_drop_id, ".jj/workspace-config-id", "store is not prepared -- start a ticket on it once"),
+         (_symlink_id, ".jj/repo/config-id", ".jj/repo/config-id is a symlink, expected a file"),
+         (_symlink_id, ".jj/workspace-config-id", ".jj/workspace-config-id is a symlink, expected a file"),
+         (_legacy_next_to_missing_id, ".jj/repo/config-id", "unmigrated jj config .jj/repo/config.toml"),
+         (_legacy_next_to_missing_id, ".jj/workspace-config-id", "unmigrated jj config .jj/workspace-config.toml")],
+        ids=["repo-id-missing", "workspace-id-missing", "repo-id-symlink", "workspace-id-symlink",
+             "repo-legacy-config", "workspace-legacy-config"],
+    )
+
+    @BROKEN
+    @pytest.mark.parametrize("call", ["label-revision", "cli-revision", "run-tests", "graphql-start"])
+    def test_denied_with_no_jj_run(self, repo, jj_log, tmp_path, capsys, damage, rel, message, call):
+        damage(repo, rel)
+        label_caller = broker.LabelCaller("cld_agent_x", "task-agent", str(repo))
+        cli_caller = broker.CliCaller("cld_cli", str(repo), "@")
+        action = {
+            "label-revision": lambda: label_caller.revision(str(repo)),
+            "cli-revision": lambda: cli_caller.revision(str(repo)),
+            "run-tests": lambda: broker.action_run_tests(cli_caller, []),
+            "graphql-start": lambda: broker.action_graphql(cli_caller, ["start"]),
+        }[call]
+        with pytest.raises(SystemExit) as excinfo:
+            action()
+        assert _exit_code(excinfo) == 3
+        assert message in capsys.readouterr().err
+        assert not jj_log.exists()
+        assert not (tmp_path / "docker.log").exists()
+
+    @BROKEN
+    def test_forget_warns_and_runs_no_jj(self, repo, jj_log, capsys, damage, rel, message):
+        damage(repo, rel)
+        broker._forget_workspace(str(repo), "gql-x")
+        err = capsys.readouterr().err
+        assert "workspace gql-x not forgotten: denied: " in err
+        assert message in err
+        assert not jj_log.exists()
+
+    @BROKEN
+    def test_stop_and_the_orphan_sweep_run_no_jj(self, repo, jj_log, monkeypatch, damage, rel, message):
+        damage(repo, rel)
+        monkeypatch.setattr(broker, "_label", lambda container, key: "cld_gone" if "session" in key else str(repo))
+        broker.do_graphql_stop(broker.Scope("cld_ticket_x", str(repo)))
+        broker.sweep_gql_orphans()
+        assert not jj_log.exists()
+
+    def test_prepared_store_runs_jj_read_only_for_a_container_caller(self, repo, jj_log):
+        assert broker.LabelCaller("cld_agent_x", "task-agent", str(repo)).revision(str(repo)) == "rev123"
+        assert jj_log.read_text().splitlines() == [
+            f"-R {repo} --ignore-working-copy log --no-graph -n1 -r cld_agent_x@ -T commit_id"]
+
+    def test_prepared_store_snapshots_for_the_host_operator(self, repo, jj_log):
+        assert broker.CliCaller("cld_cli", str(repo), "main").revision(str(repo)) == "rev123"
+        assert jj_log.read_text().splitlines() == [f"-R {repo} log --no-graph -n1 -r main -T commit_id"]
+
+    def test_forget_runs_without_snapshot(self, repo, jj_log):
+        broker._forget_workspace(str(repo), "gql-x")
+        assert jj_log.read_text().splitlines() == [f"-R {repo} --ignore-working-copy workspace forget gql-x"]
+
+    def test_git_only_repo_runs_no_jj(self, tmp_path, jj_log):
+        repo = _make_store(tmp_path / "plain", "git-only")
+        assert broker.LabelCaller("cld_agent_x", "task-agent", str(repo)).revision(str(repo)) is None
+        broker._forget_workspace(str(repo), "gql-x")
+        assert not jj_log.exists()
+
+    def test_every_host_jj_call_goes_through_the_guard(self):
+        """Static: the script names the `jj` binary only in host_jj and in its version probe."""
+        lines = BROKER_PY.read_text().splitlines()
+        hits = [i for i, line in enumerate(lines) if '"jj"' in line and not line.lstrip().startswith("#")]
+        assert [next(line for line in reversed(lines[:i]) if line.startswith("def ")).split("(")[0]
+                for i in hits] == ["def _host_jj_version", "def host_jj"]
+        start = next(i for i, line in enumerate(lines) if line.startswith("def host_jj("))
+        body = "\n".join(lines[start:hits[1] + 1])
+        assert body.index("    check_jj_ids(repo)") < body.index("    require_host_jj()") < body.index('_out("jj"')
+
+    def test_the_operator_script_runs_no_jj_of_its_own(self):
+        """cld-brokerctl.sh reaches the broker's guarded sweep instead of a bash copy with its own jj call."""
+        script = (BROKER_PY.parent / "cld-brokerctl.sh").read_text()
+        code = [line for line in script.splitlines() if not line.lstrip().startswith("#")]
+        assert not any(re.search(r"\bjj\b", line) for line in code)
+        assert "graphql-sweep() { run graphql-sweep; }" in code
+
+
+class TestVenvCachePerRepo:
+    """Code under test writes the venv cache, and a venv or a wheel in it is run or installed later
+    with the `.env` of whichever repo restores it. A repo therefore gets a folder of its own below
+    the cache root, and that folder is all its runs mount."""
+
+    @pytest.fixture(autouse=True)
+    def _docker(self, monkeypatch):
+        monkeypatch.setattr(broker, "_out_strict", lambda *argv, **kwargs: "sha256:img")
+
+    def _mounted(self, cache: Path, repo: Path) -> str:
+        broker.CONF["VENV_CACHE_ROOT"] = str(cache)
+        args = broker._venv_cache_args(str(repo), "img")
+        return args[args.index("-v") + 1].removesuffix(":/cache")
+
+    def test_two_repos_never_share_a_folder(self, tmp_path):
+        (tmp_path / "x" / "api").mkdir(parents=True)
+        (tmp_path / "y" / "api").mkdir(parents=True)
+        first, second = (self._mounted(tmp_path / "cache", tmp_path / d / "api") for d in "xy")
+        assert first != second
+        assert not Path(first).is_relative_to(second) and not Path(second).is_relative_to(first)
+
+    def test_the_root_itself_is_never_mounted(self, tmp_path):
+        mounted = Path(self._mounted(tmp_path / "cache", tmp_path))
+        assert mounted.parent == tmp_path / "cache" / "repos"
+        assert not (tmp_path / "cache" / "venvs").exists()
+
+    def test_a_repo_keeps_its_folder_across_runs_and_symlinks(self, tmp_path):
+        (tmp_path / "api").mkdir()
+        (tmp_path / "link").symlink_to(tmp_path / "api")
+        assert self._mounted(tmp_path / "cache", tmp_path / "api") == self._mounted(tmp_path / "cache", tmp_path / "link")
+
+    def test_each_folder_holds_the_dirs_venv_cache_sh_expects(self, tmp_path):
+        mounted = Path(self._mounted(tmp_path / "cache", tmp_path))
+        assert sorted(entry.name for entry in mounted.iterdir()) == ["locks", "poetry", "venvs"]
+
+    @pytest.mark.parametrize("name", ["we ird:na,me", "..x", "a'b\"c"], ids=["separators", "dots", "quotes"])
+    def test_a_hostile_repo_name_stays_one_path_component(self, tmp_path, name):
+        (tmp_path / name).mkdir()
+        mounted = Path(self._mounted(tmp_path / "cache", tmp_path / name))
+        assert mounted.parent == tmp_path / "cache" / "repos"
+        assert re.fullmatch(r"[A-Za-z0-9_.-]*-[0-9a-f]{16}", mounted.name)
+
+    def test_the_workers_still_get_the_image_id(self, tmp_path):
+        broker.CONF["VENV_CACHE_ROOT"] = str(tmp_path / "cache")
+        assert broker._venv_cache_args(str(tmp_path), "img")[2:] == ["-e", "VENV_CACHE_IMAGE_ID=sha256:img"]
+
+    def test_disabled_cache_mounts_nothing(self, tmp_path):
+        broker.CONF["VENV_CACHE_ROOT"] = ""
+        assert broker._venv_cache_args(str(tmp_path), "img") == []
+
+
+def _write_cld_config(repo: Path, body: str) -> None:
+    (repo / ".cld").mkdir(exist_ok=True)
+    (repo / ".cld" / "config.toml").write_text(body)
+
+
+class TestGraphqlConfigChecks:
+    """graphql_port and graphql_health_path are written by the agent and end up in a URL, `-p`,
+    `docker port` and an env var. A health path that is not a plain path could move the URL to
+    another host, where `local` would send the alias credentials."""
+
+    @pytest.mark.parametrize("path", ["graphql", "//evil.example/graphql", "http://evil.example/x", "@evil.example",
+                                      ":80/x", "evil.example/x", "?x=1"],
+                             ids=["no-slash", "authority", "absolute-url", "userinfo", "port", "host", "query-only"])
+    def test_health_path_must_be_a_path_from_the_root(self, repo, capsys, path):
+        _write_cld_config(repo, f'graphql_health_path = "{path}"\n')
+        with pytest.raises(SystemExit) as excinfo:
+            broker.resolve_graphql_config(str(repo))
+        assert _exit_code(excinfo) == 3
+        assert "graphql_health_path" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("path", ["/graphql", "/", "/a/b?x=1", "/health/"])
+    def test_plain_health_paths_are_accepted(self, repo, path):
+        _write_cld_config(repo, f'graphql_health_path = "{path}"\n')
+        assert broker.resolve_graphql_config(str(repo)).health_path == path
+
+    @pytest.mark.parametrize("port", ["0", "65536", "-1", "80;x", "8000 -p 22:22", "8 0", "\u0668\u0660", "0x50", "1e3"],
+                             ids=["zero", "too-big", "negative", "semicolon", "extra-flag", "space", "arabic-digits",
+                                  "hex", "float"])
+    def test_port_must_be_a_number_in_range(self, repo, capsys, port):
+        _write_cld_config(repo, f'graphql_port = "{port}"\n')
+        with pytest.raises(SystemExit) as excinfo:
+            broker.resolve_graphql_config(str(repo))
+        assert _exit_code(excinfo) == 3
+        assert "graphql_port" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("port", ["1", "8000", "65535"])
+    def test_ports_in_range_are_accepted(self, repo, port):
+        _write_cld_config(repo, f'graphql_port = "{port}"\n')
+        assert broker.resolve_graphql_config(str(repo)).port == port
+
+    def test_a_bad_health_path_stops_local_before_any_request(self, repo, monkeypatch, capsys):
+        _write_cld_config(repo, 'graphql_health_path = "//evil.example/x"\n')
+        monkeypatch.setattr(broker, "http_post", lambda *args: pytest.fail("a request was sent"))
+        with pytest.raises(SystemExit) as excinfo:
+            broker.resolve_target(broker.Scope("cld_agent_test", str(repo)), "local")
+        assert _exit_code(excinfo) == 3
+
+    @pytest.mark.parametrize(
+        "path,url",
+        [("/graphql", "http://127.0.0.1:9/graphql"), ("/h?a=1#frag", "http://127.0.0.1:9/h?a=1"),
+         ("//evil.example/x", "http://127.0.0.1:9/x"), ("@evil.example/x", "http://127.0.0.1:9/@evil.example/x"),
+         ("http://evil.example/x", "http://127.0.0.1:9/x")],
+        ids=["plain", "query-kept-fragment-dropped", "authority-ignored", "userinfo-is-path", "url-ignored"],
+    )
+    def test_the_url_keeps_its_host_whatever_the_path_is(self, path, url):
+        assert broker.local_url("127.0.0.1:9", path) == url
+
+
+class TestGraphqlFailureMessages:
+    """A failed request never prints the URL an alias resolved to: it can carry userinfo from the .env."""
+
+    ALIAS_URL = "https://deploy:hunter2@api.example/graphql"
+
+    def _query(self, monkeypatch, target: str, url: str) -> None:
+        monkeypatch.setattr(broker, "resolve_target", lambda scope, t: (url, "", ""))
+        broker.do_graphql_query(broker.Scope("cld_agent_test", "/repo"), target, "{ __typename }")
+
+    @pytest.mark.parametrize("target,shown", [("prod", "'prod'"), ("local", "'local'"),
+                                              ("https://u:pw@dev.example:8443/g?x=1", "'https://dev.example'")],
+                             ids=["alias", "local", "raw-url"])
+    def test_connection_failure_names_the_target_without_userinfo(self, monkeypatch, capsys, target, shown):
+        monkeypatch.setattr(broker, "http_post", lambda *args: None)
+        with pytest.raises(SystemExit) as excinfo:
+            self._query(monkeypatch, target, self.ALIAS_URL)
+        assert _exit_code(excinfo) == 3
+        err = capsys.readouterr().err
+        assert f"graphql request to {shown} failed (connection error)" in err
+        assert not any(secret in err for secret in ("hunter2", "deploy", "api.example", "pw@"))
+
+    @pytest.mark.parametrize("url", ["https://deploy:hunter2@127.0.0.1:1/graphql",
+                                     "https://deploy:hunter2@127.0.0.1:notaport/x", "gopher://deploy:hunter2@127.0.0.1/x"],
+                             ids=["refused", "bad-port", "bad-scheme"])
+    def test_transport_error_text_never_quotes_the_url(self, capsys, url):
+        assert broker.http_post(url, b"{}", {}, 2) is None
+        err = capsys.readouterr().err
+        assert err.startswith("[cld-broker] graphql request failed: ")
+        assert not any(secret in err for secret in ("hunter2", "deploy", "notaport", "gopher"))
+
+
+class TestTaskAgentArgv:
+    """`--` ends option parsing on the host, so a token after it would be a bare positional that
+    skips the @ref check; the broker's own --parent has to come before the caller's tokens."""
+
+    @pytest.fixture(autouse=True)
+    def fakebin(self, tmp_path, monkeypatch):
+        (tmp_path / "repo").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(broker, "stage_agent_socket", lambda: None)
+        monkeypatch.setattr(broker, "_exec", lambda argv: pytest.fail(f"exec {argv}"))
+        return tmp_path
+
+    def _denied(self, capsys, argv: list[str]) -> str:
+        with pytest.raises(SystemExit) as excinfo:
+            broker.action_task_agent(broker.CliCaller("cld_cli", "/nonexistent", "@"), argv)
+        assert _exit_code(excinfo) == 2
+        return capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["start", "@task", "--", "/etc/passwd"], ["start", "--", "/etc/passwd"], ["start", "-p", "--"],
+         ["status", "--"], ["logs", "slug", "--"], ["shutdown", "--", "--all"], ["shutdown", "slug", "--", "--force"]],
+        ids=["start-after-ref", "start-first", "start-as-option-value", "status", "logs", "shutdown-all",
+             "shutdown-force-behind"],
+    )
+    def test_double_dash_denied_for_every_op(self, capsys, argv):
+        assert "'--' is not accepted" in self._denied(capsys, argv)
+
+    @pytest.mark.parametrize(
+        "argv,forwarded",
+        [(["start", "@task", "-n", "s"], ["start", "--parent", "cld_cli", "@task", "-n", "s"]),
+         (["status", "slug"], ["status", "--parent", "cld_cli", "slug"]),
+         (["shutdown", "--all"], ["shutdown", "--parent", "cld_cli", "--all"]),
+         (["logs", "slug"], ["logs", "slug"])],
+        ids=["start", "status", "shutdown", "logs-has-no-parent"],
+    )
+    def test_broker_parent_precedes_the_callers_tokens(self, tmp_path, monkeypatch, argv, forwarded):
+        calls = []
+        monkeypatch.setattr(broker, "_exec", calls.append)
+        broker.action_task_agent(broker.CliCaller("cld_cli", str(tmp_path / "repo"), "@"), argv)
+        assert calls == [["cld", "task-agent", *forwarded]]
+
+
+class TestHostJjVersion:
+    """Host jj gets the launcher's 0.38 minimum (cld/docker.py:_check_jj_version) before its first call:
+    the broker PATH comes from broker.conf, and an older jj also reads the agent-writable repo configs."""
+
+    @pytest.fixture(autouse=True)
+    def jj(self, tmp_path, monkeypatch):
+        """A fake jj that logs every call and reports FAKE_JJ_VERSION, with the real, cached check in place."""
+        monkeypatch.setenv("FAKE_JJ_LOG", str(tmp_path / "jj.log"))
+        monkeypatch.setenv("FAKE_JJ_VERSION", "jj 0.45.1")
+        _fakebin(tmp_path, monkeypatch, jj="""
+printf '%s %s\\n' "$PWD" "$*" >> "$FAKE_JJ_LOG"
+if [ "$1" = --version ]; then echo "$FAKE_JJ_VERSION"; exit 0; fi
+echo rev123
+""")
+        _real_host_jj_version.cache_clear()
+        monkeypatch.setattr(broker, "_host_jj_version", _real_host_jj_version)
+        yield tmp_path / "jj.log"
+        _real_host_jj_version.cache_clear()
+
+    def _calls(self, log: Path) -> list[str]:
+        return log.read_text().splitlines() if log.exists() else []
+
+    @pytest.mark.parametrize("version", ["jj 0.37.2", "jj 0.9.0", "jj 0.1.0-dev", "garbage", ""],
+                             ids=["0.37", "0.9", "0.1", "unparsable", "silent"])
+    def test_an_old_or_unreadable_jj_refuses_every_host_call(self, repo, jj, monkeypatch, version):
+        monkeypatch.setenv("FAKE_JJ_VERSION", version)
+        for snapshot in (False, True):
+            with pytest.raises(broker.StoreRefused, match="older than 0.38"):
+                broker.host_jj(str(repo), "log", snapshot=snapshot)
+        assert [call.partition(" ")[2] for call in self._calls(jj)] == ["--version"]
+
+    @pytest.mark.parametrize("version", ["jj 0.38.0", "jj 0.45.1-abc123", "jj 0.100.0", "jj 1.0.0"])
+    def test_a_new_enough_jj_runs(self, repo, jj, monkeypatch, version):
+        monkeypatch.setenv("FAKE_JJ_VERSION", version)
+        assert broker.host_jj(str(repo), "log") == "rev123"
+
+    def test_jj_missing_refuses(self, repo, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        (tmp_path / "empty").mkdir()
+        with pytest.raises(broker.StoreRefused, match="'not found' is older than"):
+            broker.host_jj(str(repo), "log")
+
+    def test_asked_once_per_process_and_away_from_any_repo(self, repo, jj):
+        for _ in range(3):
+            broker.host_jj(str(repo), "log")
+        calls = self._calls(jj)
+        assert [call.partition(" ")[2] for call in calls].count("--version") == 1
+        assert calls[0] == "/ --version"
+        assert len(calls) == 4
+
+    def test_a_repo_without_jj_asks_nothing(self, tmp_path, jj):
+        assert broker.host_jj(str(_make_store(tmp_path / "plain", "git-only")), "log") is None
+        assert self._calls(jj) == []
+
+    def test_the_other_guards_come_first(self, repo, jj):
+        (repo / ".jj/repo/config-id").unlink()
+        with pytest.raises(broker.StoreRefused, match="not prepared"):
+            broker.host_jj(str(repo), "log")
+        assert self._calls(jj) == []
+
+    def test_refusals_reach_the_callers_as_denials(self, repo, jj, monkeypatch, capsys):
+        monkeypatch.setenv("FAKE_JJ_VERSION", "jj 0.30.0")
+        with pytest.raises(SystemExit) as excinfo:
+            broker.LabelCaller("cld_agent_x", "task-agent", str(repo)).revision(str(repo))
+        assert _exit_code(excinfo) == 3
+        assert "denied: host jj 'jj 0.30.0' is older than 0.38" in capsys.readouterr().err
+        broker._forget_workspace(str(repo), "gql-x")
+        assert "workspace gql-x not forgotten: denied: host jj" in capsys.readouterr().err
+        assert [call.partition(" ")[2] for call in self._calls(jj)] == ["--version"]
+
+
+class TestHostJjStoreChecks:
+    """check_jj_ids / host_jj refuse the git dir layouts the launcher refuses (TestStoreMountParity
+    holds the two sides together), and a git_target that left the repo."""
+
+    @pytest.fixture
+    def jj_log(self, tmp_path, monkeypatch) -> Path:
+        monkeypatch.setenv("FAKE_JJ_LOG", str(tmp_path / "jj.log"))
+        _fakebin(tmp_path, monkeypatch, jj='printf "%s\\n" "$*" >> "$FAKE_JJ_LOG"\necho rev123\n')
+        return tmp_path / "jj.log"
+
+    @pytest.mark.parametrize("damage", [_break_commondir_redirect, _break_modules, _break_git_target],
+                             ids=["commondir", "modules", "git-target"])
+    def test_host_jj_runs_nothing_on_a_refused_store(self, repo, jj_log, damage):
+        damage(repo)
+        with pytest.raises(broker.StoreRefused):
+            broker.host_jj(str(repo), "log")
+        assert not jj_log.exists()
+
+    def test_the_commondir_placeholder_is_accepted(self, repo, jj_log):
+        assert (repo / ".git/commondir").read_text() == "."
+        assert broker.host_jj(str(repo), "log") == "rev123"
+
+    def test_runners_and_servers_are_refused_before_docker_run(self, repo, stage, docker_log):
+        _break_commondir_redirect(repo)
+        _write_cld_config(repo, 'graphql_command = "serve"\n')
+        with pytest.raises(SystemExit) as excinfo:
+            broker.do_graphql_start(broker.Scope("cld_ticket_x", str(repo)), "rev", "")
+        assert _exit_code(excinfo) == 3
+        with pytest.raises(SystemExit) as excinfo:
+            broker.run_tests(str(repo), "rev", broker.Secrets(f"{repo}/.env", ".", None, None), "", [])
+        assert _exit_code(excinfo) == 3
+        assert not docker_log.exists()
+
+    def test_a_path_that_cannot_be_examined_is_a_refusal_not_a_traceback(self, repo):
+        (repo / "plain-file").write_text("")
+        with pytest.raises(broker.StoreRefused, match="cannot examine .*Not a directory"):
+            broker.check_git_dir(str(repo / "plain-file"), ".git")
+
+
+class TestGraphqlSweepRoute:
+    """`cld-brokerctl.sh graphql-sweep` runs the broker's own sweep, so a repo whose store fails the
+    host jj guard is not touched by it."""
+
+    @pytest.fixture
+    def run(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FAKE_JJ_LOG", str(tmp_path / "jj.log"))
+        monkeypatch.setenv("FAKE_DOCKER_LOG", str(tmp_path / "docker.log"))
+        _fakebin(tmp_path, monkeypatch, jj=_FAKE_JJ_VERSION + 'printf "%s\\n" "$*" >> "$FAKE_JJ_LOG"\n', docker="""
+case "$1" in
+  ps) echo cld_gql_cld_gone ;;
+  inspect)
+    case "$*" in
+      *org.cld.gql-session*) echo cld_gone ;;
+      *org.cld.gql-repo*) echo "$FAKE_GQL_REPO" ;;
+      *) exit 1 ;;
+    esac ;;
+  rm) echo "$*" >> "$FAKE_DOCKER_LOG" ;;
+esac
+""")
+
+        def go(repo: Path) -> subprocess.CompletedProcess:
+            env = dict(os.environ, CLD_BROKER_CONF="/nonexistent", FAKE_GQL_REPO=str(repo))
+            env.pop("SSH_ORIGINAL_COMMAND", None)
+            return subprocess.run([sys.executable, str(BROKER_PY), "graphql-sweep"], capture_output=True, text=True,
+                                  env=env, cwd=tmp_path)
+        return go
+
+    def test_reaps_and_forgets_through_the_guarded_jj(self, tmp_path, repo, run):
+        result = run(repo)
+        assert result.returncode == 0, result.stderr
+        assert "reaping orphaned graphql server cld_gql_cld_gone (session cld_gone gone)" in result.stdout
+        assert (tmp_path / "docker.log").read_text() == "rm -f cld_gql_cld_gone\n"
+        assert (tmp_path / "jj.log").read_text().splitlines() == [
+            f"-R {repo} --ignore-working-copy workspace forget gql-cld_gone"]
+
+    def test_a_refused_store_is_reaped_but_never_given_to_jj(self, tmp_path, repo, run):
+        _break_commondir_redirect(repo)
+        result = run(repo)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "docker.log").exists()
+        assert "workspace gql-cld_gone not forgotten: denied: " in result.stderr
+        assert not (tmp_path / "jj.log").exists()
+
+    def test_the_default_sweep_is_silent(self, monkeypatch, capsys):
+        monkeypatch.setattr(broker, "_capture", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b""))
+        broker.sweep_gql_orphans()
+        assert capsys.readouterr().out == ""
+
+
+class TestGraphqlStartLeftover:
+    """A stopped server left by an earlier start is cleaned up in the repo it was started for."""
+
+    def test_the_workspace_is_forgotten_in_the_label_repo(self, tmp_path, monkeypatch):
+        forgotten = []
+        monkeypatch.setattr(broker, "sweep_gql_orphans", lambda: None)
+        monkeypatch.setattr(broker, "resolve_graphql_context", lambda repo: (
+            broker.Secrets("/none/.env", ".", None, None), broker.GraphqlConfig("serve", "8000", "/graphql")))
+        monkeypatch.setattr(broker, "_forget_workspace", lambda repo, workspace: forgotten.append((repo, workspace)))
+        monkeypatch.setattr(broker, "_label", lambda container, key: "/repos/a")
+        monkeypatch.setattr(broker, "_rm_container", lambda name: None)
+        monkeypatch.setattr(broker, "resolve_graphql_bind", lambda: "127.0.0.1")
+        monkeypatch.setattr(broker, "_out_strict", lambda *argv, **kwargs: "false" if "{{.State.Running}}" in argv else "")
+        _fakebin(tmp_path, monkeypatch, docker="exit 0\n")
+        with pytest.raises(SystemExit):
+            broker.do_graphql_start(broker.Scope("cld_ticket_x", "/repos/b"), "rev", "")
+        assert forgotten == [("/repos/a", "gql-cld_ticket_x")]

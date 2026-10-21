@@ -27,6 +27,7 @@ from cld.docker import (
     ensure_image,
     find_repo_root,
     find_target_repo,
+    prepare_store_mounts,
     require_docker,
     resolve_anchor_checked,
     run_extra_paths,
@@ -253,6 +254,8 @@ def task_agent_start(
 
     cld_root = Path(__file__).resolve().parent.parent
     repo_root = find_target_repo(cfg)
+    # Before any host jj call on the repo (the anchor resolution below).
+    prepare_store_mounts(repo_root)
     brief, resolved = _compose_from_args(refs or [], prompt, repo_root, cld_root)
     # Display only: the roster's Persona column and the launch banner. A task-agent with
     # no persona ref is coherent -- the lifecycle preamble is always layered in.
@@ -326,7 +329,7 @@ def task_agent_start(
 
     skipped = []
     for rel in cfg.home_mounts_devcontainer:
-        mnt = stage_home_ro(rel, cfg)
+        mnt = stage_home_ro(rel, cfg, [repo_root])
         if mnt:
             args += mnt
         else:
@@ -880,7 +883,10 @@ def chain_run(
     cfg = Config.from_env()
     setup_logging(cfg)
     cld_root = Path(__file__).resolve().parent.parent
-    brief, _ = _compose_from_args(refs or [], prompt, find_repo_root(), cld_root)
+    repo_root = find_repo_root()
+    # Before any host jj call on the repo (the anchor resolution below).
+    prepare_store_mounts(repo_root)
+    brief, _ = _compose_from_args(refs or [], prompt, repo_root, cld_root)
 
     log.info(
         "chain run: file=%s, name=%s, model=%s, no_detach=%s",
@@ -899,8 +905,6 @@ def chain_run(
         raise typer.Exit(0 if result.success else 1)
 
     # --- Detached mode ---
-    repo_root = find_repo_root()
-    cld_root = Path(__file__).resolve().parent.parent
     chain = load_chain(chain_path)
     validate_chain(chain, repo_root, cld_root)
     chain = apply_name_override(chain, name)

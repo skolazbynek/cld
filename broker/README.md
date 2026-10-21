@@ -18,7 +18,13 @@ agent, task-agent or ticket container** -- no whitelist: it resolves the target 
 from the calling container's `org.cld.repo-root` label, resolves which change
 that session is on (reading the jj store, never touching the working copy),
 and for `run-tests` runs the standalone [`runtests`](../runtests/) container
-against it, mounting the repo's raw `.env` into that ephemeral runner.
+against it, mounting only the repo's jj/git store (no checkout) and a private
+copy of its `.env` into that ephemeral runner. Every host `jj` call goes through
+`host_jj`, which first checks the repo. A repo is refused with exit 3, before any
+host `jj` runs or any container starts, when a jj id (`.jj/repo/config-id`,
+`.jj/workspace-config-id`) is missing (start a ticket on it once), when its git
+dir holds a foreign `commondir` or a `modules/` folder, when `git_target` points
+outside the repo, or when the host jj is older than 0.38.
 `claude` only ever sees the streamed output. See `../docs/design-cld-broker.md`
 for the full design.
 
@@ -29,7 +35,7 @@ container: cld broker run-tests -k login -x tests/
         ├─ REPO = docker inspect <session> -> org.cld.repo-root label
         ├─ REV  = jj -R <repo> --ignore-working-copy log -r "<session>@"   (workspace tip, store-reading only)
         ├─ .env = <repo>/.env  (or under pyproject_dir from <repo>/.cld/config.toml)
-        └─ docker run --rm runtests -e REVISION=REV -v repo -v .env -- -k login -x tests/
+        └─ docker run --rm runtests -e REVISION=REV <store rows> <.env copy> -- -k login -x tests/
    ◀───────────────── stdout / stderr / exit code ─────────────────┘
 ```
 
@@ -52,6 +58,9 @@ file, so there are no sshd flags to remember:
 ```
 cld-brokerctl start | restart | shutdown | status | logs [N] | graphql-sweep | run ...
 ```
+
+`graphql-sweep` runs the broker's own sweep (`cld-broker.py graphql-sweep`), so it
+reaches a repo's jj only through the broker's store checks.
 
 It reads `$CLD_BROKER_DIR` (default `~/.cld/broker`). `restart` is the one to run
 after editing the broker config or rebuilding the `runtests` image.
@@ -89,7 +98,9 @@ caller.
 
 Assumes the `runtests` image is built (`../runtests/build.sh`) and the docker
 socket is **not** exposed to any container (that is what keeps the broker as
-claude's only host channel).
+claude's only host channel). The broker refuses (exit 3) a runner or server image
+whose label `org.cld.jj-version` is missing or older than 0.38: rebuild an image
+built before that label with its `build.sh`.
 
 1. **Keys.** `./keygen.sh /etc/cld` (or any dir), then note the printed
    `known_hosts` line.
@@ -101,7 +112,7 @@ claude's only host channel).
    through the broker should be able to push (see the sample for why a
    login-shell agent's socket path will not do). `VENV_CACHE_ROOT` (default
    `~/.cld/cache`) holds the venvs reused across `run-tests` and `graphql`
-   runs; see `../runtests/README.md#venv-cache`.
+   runs, one folder per repo below `repos/`; see `../runtests/README.md#venv-cache`.
 3. **Broker script.** Install `cld-broker.py` at `/opt/cld/cld-broker.py`
    (path referenced by `ForceCommand`), `chmod +x`.
 4. **sshd.** Edit `sshd_cld_broker.conf` (`AllowUsers`, `ListenAddress` for your
@@ -146,9 +157,9 @@ define a function in `cld-broker.py` — that's the whole change:
 def action_lint(caller: Caller, argv: list[str]) -> None:
     repo = caller.repo("")
     rev, secrets = resolve_test_context(caller, repo)
+    image = _setting("LINT_IMAGE") or "runlint:latest"
     _exec(["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
-           "-v", f"{repo}:/repo", "-e", f"REVISION={rev}",
-           _setting("LINT_IMAGE") or "runlint:latest", *argv])
+           *store_container_args(repo, image), "-e", f"REVISION={rev}", image, *argv])
 ```
 
 It receives the `Caller` the dispatcher built and the decoded argv as a list.
@@ -202,7 +213,8 @@ the validated `$session` appended instead -- both in either spelling, `--opt` an
 path there would let a container read any host file you can. The positional check
 knows which `start` options take a *separate* value (`-n`/`-p`/`--branch`/`-m`/`-r`/
 `--peer`) rather than assuming every `-*` token consumes the next one, which would
-let the token after an `--opt=value` slip by unchecked.
+let the token after an `--opt=value` slip by unchecked. A `--` token is refused, so
+no token after it can reach the host as a bare file path.
 
 ## Security notes
 
@@ -225,6 +237,10 @@ let the token after an `--opt=value` slip by unchecked.
   structurally unable to push.
 - **Network scope.** Bind the instance to the docker bridge gateway so only
   containers on the bridge can reach it.
+- **Session name is not tied to the caller.** The broker trusts the session name
+  the caller sends. It does not check that the request comes from that container.
+  So a caller holding the key can act as another session: run its tests, or stop,
+  restart, query or read the logs of its GraphQL server. Open item.
 - **ssh-agent in runs.** `run-tests` and `graphql start` mount the caller's own
   forwarded ssh-agent (if it has one) so `git+ssh://` dependencies install.
   The code under test can then use the key for the whole run -- exactly what

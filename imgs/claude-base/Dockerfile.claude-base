@@ -136,4 +136,8 @@ COPY --chown=claude:claude .claude/skills/ /opt/cld/.claude/skills/
 # /etc/profile.d/*.sh, so put the PATH entry there.
 RUN printf 'export PATH="/tmp/bin:$PATH"\n' > /etc/profile.d/cld-path.sh
 
+# The boot scripts above run jj in origin with --ignore-working-copy; cld checks
+# the label on this image and on the derived ones (cld/docker.py:require_boot_api).
+LABEL org.cld.boot-api=2
+
 USER claude

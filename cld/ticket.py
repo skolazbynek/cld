@@ -24,8 +24,10 @@ from cld.docker import (
     _docker_status,
     base_extra_paths,
     build_ticket_container_args,
+    container_has_store_mounts,
     devcontainer_extra_paths,
     ensure_image,
+    prepare_store_mounts,
     stage_home_ro,
     stage_ssh_agent,
     ticket_anchor_resolver,
@@ -45,6 +47,7 @@ from cld.manifest import (
 from cld.registry import pick_repos
 from cld.vcs import get_backend
 from cld.vcs.anchor import find_anchor_commit, move_anchor_commit, revert_ops
+from cld.vcs.jj import check_jj_ids
 
 log = get_logger(__name__)
 
@@ -124,8 +127,9 @@ def _launch(cfg: Config, manifest: TicketManifest) -> None:
 
     args = build_ticket_container_args(manifest, cfg)
     skipped = []
+    repo_paths = [Path(repo.path) for repo in manifest.repos]
     for rel in cfg.home_mounts_devcontainer:
-        if mnt := stage_home_ro(rel, cfg):
+        if mnt := stage_home_ro(rel, cfg, repo_paths):
             args += mnt
         else:
             skipped.append(rel)
@@ -217,6 +221,10 @@ def _warm_start(container: str, slug: str) -> None:
     """Restart a stopped ticket container in place: workspaces are reused, the
     entrypoint's warm-restart branch reattaches each repo (spec section 6)."""
     manifest = read_manifest(container)
+    if not container_has_store_mounts(container):
+        raise RuntimeError(
+            f"'{container}' mounts the full host checkout; run `cld restart {slug}`"
+        )
     subprocess.run(["docker", "start", container], check=True)
     if not wait_ticket_ready(container, len(manifest.repos)):
         _print_logs(container, 40)
@@ -270,6 +278,10 @@ def start_ticket(cfg: Config, ticket: str, specs: list[str], shared: list[str]) 
     if status == "stopped":
         _warm_start(container, slug)
         return
+    if not container_has_store_mounts(container):
+        log.warning(
+            "'%s' mounts the full host checkout; run `cld restart %s`", container, slug,
+        )
     typer.echo(f"Ticket '{slug}' is already running. Attach: cld claude {slug}")
 
 
@@ -468,6 +480,9 @@ def restart_ticket(cfg: Config, ticket: str, reanchor: tuple[str, ...] = ()) -> 
             f"no ticket container '{container}' to restart; `cld start {slug}` creates one"
         )
     manifest = read_manifest(container)
+    # Before the container is stopped or removed, and before any host jj call.
+    for repo in manifest.repos:
+        prepare_store_mounts(Path(repo.path), repo.name)
     if reanchor:
         _reanchor_restart(cfg, container, manifest, list(reanchor))
         return
@@ -547,6 +562,13 @@ def forget_session_state(repo_root_str: str, session: str) -> None:
         return
     if backend.name != "jj":
         return
+    if reason := check_jj_ids(backend.repo_root):
+        log.warning(
+            "Not cleaning up session state for %s in %s: %s, so no host jj runs there. "
+            "Fix the repo, then: cd %s && jj bookmark forget %s && jj workspace forget %s",
+            session, repo_root, reason, repo_root, session, session,
+        )
+        return
     for cmd in (["bookmark", "forget", session], ["workspace", "forget", session]):
         result = backend.run(cmd)
         if result.returncode != 0:
@@ -616,6 +638,9 @@ def _bookmark_tip(repo_path: str, bookmark: str) -> str:
     except RuntimeError:
         return "-"
     if backend.name != "jj":
+        return "-"
+    if reason := check_jj_ids(backend.repo_root):
+        log.warning("No bookmark lookup in %s: %s", backend.repo_root, reason)
         return "-"
     result = backend.run([
         "log", "--ignore-working-copy", "--no-graph",

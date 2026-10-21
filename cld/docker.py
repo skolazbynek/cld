@@ -6,16 +6,19 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 from cld.config import Config, _load_toml
 from cld.manifest import TicketManifest, manifest_labels, read_manifest
 from cld.log import get_logger, log_subprocess, mask_secrets
 from cld.vcs import get_backend
+from cld.vcs.jj import COMMONDIR_PLACEHOLDER, check_git_dir
 
 log = get_logger(__name__)
 
@@ -33,6 +36,13 @@ _RO_HOME_MOUNT_ROOT = "/tmp/host-config"
 # Broker key + pinned known_hosts land here (RO). See stage_broker.
 _BROKER_KEY_MOUNT = "/run/secrets/broker-key"
 _BROKER_KNOWN_HOSTS_MOUNT = "/run/secrets/broker-known-hosts"
+
+# Image label: the boot scripts run jj in origin with --ignore-working-copy.
+BOOT_API_LABEL = "org.cld.boot-api"
+BOOT_API_VERSION = "2"
+# Container label: the container mounts the protected store rows and no checkout.
+ORIGIN_MOUNT_LABEL = "org.cld.origin-mount"
+ORIGIN_MOUNT_VALUE = "store-v1"
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -365,6 +375,251 @@ def parse_peers_env(value: str) -> dict[str, int]:
     return peers
 
 
+@dataclass(frozen=True)
+class StoreLayout:
+    """Which VCS store a host repo has. ``git_dir`` is relative to the repo."""
+
+    jj: bool
+    git_dir: str
+
+
+_JJ_MIN_VERSION = (0, 38)
+
+# (id file, legacy config file, jj flag that creates the id), relative to the repo.
+_JJ_IDS = (
+    (".jj/repo/config-id", ".jj/repo/config.toml", "--repo"),
+    (".jj/workspace-config-id", ".jj/workspace-config.toml", "--workspace"),
+)
+
+
+def _refuse_store(name: str, reason: str) -> NoReturn:
+    sys.exit(f"cld: repo '{name}': {reason} -- cannot mount its store safely")
+
+
+def _kind(path: Path) -> str | None:
+    """``dir``, ``file``, ``symlink`` or ``other`` by ``lstat``; None when missing."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    return "file" if stat.S_ISREG(mode) else "other"
+
+
+def _require_kind(name: str, repo: Path, rel: str, expected: str) -> None:
+    kind = _kind(repo / rel)
+    if kind != expected:
+        found = "missing" if kind is None else f"a {kind}"
+        _refuse_store(name, f"{rel} is {found}, expected a {expected}")
+
+
+def _store_rows(layout: StoreLayout) -> list[tuple[str, str, bool]]:
+    """The eleven mount rows of the design (section 3.1) as ``(path, kind, readonly)``.
+
+    The path is the same under the host repo and under the container root. The
+    read-write rows make the parent of each read-only path a mount point, so
+    the agent cannot rename the parent and plant a copy. The ``commondir`` row
+    is a placeholder that keeps the agent from creating that file: git and jj
+    take their config and hooks from the folder it names.
+    """
+    git = layout.git_dir
+    rows = [
+        (".jj", "dir", False),
+        (".jj/working_copy", "dir", True),
+        (".jj/repo", "dir", False),
+        (".jj/repo/config-id", "file", True),
+        (".jj/repo/store", "dir", False),
+        (".jj/repo/store/git_target", "file", True),
+    ] if layout.jj else []
+    rows += [
+        (git, "dir", False), (f"{git}/config", "file", True), (f"{git}/hooks", "dir", True),
+        (f"{git}/commondir", "file", True),
+    ]
+    if layout.jj:
+        rows.append((".jj/workspace-config-id", "file", True))
+    return rows
+
+
+def bind_mount_args(src: str, dst: str, *, readonly: bool) -> list[str]:
+    """One ``--mount`` argument pair.
+
+    ``--mount`` instead of ``-v``: a missing source fails the launch and is
+    not created on the host. Docker parses the value as CSV, so a comma or a
+    quote in a path would add or end a field: both are refused with a
+    ``ValueError``.
+    """
+    if bad := next((value for value in (src, dst) if "," in value or '"' in value), None):
+        raise ValueError(f"'{bad}' contains a comma or a quote, which would split the --mount value")
+    return ["--mount", f"type=bind,src={src},dst={dst}" + (",readonly" if readonly else "")]
+
+
+def store_mount_args(layout: StoreLayout, host_repo: str, root: str) -> list[str]:
+    """``--mount`` arguments for the store rows, host repo at *host_repo*, container side at *root*."""
+    args: list[str] = []
+    for rel, _, readonly in _store_rows(layout):
+        args += bind_mount_args(f"{host_repo}/{rel}", f"{root}/{rel}", readonly=readonly)
+    return args
+
+
+def _check_jj_version(name: str) -> None:
+    cmd = ["jj", "--version"]
+    try:
+        # cwd away from any repo: even this call must not load a repo config
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd="/")
+    except FileNotFoundError:
+        _refuse_store(name, "jj is not installed on the host")
+    log_subprocess(log, cmd, result)
+    version = re.search(r"(\d+)\.(\d+)", result.stdout)
+    if not version or (int(version[1]), int(version[2])) < _JJ_MIN_VERSION:
+        _refuse_store(
+            name,
+            f"host jj '{result.stdout.strip()}' is older than "
+            f"{'.'.join(map(str, _JJ_MIN_VERSION))}",
+        )
+
+
+def _git_target_layout(name: str, repo: Path) -> StoreLayout:
+    """Check that ``git_target`` names the repo's own git dir, and return the layout."""
+    store = repo / ".jj/repo/store"
+    target = os.path.normpath(os.path.join(store, (store / "git_target").read_text().strip()))
+    bases = {os.path.normpath(repo), os.path.realpath(repo)}
+    for git_dir in (".git", ".jj/repo/store/git"):
+        if target in {os.path.normpath(os.path.join(base, git_dir)) for base in bases}:
+            return StoreLayout(jj=True, git_dir=git_dir)
+    _refuse_store(name, f"git_target points to {target}, outside this repo's git dirs")
+
+
+def _create_jj_id(name: str, repo: Path, rel: str, flag: str) -> None:
+    cmd = ["jj", "-R", str(repo), "--ignore-working-copy", "config", "path", flag]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    log_subprocess(log, cmd, result)
+    if _kind(repo / rel) is None:
+        _refuse_store(name, f"jj did not create {rel}: {(result.stderr or '').strip()}")
+
+
+def _check_jj(name: str, repo: Path) -> StoreLayout:
+    """The jj checks that must pass before the first jj call; returns the layout."""
+    if _kind(repo / ".jj/repo") == "file":
+        _refuse_store(name, "secondary jj workspace (.jj/repo is a file)")
+    _check_jj_version(name)
+    _require_kind(name, repo, ".jj/repo", "dir")
+    _require_kind(name, repo, ".jj/repo/store", "dir")
+    _require_kind(name, repo, ".jj/repo/store/git_target", "file")
+    # Any jj call migrates a legacy config file next to a missing id into the
+    # host jj config, so every refusal comes before the first jj call.
+    for rel, legacy, _flag in _JJ_IDS:
+        if _kind(repo / rel) is None and _kind(repo / legacy) is not None:
+            _refuse_store(
+                name, f"unmigrated jj config {legacy}: check it, then run jj once on the host",
+            )
+    return _git_target_layout(name, repo)
+
+
+def _check_rows(name: str, repo: Path, layout: StoreLayout, creatable: Iterable[str] = ()) -> None:
+    """``lstat`` each mount source: refuse a symlink or the wrong kind. A
+    *creatable* source that is missing is left for the caller to create."""
+    for rel, kind, _readonly in _store_rows(layout):
+        if rel not in creatable or _kind(repo / rel) is not None:
+            _require_kind(name, repo, rel, kind)
+
+
+def prepare_store_mounts(host_repo: Path, name: str = "") -> StoreLayout:
+    """Host preflight for the store mounts (design section 3.2).
+
+    Finds the layout, checks the jj version and the settings the read-only
+    rows protect, and creates what may be created: the two jj ids, an empty
+    ``hooks`` folder and the ``commondir`` placeholder. Exits with a refusal
+    rather than mount an unsafe store.
+    """
+    name = name or host_repo.name
+    if _kind(host_repo / ".jj") is not None:
+        _require_kind(name, host_repo, ".jj", "dir")
+        layout = _check_jj(name, host_repo)
+    elif _kind(host_repo / ".git") == "file":
+        _refuse_store(name, "git worktree (.git is a file)")
+    elif _kind(host_repo / ".git") is None:
+        _refuse_store(name, "neither a .jj nor a .git directory")
+    else:
+        layout = StoreLayout(jj=False, git_dir=".git")
+    # Before the first jj call: that call would load a planted commondir.
+    if reason := check_git_dir(host_repo, layout.git_dir):
+        _refuse_store(name, reason)
+    hooks = f"{layout.git_dir}/hooks"
+    commondir = f"{layout.git_dir}/commondir"
+    ids = [rel for rel, _legacy, _flag in _JJ_IDS] if layout.jj else []
+    _check_rows(name, host_repo, layout, [hooks, commondir, *ids])
+    for rel, _legacy, flag in _JJ_IDS if layout.jj else ():
+        if _kind(host_repo / rel) is None:
+            _create_jj_id(name, host_repo, rel, flag)
+    if _kind(host_repo / hooks) is None:
+        (host_repo / hooks).mkdir()
+        (host_repo / hooks).chmod(0o755)
+    if _kind(host_repo / commondir) is None:
+        (host_repo / commondir).write_text(COMMONDIR_PLACEHOLDER)
+    _check_rows(name, host_repo, layout)
+    return layout
+
+
+def require_boot_api(*images: str) -> None:
+    """Exit unless every image carries the boot API label: an older entrypoint
+    or boot script runs plain jj in origin and fails on the read-only working
+    copy. The base image counts too: the derived images bake in its scripts."""
+    for image in images:
+        if _image_label(image, BOOT_API_LABEL) != BOOT_API_VERSION:
+            sys.exit(
+                f"cld: image '{image}' lacks the label {BOOT_API_LABEL}={BOOT_API_VERSION} "
+                "-- rebuild the cld images with `cld build`"
+            )
+
+
+def container_has_store_mounts(container: str) -> bool:
+    """Whether *container* was launched with the store mounts and no checkout (``docker inspect`` takes either kind)."""
+    return _image_label(container, ORIGIN_MOUNT_LABEL) == ORIGIN_MOUNT_VALUE
+
+
+def refuse_unprotected_containers(name: str, host_repo: str) -> None:
+    """Exit while any container mounts *host_repo* without the current store mounts label.
+
+    Such a container has the read-write checkout, so it can replace a protected
+    source between the preflight and ``docker run`` (or any later ``docker start``).
+    A failed listing counts as a hit: nothing says no old container is there.
+    """
+    cmd = ["docker", "ps", "-a", "--filter", f"volume={host_repo}",
+           "--format", f'{{{{.Names}}}}\t{{{{.Label "{ORIGIN_MOUNT_LABEL}"}}}}']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    log_subprocess(log, cmd, result)
+    if result.returncode != 0:
+        _refuse_store(name, f"docker ps failed, so old containers mounting {host_repo} cannot be ruled out")
+    old = [
+        container for container, _, label in
+        (line.partition("\t") for line in result.stdout.strip().splitlines())
+        if container and label != ORIGIN_MOUNT_VALUE
+    ]
+    if old:
+        _refuse_store(
+            name,
+            f"container(s) {', '.join(old)} mount the full checkout without the protected store "
+            "mounts: restart each one (`cld restart <ticket>` for a ticket) or stop and remove it",
+        )
+
+
+def _repo_store_args(name: str, repo: Path, host_repo: str, root: str) -> list[str]:
+    """Preflight one repo and return its store mounts; refuse while an unprotected container uses it."""
+    try:
+        # The row names are fixed, so these two cover every mount value; refuse
+        # before the preflight makes its first jj call.
+        bind_mount_args(host_repo, root, readonly=False)
+    except ValueError as e:
+        _refuse_store(name, str(e))
+    # Before the preflight: it creates files and runs jj, which an old container can race.
+    refuse_unprotected_containers(name, host_repo)
+    layout = prepare_store_mounts(repo, name)
+    return store_mount_args(layout, host_repo, root)
+
+
 def build_container_args(
     repo_root: Path,
     session_name: str,
@@ -376,7 +631,7 @@ def build_container_args(
 ) -> list[str]:
     """Build the base ``docker run`` argument list every launcher needs.
 
-    Sets up security constraints, volume mounts (repo, claude config),
+    Sets up security constraints, volume mounts (repo store, claude config),
     and environment variables. No docker socket is mounted (see the
     note in the body). Devcontainer-only
     mounts (gitconfig, bashrc, nvim) are added by the launcher in cli.py.
@@ -455,11 +710,15 @@ def build_container_args(
         "-e", f"HOME={CONTAINER_HOME}",
     ]
 
-    # Workspace (required)
+    # Workspace (required). Origin holds only the store rows, never the checkout.
+    require_boot_api(cfg.base_image, cfg.devcontainer_image if task_agent else cfg.run_image)
     args += [
-        "-v", f"{host_repo_root}:{WORKSPACE_BASE}/origin",
         "-w", f"{WORKSPACE_BASE}/current",
+        "--label", f"{ORIGIN_MOUNT_LABEL}={ORIGIN_MOUNT_VALUE}",
     ]
+    args += _repo_store_args(
+        repo_root.name, repo_root, host_repo_root, f"{WORKSPACE_BASE}/origin",
+    )
 
     args += stage_ssl_certs(cfg)
 
@@ -477,7 +736,7 @@ def build_container_args(
     # into $HOME by the entrypoint. Devcontainer-only entries are added by cli.py.
     for rel in cfg.home_mounts_always:
         log.debug("home_mounts_always: attempting ~/%s", rel)
-        mnt = stage_home_ro(rel, cfg)
+        mnt = stage_home_ro(rel, cfg, [repo_root])
         if mnt:
             args += mnt
         else:
@@ -497,11 +756,7 @@ def build_container_args(
         "-e", f"CLD_HOST_HOME={host_home}",
     ]
 
-    # Workspace setup: gitignored files to symlink into workspace
-    if cfg.ignore_gitignore:
-        workspace_files = ":".join(cfg.ignore_gitignore)
-        args += ["-e", f"WORKSPACE_FILES={workspace_files}"]
-        log.debug(f"Workspace files to link: {workspace_files}")
+    warn_skipped_workspace_files(cfg.ignore_gitignore)
 
     # No docker socket is mounted into any container (it was equivalent to host
     # root). In-container docker needs -- peer enumeration above all -- go
@@ -527,21 +782,29 @@ def build_container_args(
     return args
 
 
-def ticket_repo_files(manifest: TicketManifest) -> str:
-    """Encode each repo's ``ignore_gitignore`` list as the ``CLD_REPO_FILES`` value.
+def warn_skipped_workspace_files(files: Iterable[str]) -> None:
+    """Warn once per ``ignore_gitignore`` entry: no launcher passes files while the
+    host checkout is not mounted (design section 4.1)."""
+    for file in files:
+        log.warning(
+            "ignore_gitignore: '%s' skipped: the host checkout is no longer mounted", file,
+        )
 
-    Format ``<name>=<colon-list>`` joined by ``;``; repos with nothing to link
-    are omitted. Resolved host-side from each repo's own ``.cld/config.toml``
-    at launch, so an edit takes effect on the next recreate (design section 4.1).
-    """
-    parts: list[str] = []
+
+def warn_skipped_repo_files(manifest: TicketManifest) -> None:
+    """``warn_skipped_workspace_files`` for each repo's own ``.cld/config.toml``."""
     for repo in manifest.repos:
         repo_config = Path(repo.path) / ".cld" / "config.toml"
-        if not repo_config.is_file():
-            continue
-        if files := _load_toml(repo_config).get("ignore_gitignore", ()):
-            parts.append(f"{repo.name}={':'.join(files)}")
-    return ";".join(parts)
+        if repo_config.is_file():
+            warn_skipped_workspace_files(_load_toml(repo_config).get("ignore_gitignore", ()))
+
+
+def _bootstrap_subdir_ok(subdir: object) -> bool:
+    """``pyproject_dir`` comes from the repo and lands in ``CLD_REPO_BOOTSTRAP``, split on ``;`` and ``=``."""
+    return (
+        isinstance(subdir, str) and not Path(subdir).is_absolute()
+        and ".." not in Path(subdir).parts and not {";", "="} & set(subdir)
+    )
 
 
 def ticket_repo_bootstrap(manifest: TicketManifest, cfg: Config) -> str:
@@ -550,7 +813,7 @@ def ticket_repo_bootstrap(manifest: TicketManifest, cfg: Config) -> str:
     Format ``<name>=<pyproject subdir>`` joined by ``;``; repos without the
     registry ``bootstrap`` key (ad-hoc repos included) are omitted. The subdir
     is the repo's own ``pyproject_dir`` (``.cld/config.toml``), default ``.``
-    -- resolved host-side like ``ticket_repo_files`` (design section 4.2).
+    -- resolved host-side from the same file as ``warn_skipped_repo_files``.
     """
     parts: list[str] = []
     for repo in manifest.repos:
@@ -561,6 +824,12 @@ def ticket_repo_bootstrap(manifest: TicketManifest, cfg: Config) -> str:
         subdir = "."
         if repo_config.is_file():
             subdir = _load_toml(repo_config).get("pyproject_dir", ".") or "."
+        if not _bootstrap_subdir_ok(subdir):
+            log.warning(
+                "repo '%s': pyproject_dir %r skipped: not a relative path without '..', ';' or '='",
+                repo.name, subdir,
+            )
+            continue
         parts.append(f"{repo.name}={subdir}")
     return ";".join(parts)
 
@@ -569,7 +838,7 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
     """Build the ``docker run`` argument list for a ticket container (v2).
 
     Deliberately separate from ``build_container_args``: the ticket kind
-    mounts N repos RW at ``/workspace/origin/<name>``, works at the ticket
+    mounts the store of N repos at ``/workspace/origin/<name>``, works at the ticket
     root ``/workspace/<slug>``, carries the manifest as labels (authoritative
     JSON plus flat per-repo path labels), and replaces the scalar
     ``CLD_HOST_PROJECT_DIR``/``CLD_HOST_HOME`` pair with the ``CLD_PATH_MAP``
@@ -596,8 +865,12 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
         "-e", f"HOME={CONTAINER_HOME}",
     ]
 
-    # Per-repo RW origin mounts; the workspaces themselves live in the
-    # container layer under the ticket root, which is the harness cwd.
+    require_boot_api(cfg.base_image, cfg.devcontainer_image)
+    args += ["--label", f"{ORIGIN_MOUNT_LABEL}={ORIGIN_MOUNT_VALUE}"]
+
+    # Per-repo origin: the store rows only, no checkout; the workspaces
+    # themselves live in the container layer under the ticket root, which is the
+    # harness cwd.
     # Both container prefixes of a repo map to its origin host path so
     # host-facing messages naming workspace files resolve to something the
     # user can open (design section 6.4).
@@ -605,7 +878,7 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
     for repo in manifest.repos:
         host_path = to_host_path(repo.path, cfg)
         origin = f"{WORKSPACE_BASE}/origin/{repo.name}"
-        args += ["-v", f"{host_path}:{origin}"]
+        args += _repo_store_args(repo.name, Path(repo.path), host_path, origin)
         path_map[origin] = host_path
         path_map[f"{WORKSPACE_BASE}/{manifest.ticket}/{repo.name}"] = host_path
     path_map[CONTAINER_HOME] = host_home
@@ -620,10 +893,11 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
         log.error(f"{home}/.claude not found -- Claude auth and session state unavailable")
         sys.exit(1)
     args += ["-v", f"{host_home}/.claude:{CONTAINER_HOME}/.claude:rw"]
-    args += stage_plugin_marketplaces(cfg, [Path(repo.path) for repo in manifest.repos])
+    repo_paths = [Path(repo.path) for repo in manifest.repos]
+    args += stage_plugin_marketplaces(cfg, repo_paths)
 
     for rel in cfg.home_mounts_always:
-        if mnt := stage_home_ro(rel, cfg):
+        if mnt := stage_home_ro(rel, cfg, repo_paths):
             args += mnt
         else:
             log.warning(f"~/{rel} not found -- skipping")
@@ -636,9 +910,7 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
     ]
     log.info(f"Session name: {session}")
 
-    if repo_files := ticket_repo_files(manifest):
-        args += ["-e", f"CLD_REPO_FILES={repo_files}"]
-        log.debug("Workspace files to link: %s", repo_files)
+    warn_skipped_repo_files(manifest)
 
     if bootstrap := ticket_repo_bootstrap(manifest, cfg):
         args += ["-e", f"CLD_REPO_BOOTSTRAP={bootstrap}"]
@@ -1089,8 +1361,11 @@ def ticket_anchor_resolver(
     ``exclude_session``, forwarded to ``resolve_anchor_checked``, is set by a
     reanchoring restart to the ticket's own container name so it is not
     checked against its own live reach.
+
+    Runs the store preflight first: no host jj may touch the repo before it.
     """
     def resolve(path: str, revision: str, mode: str) -> str:
+        prepare_store_mounts(Path(path))
         return resolve_anchor_checked(
             cfg, Path(path), revision, mode, caller_kind="ticket",
             exclude_session=exclude_session,
@@ -1239,17 +1514,46 @@ def stage_otel(cfg: Config, session_name: str) -> list[str]:
     ]
 
 
-def stage_home_ro(rel_path: str, cfg: Config) -> list[str]:
+def _home_mount_skip_reason(rel_path: str, protected_repos: Iterable[Path]) -> str | None:
+    """Why ``$HOME/<rel_path>`` must not be mounted, or None.
+
+    The source is checked once and docker resolves it again at every
+    ``docker start``: it must stay inside ``$HOME`` with no symlink to swap,
+    and clear of every repo.
+    """
+    rel = Path(rel_path)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        return "not a relative path below $HOME without '..'"
+    home = Path.home()
+    prefixes = [home.joinpath(*rel.parts[:i]) for i in range(1, len(rel.parts) + 1)]
+    if link := next((p for p in prefixes if p.is_symlink()), None):
+        return f"{link} is a symlink"
+    if repo := next((repo for repo in protected_repos if _overlaps(home / rel, repo)), None):
+        return f"it overlaps the repo {repo}"
+    return None
+
+
+def stage_home_ro(rel_path: str, cfg: Config, repo_roots: Iterable[Path] = ()) -> list[str]:
     """Stage ``$HOME/<rel_path>`` RO under ``/tmp/host-config/<rel_path>``.
 
-    Returns the ``["-v", ...]`` arg pair, or ``[]`` if the source doesn't exist.
+    Returns the ``["--mount", ...]`` arg pair, or ``[]`` if the source doesn't
+    exist or fails ``_home_mount_skip_reason`` (a warning names the reason).
+    Overlap is checked against the registry and *repo_roots*.
     The entrypoint copies the staged tree into ``$HOME`` (see ``copy_host_configs``).
     """
+    repos = [*(Path(entry.path).expanduser() for entry in cfg.repos.values()), *repo_roots]
+    if reason := _home_mount_skip_reason(rel_path, repos):
+        log.warning("home mount '%s' skipped: %s", rel_path, reason)
+        return []
     local_path = Path.home() / rel_path
     if not local_path.exists():
         return []
     host_path = to_host_path(str(local_path.resolve()), cfg)
-    return ["-v", f"{host_path}:{_RO_HOME_MOUNT_ROOT}/{rel_path}:ro"]
+    try:
+        return bind_mount_args(host_path, f"{_RO_HOME_MOUNT_ROOT}/{rel_path}", readonly=True)
+    except ValueError as e:
+        log.warning("home mount '%s' skipped: %s", rel_path, e)
+        return []
 
 
 def _read_json_dict(path: Path) -> dict:
@@ -1263,45 +1567,136 @@ def _read_json_dict(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+_MARKETPLACE_MARKER = ".claude-plugin/marketplace.json"
+
+
+def _extra_marketplaces(settings_file: Path) -> list[object]:
+    extra = _read_json_dict(settings_file).get("extraKnownMarketplaces")
+    return list(extra.values()) if isinstance(extra, dict) else []
+
+
+def _marketplace_paths(entries: Iterable[object]) -> list[tuple[str, Path]]:
+    """``(kind, path)`` of each directory or file source; other kinds need no mount."""
+    paths: list[tuple[str, Path]] = []
+    for entry in entries:
+        source = entry.get("source") if isinstance(entry, dict) else None
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            continue
+        if source.get("source") in ("directory", "file"):
+            paths.append((source["source"], Path(source["path"]).expanduser()))
+    return paths
+
+
+def _path_forms(path: Path) -> tuple[Path, Path]:
+    return Path(os.path.normpath(path)), Path(os.path.realpath(path))
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    """Whether *a* and *b* are the same folder or one holds the other, comparing
+    the literal and the resolved form of each."""
+    return any(x == y or x in y.parents or y in x.parents for x in _path_forms(a) for y in _path_forms(b))
+
+
+def _marketplace_skip_reason(
+    kind: str, path: Path, protected_repos: list[Path], agent_dirs: list[Path],
+) -> str | None:
+    """Why a marketplace folder must not be mounted, or None (design section 4.2).
+
+    The mount is checked once and docker resolves its source again at every
+    ``docker run`` and ``docker start``, so the folder must be one no agent
+    container can write: not inside (or holding) ``agent_dirs`` or a repo,
+    and with no symlink in its path, so that nothing can be swapped later.
+    """
+    if not path.is_absolute():
+        return "not an absolute path"
+    if not os.path.lexists(path):
+        return "not found"
+    if kind == "directory":
+        folder, marker = path, path / _MARKETPLACE_MARKER
+        links = [folder, marker.parent, marker]
+    else:
+        folder, marker = path.parent, path
+        links = [folder, marker]
+        if marker.name != "marketplace.json":
+            return "a file source must be named marketplace.json"
+    if (link := next((p for p in links if p.is_symlink()), None)) is not None:
+        return f"{link} is a symlink"
+    if not folder.is_dir():
+        return "not a directory"
+    if not marker.is_file():
+        return f"marker {marker} is missing or not a regular file"
+    literal, real = _path_forms(folder)
+    if literal != real:
+        return f"a symlink is in its path (the real path is {real})"
+    home = Path.home().resolve()
+    if folder == home or folder in home.parents:
+        return "it is $HOME or contains it"
+    for repo in protected_repos:
+        if _overlaps(folder, repo):
+            return f"it overlaps the repo {repo}"
+    for agent_dir in agent_dirs:
+        if _overlaps(folder, agent_dir):
+            return f"it overlaps {agent_dir}, which agent containers write"
+    return None
+
+
 def stage_plugin_marketplaces(cfg: Config, repo_roots: list[Path]) -> list[str]:
     """Mount directory/file-sourced plugin marketplaces RO at their host path.
 
     Claude's plugin registry stores these as absolute host paths, which do
     not exist in the container, so the marketplace fails to load. Mounting
     each at the identical path makes the registry entries resolve as-is.
-    Sources are read from the host registry, the host user settings and each
-    repo's project settings; other source kinds (github, git, ...) need no mount.
+    Sources are read from the host registry and the host user settings;
+    other source kinds (github, git, ...) need no mount. Settings are
+    writable by agents, so a folder is mounted only if it passes
+    ``_marketplace_skip_reason`` (design section 4.2): that check holds for
+    every later ``docker start`` too, as it demands a folder no agent can
+    write. The mount is ``--mount ...,readonly`` of the checked path. Paths
+    listed in a repo's own settings are never mounted: any commit can change
+    them. Both cases warn on every launch.
     """
     claude_dir = Path.home() / ".claude"
-    sources: list[object] = list(_read_json_dict(claude_dir / "plugins/known_marketplaces.json").values())
-    settings_files = [claude_dir / "settings.json"]
+    user_sources = [
+        *_read_json_dict(claude_dir / "plugins/known_marketplaces.json").values(),
+        *_extra_marketplaces(claude_dir / "settings.json"),
+    ]
+    candidates: list[tuple[str, Path, Path | None]] = [
+        (kind, path, None) for kind, path in _marketplace_paths(user_sources)
+    ]
     for root in repo_roots:
-        settings_files += [root / ".claude/settings.json", root / ".claude/settings.local.json"]
-    for settings_file in settings_files:
-        extra = _read_json_dict(settings_file).get("extraKnownMarketplaces")
-        if isinstance(extra, dict):
-            sources += list(extra.values())
+        for settings_file in (root / ".claude/settings.json", root / ".claude/settings.local.json"):
+            candidates += [
+                (kind, path, settings_file)
+                for kind, path in _marketplace_paths(_extra_marketplaces(settings_file))
+            ]
+    if not candidates:
+        return []
 
-    paths: set[str] = set()
-    for entry in sources:
-        source = entry.get("source") if isinstance(entry, dict) else None
-        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+    # Every repo a container of this host mounts, not only this launch's.
+    protected_repos = [
+        *(Path(entry.path).expanduser() for entry in cfg.repos.values()),
+        *repo_roots,
+        *(Path(occupant["repo_root"]) for occupant in docker_occupant_list() if occupant["repo_root"]),
+    ]
+    agent_dirs = [claude_dir, Path(cfg.mailbox_root).expanduser()]
+    seen: set[tuple[str, Path]] = set()
+    mounts: dict[str, list[str]] = {}
+    for kind, path, repo_settings in candidates:
+        if (kind, path) in seen:
             continue
-        path = Path(source["path"]).expanduser()
-        match source.get("source"):
-            case "directory":
-                pass
-            case "file":
-                path = path.parent
-            case _:
-                continue
-        path = path.resolve()
-        if not path.exists():
-            log.warning(f"Plugin marketplace path {path} not found -- skipping")
-            continue
-        paths.add(to_host_path(str(path), cfg))
+        seen.add((kind, path))
+        reason = (
+            f"listed in {repo_settings}, which the repo controls"
+            if repo_settings
+            else _marketplace_skip_reason(kind, path, protected_repos, agent_dirs)
+        )
+        if not reason:
+            host_path = to_host_path(str(path if kind == "directory" else path.parent), cfg)
+            try:
+                mounts[host_path] = bind_mount_args(host_path, host_path, readonly=True)
+            except ValueError as e:
+                reason = str(e)
+        if reason:
+            log.warning("plugin marketplace: '%s' skipped: %s", path, reason)
 
-    args: list[str] = []
-    for host_path in sorted(paths):
-        args += ["-v", f"{host_path}:{host_path}:ro"]
-    return args
+    return [arg for host_path in sorted(mounts) for arg in mounts[host_path]]

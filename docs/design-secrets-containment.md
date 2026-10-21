@@ -1,6 +1,6 @@
 # Secrets containment: no host checkout and no symlinked secrets in agent reach
 
-**Status:** design, not built. **Date:** 2026-10-21. **Ticket:** CLD-001.
+**Status:** built, with the deviations in section 13. **Date:** 2026-10-21. **Ticket:** CLD-001.
 **Prerequisite for:** `docs/design-broker-profile.md`, `docs/design-broker-test-jobs.md` (uses
 section 6), `docs/design-broker-identities.md` (uses section 7). Ships first in their build order.
 **Related:** `docs/design-ticket-containers.md` §4 and §6, `docs/design-cld-broker.md` §9,
@@ -47,7 +47,7 @@ Found while designing this (same root cause: agent-writable state that the host 
 | D3 | **Host-trusted VCS config is read-only:** the git dir's `config` and `hooks`, jj's `config-id`, `workspace-config-id` and `git_target`. The parent of each is its own mount root. With an id missing, cld and the broker run no jj on the repo. | Leave them writable: host code runs on the next push, and a planted jj config forges `trunk()`. One read-only bind deep in a read-write mount: Linux refuses to rename a mountpoint (EBUSY) but not its parent, so the agent renames the parent and plants a fresh copy. Create a missing id at preflight: jj then migrates a planted legacy file into host config (A10). |
 | D4 | **Runner and server containers mount the same set at `/repo`.** | Keep the checkout: agent code in the runner writes `.cld/config.toml` and plants symlinks. |
 | D5 | **Secrets resolver:** open `.env` once with no symlink anywhere below the repo, require a regular file, copy it into a broker-owned 0600 file, mount only the copy (6). | `realpath` check, then mount: docker resolves the path again at start (race; same class as snug #284, inspect_ai #563). `docker create` + `docker cp -` + `start`: no copy on disk, but three docker calls and a rewrite of the exec path test-jobs replaces; kept as a fallback. `--env-file`: the CLI follows symlinks, parses unlike `source`, shows values in `docker inspect`. `/proc/self/fd/N` source: the daemon resolves it in its own context. |
-| D6 | **`ignore_gitignore` stays, as copies.** Listed files are checked, bound read-only into `/tmp`, copied into the workspace at boot. `.env` and `.env.*` are refused. | Drop it: it has non-secret uses. Keep symlinks: they need the checkout. Host staging copies: more host state, no gain once only the operator writes the checkout. |
+| D6 | **`ignore_gitignore` stays, as copies.** Not built (13). Listed files are checked, bound read-only into `/tmp`, copied into the workspace at boot. `.env` and `.env.*` are refused. | Drop it: it has non-secret uses. Keep symlinks: they need the checkout. Host staging copies: more host state, no gain once only the operator writes the checkout. |
 | D7 | **Marketplace mounts need a marker** and must not overlap a repo or `$HOME`. | Leave it: a `~/.claude` edit mounts any directory. An operator allowlist: new config for every user. |
 | D8 | **Old containers must be recreated.** Warm start with the old mount is refused with a `cld restart` hint. | Silent recreate: drops container-layer state without consent. Wait: one old container per repo voids D3 for all. |
 
@@ -74,6 +74,7 @@ git-only repos, `H/.jj/repo/store/git` for jj with an internal git store.
 | 8 | `G/config` | same under `R` | ro | `core.sshCommand`, `core.fsmonitor`, credential helpers |
 | 9 | `G/hooks` | same under `R` | ro | `pre-push`, `post-checkout` |
 | 10 | `H/.jj/workspace-config-id` | same under `R` | ro | blocks a planted legacy workspace config (7.2) |
+| 11 | `G/commondir` | same under `R` | ro | placeholder holding `.`, created by the preflight; git and jj read config and hooks from the folder it names (13) |
 
 Every row is `--mount type=bind,src=…,dst=…[,readonly]`, so a missing source fails instead of
 being created on the host, as `-v` would do. Docker mounts parents first (moby `SortMounts`). cld
@@ -109,8 +110,7 @@ Refusal: `cld: repo '<name>': <reason> -- cannot mount its store safely`, exit 1
   launch and reattach both use it.
 - `cld_boot_worktree` passes `--no-track` to `git worktree add -b`; tracking writes `G/config`.
 - `entrypoint-claude-run.sh:39-46` uses both helpers. `_forget_session_bookmark` adds the flag.
-- `link_workspace_files` copies from `/tmp/cld-repo-files/<name>/<file>` (4.1) with `cp` and never
-  reads origin. v1 kinds use `<name>` = `current`.
+- `link_workspace_files` copies from `/tmp/cld-repo-files/<name>/<file>` (4.1). Not built (13).
 - The ticket CLAUDE.md gains: "`/workspace/origin/<repo>` holds only the shared jj/git store.
   Run jj and edit files in your workspace."
 - Both images get `LABEL org.cld.boot-api=2`.
@@ -123,12 +123,11 @@ Refusal: `cld: repo '<name>': <reason> -- cannot mount its store safely`, exit 1
   entrypoint runs plain jj in origin and fails on row 2.
 - `_warm_start` refuses a container without the label: "this container mounts the full host
   checkout; run `cld restart <ticket>`". `start_ticket` on a running one warns.
-- At launch, a warning names any other container that mounts the same repo without the label: its
-  read-write checkout can still swap the protected sources.
+- At launch, another container mounting the repo without the label is refused (13): it can swap sources.
 
 ## 4. Mechanism: other paths from the host into the agent container
 
-### 4.1 `ignore_gitignore`
+### 4.1 `ignore_gitignore` (not built, 13)
 
 `ticket_repo_files` and the v1 `WORKSPACE_FILES` path check each name host-side: relative, no
 `..`, no empty part; basename not `.env` and not starting with `.env.`; opened part by part with
@@ -229,23 +228,22 @@ Docker resolves only the copy's path, which no container can write. Callers that
 - **The operator runs agent code** when checking out and running agent commits on the host
   (tests, committed hook dirs, build scripts). That checkout also lands a tracked
   `.cld/config.toml`, read by the broker (profile layer 2) and by cld's launcher
-  (`cld/config.py:333-358`): `home_mounts_always` mounts any `$HOME` path into the next
-  container, `ssl_certs_path` swaps its CA bundle, the image keys pick its image. Open question 4.
+  (`cld/config.py`): `ssl_certs_path` swaps its CA bundle, the image keys pick its image.
+  The home mounts are user-config only (13). Open question 4.
 - **Store integrity.** The agent can move bookmarks, rewrite the op log, move `main@origin`
   through colocated refs and leave the host workspace stale. This can still forge `trunk()` for
   the profile's reviewed revision (profile 5.2). jj config is out of reach (rows 4 and 10; user
   config is never mounted), except an alias planted earlier by a full-checkout container and
   already migrated into host config; the check in section 9 finds it.
-- Submodule configs (`.git/modules/*/config`) and `.git/info` stay writable.
+- Submodules are refused (13). `.git/info`, `config.worktree` and `objects/info/alternates`
+  stay writable.
 - Tracked or once-committed `.env` files are in the store (A7).
 
 ## 8. What breaks or changes for users
 
 - `/workspace/origin/<repo>` shows only `.jj` and `.git`. Untracked host files are gone from it.
   Plain `jj` there fails with a read-only error; work in the workspace.
-- **`ignore_gitignore`:** `.env` and `.env.*` are skipped with a warning. Other files are copies,
-  refreshed at each container start: host edits no longer show live, agent edits no longer reach
-  the host. Symlinked entries are skipped.
+- **`ignore_gitignore`:** every listed file is skipped with a warning (13).
 - **Broker:** a symlink at or above `.env`, `.cld` or `.cld/config.toml` (below the repo) is refused
   with exit 3 by `run-tests`, `graphql start`, `query` and `endpoints`. An absolute or `..`
   `pyproject_dir` is refused; the profile's layer 3 `secrets.env_file` replaces it.
@@ -253,7 +251,7 @@ Docker resolves only the copy's path, which no container can write. Callers that
   refuses a repo with an id missing next to its legacy jj config file.
 - Existing tickets need `cld restart <ticket>`. Container-layer state (installed packages, edits
   not yet snapshotted) is lost; committed and snapshotted work stays.
-- Marketplaces without a marker, or overlapping a repo, are no longer mounted.
+- Marketplaces that fail the 4.2 checks (as built, 13), and all repo-settings ones, are not mounted.
 - Git-backed tickets no longer set upstream tracking on the session branch.
 - A host `git config` change reaches a running container only after a restart.
 
@@ -262,7 +260,7 @@ Docker resolves only the copy's path, which no container can write. Callers that
 - **Order:** the broker first (sections 5 and 6, then restart it), then cld and the images
   together (3 and 4). An old image with a new launcher is refused (3.4). A new image with an old
   launcher still gets the full checkout and works as today.
-- Runner images are unchanged. Servers started before the broker upgrade keep the old mount until
+- Runner images must be rebuilt (13). Servers started before the broker upgrade keep the old mount until
   `graphql restart`. Running task agents keep it until they end; new launches get the new mounts.
 - **Operator steps:** jj 0.38+ on the host; upgrade cld and restart the broker; rebuild the cld
   images; `cld restart` each ticket; turn a symlinked `.env` into a regular file (or use profile
@@ -285,7 +283,7 @@ Real-jj cases use the `jj_repo` fixture and skip without jj. Read-only binds are
   gives no mount and deletes a stale copy; copy equals the bytes, is 0600, replaced atomically;
   bad stage dir refused). `TestSecretMountArgs` (`run-tests` and `graphql start` mount only the
   copy, read-only). `TestAliasNoFollow` (`query <alias>`, `endpoints`; denial names the source).
-  `TestConfigNoFollow`. `TestRunnerStoreMounts` (rows 1-10 per layout, no `<repo>:/repo`, exit 3
+  `TestConfigNoFollow`. `TestRunnerStoreMounts` (rows 1-11 per layout, no `<repo>:/repo`, exit 3
   without either id). `TestStoreMountParity` (broker and cld builders give the same set).
   `TestHostJjNeedsIds` (fake jj: no call at all when an id is missing or a symlink).
 - `tests/test_docker.py`: `TestStoreMounts` and `TestStorePreflight` (colocated, internal git,
@@ -295,9 +293,8 @@ Real-jj cases use the `jj_repo` fixture and skip without jj. Read-only binds are
   workspace config leaves `trunk()` unchanged while both ids exist, and changes it once the
   workspace id is deleted; guards A1 and A10 on jj upgrades).
   `TestTicketContainerArgs`, `TestBuildContainerArgs` (no checkout mount, label, file binds).
-  `TestTicketRepoFiles` (`.env`, `.env.local`, `../x`, `/abs`, symlinks refused).
   `TestPluginMarketplaceFilter` (`$HOME`, repo dir, dir inside a repo, no marker; a real one mounts).
-- `tests/test_container_init_sh.py`: `TestLinkWorkspaceFilesCopies`. `TestBootWithReadOnlyWorkingCopy`
+- `tests/test_container_init_sh.py`: `TestBootWithReadOnlyWorkingCopy`
   (real jj; origin holds only `.jj`, `working_copy` not writable; first launch and reattach
   succeed; the op log gains no snapshot of the default workspace). `TestPlainJjInOriginFails`
   (real jj; `jj st` fails and adds no operation; A3). `TestNoPlainJjInOrigin` (static scan of
@@ -320,7 +317,7 @@ Real-jj cases use the `jj_repo` fixture and skip without jj. Read-only binds are
 6. `cld broker run-tests --repo lide <one test>` passes and sees a `.env` value; `graphql start`,
    `query` and `endpoints` work.
 7. On the host, make `api/.env` a symlink: `run-tests` exits 3 naming it. Restore it.
-8. `ignore_gitignore = [".env", ".envrc"]`: `.env` skipped with a warning, `.envrc` copied.
+8. `ignore_gitignore = [".env", ".envrc"]`: both skipped with a warning (13).
 9. A ticket created by the old cld: warm start is refused; `cld restart` recreates it; the work at
    its bookmark is intact.
 10. A task agent starts and pushes its deliverable branch. `cld run` completes.
@@ -371,8 +368,33 @@ Open questions:
 1. Not in this design: `~/.claude` read-write (7.3) defeats the first contract point through
    host code. It is the next containment ticket, ahead of the identities work.
 2. Refuse host jj older than 0.38 (this design), or only warn?
-3. Should `.envrc` and other names join the `ignore_gitignore` refusal list?
+3. `ignore_gitignore` is off (13). Bring back the copy mechanism of 4.1, or drop the key?
 4. Should the broker and cld's launcher both ignore a `.cld/config.toml` that came from a commit,
    closing the checkout path for the second contract point? Owner: this design, as the launcher
    is in scope. The profile design adopts the answer for its layer 2 (profile 5.2).
-5. Cover submodule git configs now, or leave them open?
+5. Submodules are refused (13). Add read-only rows for each `modules/*` config and hooks dir?
+
+## 13. As built
+
+Deviations from the sections above. Host checks: `MANUAL_TESTS.md` section 10.
+
+- **Row 11** (`G/commondir`, read-only, holds `.`) is new; the preflight creates it.
+- **More refusals, all before any host jj:** a foreign `commondir`; a `G/modules` dir (submodules
+  are not supported yet); any container that mounts the repo without the `store-v1` label (a
+  refusal, not the warning of 3.4). `claude-base` also carries `org.cld.boot-api=2`.
+- **`ignore_gitignore` is off.** D6 and 4.1 were not built. Listed files are skipped with a
+  warning, and `link_workspace_files` is removed.
+- **Marketplaces (4.2):** the marker, outside `~/.claude`, the mailbox root, every repo and the
+  parents of `$HOME`, and literal path equal to real path. Mounted read-only with `--mount`.
+  Entries in a repo's `.claude/settings.json` are never mounted.
+- **Home mounts:** user config only. Relative, no `..`, no symlink, no repo overlap.
+- **Broker secrets (6.3):** copies older than 24 h are swept. The stage dir must also lie
+  outside `~/.claude` and the registry repos.
+- **Runner and server (5):** `--cap-drop=ALL` and `no-new-privileges`. Images without an
+  `org.cld.jj-version` label of 0.38+ are refused. `host_jj` checks the ids, `commondir`,
+  `modules/`, `git_target` and the jj version. Venv cache per repo, at
+  `<VENV_CACHE_ROOT>/repos/<name>-<hash>/`. `graphql_health_path` and `graphql_port` are
+  validated, failed requests print no URL, `task-agent` refuses `--`, and `cld-brokerctl.sh
+  graphql-sweep` uses the broker's own sweep.
+- **Tests (10.1):** the 4.1 classes do not exist. The old-image and old-container cases are unit
+  tests in `TestLaunchWiring` (`tests/test_docker.py`).

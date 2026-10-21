@@ -43,6 +43,8 @@
 # venv and no `cld` import.
 import argparse
 import base64
+import errno
+import hashlib
 import http.client
 import json
 import os
@@ -52,13 +54,14 @@ import stat
 import subprocess
 import sys
 import time
+import tempfile
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cache, cached_property
 from pathlib import Path
 from typing import IO, NamedTuple, NoReturn, Protocol, Self, TextIO
 
@@ -74,6 +77,8 @@ _DEFAULTS = {
     "GRAPHQL_START_TIMEOUT": "300",
     "GRAPHQL_QUERY_TIMEOUT": "30",
     "GRAPHQL_OUTPUT_MAX_BYTES": "65536",
+    "SECRETS_STAGE_DIR": "~/.cld/broker-secrets",
+    "TESTS_RUNS_ROOT": "~/.cld/runs",
     # GRAPHQL_URL_ALLOWLIST is deliberately left out here (see check_url_allowlisted):
     # empty means "no raw URLs at all", and that has to be the default, not a value
     # defaulted in code that's easy to lose track of.
@@ -117,9 +122,24 @@ class Scope(NamedTuple):
     repo: str
 
 
-class SecretsEnv(NamedTuple):
+class SecretsRefused(Exception):
+    """A secrets or config file the broker will not read or mount; args[0] is the reason."""
+
+
+class Secrets(NamedTuple):
+    """A repo's `.env` as read at resolve time. *staged* is the private copy the
+    containers mount (None when absent or not staged), *data* the bytes read."""
+
+    source: str
     project_subdir: str
-    env_file: str
+    staged: str | None
+    data: bytes | None
+
+    def mount_args(self) -> list[str]:
+        return [] if self.staged is None else ["--mount", f"type=bind,src={self.staged},dst=/secrets/.env,readonly"]
+
+    def values(self) -> dict[str, str]:
+        return {} if self.data is None else parse_env_text(self.data.decode(errors="surrogateescape"))
 
 
 class GraphqlConfig(NamedTuple):
@@ -137,12 +157,12 @@ def _setting(key: str) -> str:
     return CONF.get(key) or _DEFAULTS.get(key, "")
 
 
-def parse_env_file(path: str) -> dict[str, str]:
+def parse_env_text(text: str) -> dict[str, str]:
     """`[export] KEY=VALUE` lines of a shell-style env file, with the shell's
     quoting rules. Nothing is expanded or executed: `$VAR` stays literal, and
     any other line is skipped."""
     values = {}
-    for line in Path(path).read_text(errors="surrogateescape").splitlines():
+    for line in text.splitlines():
         try:
             tokens = shlex.split(line)
         except ValueError:
@@ -152,6 +172,10 @@ def parse_env_file(path: str) -> dict[str, str]:
         if tokens and (match := _ASSIGNMENT_RE.fullmatch(tokens[0])):
             values[match[1]] = match[2]
     return values
+
+
+def parse_env_file(path: str) -> dict[str, str]:
+    return parse_env_text(Path(path).read_text(errors="surrogateescape"))
 
 
 def load_conf() -> None:
@@ -169,10 +193,11 @@ def load_conf() -> None:
 
 # ---- process helpers -------------------------------------------------------
 
-def _capture(argv: Sequence[str], stderr: int | None = subprocess.DEVNULL) -> subprocess.CompletedProcess[bytes]:
+def _capture(argv: Sequence[str], stderr: int | None = subprocess.DEVNULL,
+             cwd: str | None = None) -> subprocess.CompletedProcess[bytes]:
     """Run *argv* with stdout captured. A missing binary is exit 127, as in a shell."""
     try:
-        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=stderr)
+        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=stderr, cwd=cwd)
     except OSError as e:
         if stderr is None:
             print(f"{argv[0]}: {e.strerror}", file=sys.stderr)
@@ -232,18 +257,395 @@ def _rm_container(name: str) -> None:
 
 
 def _forget_workspace(repo: str, workspace: str) -> None:
-    _capture(["jj", "-R", repo, "--ignore-working-copy", "workspace", "forget", workspace])
-
-
-# Read a single quoted-string key from a flat cld TOML config (e.g. .cld/config.toml).
-# Empty if the file or key is absent. Avoids a TOML parser in the broker.
-def cld_conf_get(file: str, key: str) -> str:
     try:
-        lines = Path(file).read_text(errors="surrogateescape").splitlines()
-    except OSError:
+        host_jj(repo, "workspace", "forget", workspace)
+    except StoreRefused as e:
+        print(f"[cld-broker] workspace {workspace} not forgotten: {e}", file=sys.stderr)
+
+
+# ---- the secrets resolver (docs/design-secrets-containment.md §6) ------------
+# The repo is the agent's to write, so every read of `.env` or `.cld/config.toml`
+# walks the path one component at a time with O_NOFOLLOW and refuses a symlink
+# anywhere below the repo. Symlinks above the repo are the operator's.
+
+_SECRETS_MAX_BYTES = 1 << 20
+# A staged copy is replaced on each use; one this old belongs to a run that is gone.
+_STAGE_MAX_AGE = 24 * 3600
+# What the stage dir holds: a copy named after its source, or a tempfile of an interrupted copy.
+_STAGE_PREFIX = ".stage-"
+_STAGE_NAME_RE = re.compile(rf"[0-9a-f]{{16}}\.env|{re.escape(_STAGE_PREFIX)}\w{{8}}")
+
+
+def _csv_unsafe(value: str) -> bool:
+    """Docker parses a --mount value as CSV: a comma or a quote in a path adds or ends a field."""
+    return "," in value or '"' in value
+
+
+def _below_repo_parts(rel: str) -> list[str]:
+    parts = [part for part in rel.split("/") if part != "."]
+    if rel.startswith("/") or ".." in parts or "" in parts:
+        raise SecretsRefused("path below the repo must be relative, without '..' or empty parts")
+    return parts
+
+
+def _walk_read(root: str, parts: list[str], max_bytes: int) -> bytes | None:
+    """Bytes of the regular file at *parts* below the open-able directory *root*, None if
+    absent. Raises SecretsRefused on a symlink, a non-regular file or an oversize file."""
+    try:
+        dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise SecretsRefused(f"cannot read {root}: {e.strerror}") from None
+    try:
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            except FileNotFoundError:
+                return None
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise SecretsRefused(f"symlink or non-directory at {part}") from None
+                raise SecretsRefused(f"cannot read {part}: {e.strerror}") from None
+            os.close(dir_fd)
+            dir_fd = next_fd
+        # O_NONBLOCK keeps a FIFO planted in place of the file from blocking the open.
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise SecretsRefused(f"symlink at {parts[-1]}") from None
+            raise SecretsRefused(f"cannot read {parts[-1]}: {e.strerror}") from None
+    finally:
+        os.close(dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SecretsRefused(f"{parts[-1]} is not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as file:
+            data = file.read(max_bytes + 1)
+    except OSError as e:
+        raise SecretsRefused(f"cannot read {parts[-1]}: {e.strerror}") from None
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes:
+        raise SecretsRefused(f"{parts[-1]} is larger than {max_bytes // 1024} KiB")
+    return data
+
+
+def read_repo_file(repo: str, rel: str, max_bytes: int = _SECRETS_MAX_BYTES) -> bytes | None:
+    """Bytes of the regular file *rel* in *repo*, None if absent; the walk of
+    resolve_secrets without the copy. Raises SecretsRefused."""
+    return _walk_read(repo, _below_repo_parts(rel), max_bytes)
+
+
+def _mailbox_root() -> str:
+    try:
+        data = tomllib.loads((Path.home() / ".config" / "cld" / "config.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        data = {}
+    return os.path.expanduser(CONF.get("CLD_MAILBOX_ROOT") or data.get("mailbox_root") or "~/.cld/mailboxes")
+
+
+def _stage_dir() -> str:
+    """The checked directory holding the private copies. Creates it 0700 on first use and
+    removes the copies a crashed run left behind."""
+    path = os.path.expanduser(_setting("SECRETS_STAGE_DIR"))
+    if _csv_unsafe(path):
+        raise SecretsRefused("the secrets stage directory path contains a comma or a quote")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass  # checked below
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise SecretsRefused("the secrets stage directory is not a private directory of the broker user")
+    real = Path(path).resolve()
+    forbidden = (_mailbox_root(), CONF.get("VENV_CACHE_ROOT", "~/.cld/cache"), _setting("TESTS_RUNS_ROOT"),
+                 "~/.claude", *host_registry().values())
+    if any(root and real.is_relative_to(Path(os.path.expanduser(root)).resolve()) for root in forbidden):
+        raise SecretsRefused("the secrets stage directory is inside a directory the containers write")
+    for entry in os.scandir(path):
+        if (_STAGE_NAME_RE.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
+                and time.time() - entry.stat(follow_symlinks=False).st_mtime > _STAGE_MAX_AGE):
+            Path(entry.path).unlink(missing_ok=True)
+    return path
+
+
+def resolve_secrets(repo: str, env_file: str, *, operator_path: bool = False, stage: bool = True) -> Secrets:
+    """Read *env_file* without following a symlink below *repo* and, with *stage*, copy the
+    bytes into a 0600 file of the broker's own. Only that copy is ever mounted. With
+    *operator_path* the file is the operator's own, outside the repo: only its basename is
+    not followed. Raises SecretsRefused."""
+    if operator_path:
+        root, parts = os.path.realpath(os.path.dirname(env_file)), [os.path.basename(env_file)]
+    elif env_file.startswith(f"{repo}/"):
+        root, parts = repo, _below_repo_parts(env_file.removeprefix(f"{repo}/"))
+    else:
+        raise SecretsRefused("path is outside the repo")
+    subdir = "/".join(parts[:-1]) or "."
+    data = _walk_read(root, parts, _SECRETS_MAX_BYTES)
+    if not stage:
+        return Secrets(env_file, subdir, None, data)
+    staged = f"{_stage_dir()}/{hashlib.sha256(env_file.encode()).hexdigest()[:16]}.env"
+    if data is None:
+        Path(staged).unlink(missing_ok=True)
+        return Secrets(env_file, subdir, None, None)
+    fd, tmp = tempfile.mkstemp(prefix=_STAGE_PREFIX, dir=os.path.dirname(staged))  # 0600
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+        os.replace(tmp, staged)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return Secrets(env_file, subdir, staged, data)
+
+
+# ---- the repo store: runner mounts and host jj (docs/design-secrets-containment.md §3.1, §5) ----
+# The runner and server containers get only the jj/git store, never the checkout. The
+# rows must equal cld/docker.py:_store_rows (the broker cannot import cld; see
+# TestStoreMountParity). Nothing here creates a file or runs jj to repair a store.
+
+_ORIGIN_MOUNT_LABEL = "org.cld.origin-mount=store-v1"
+
+# (id file, legacy config file the id guards), relative to the repo.
+_JJ_IDS = (
+    (".jj/repo/config-id", ".jj/repo/config.toml"),
+    (".jj/workspace-config-id", ".jj/workspace-config.toml"),
+)
+
+
+class StoreLayout(NamedTuple):
+    jj: bool
+    git_dir: str  # relative to the repo
+
+
+class StoreRefused(Exception):
+    """A repo store the broker will not run jj on or mount; args[0] is the denial message."""
+
+
+def _kind(path: str) -> str | None:
+    """``dir``, ``file``, ``symlink`` or ``other`` by ``lstat``; None when missing.
+    Raises StoreRefused when the path cannot be examined (ENOTDIR, EACCES, ...)."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise StoreRefused(f"denied: cannot examine {path}: {e.strerror}") from None
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    return "file" if stat.S_ISREG(mode) else "other"
+
+
+def _not_prepared(repo: str) -> StoreRefused:
+    return StoreRefused(f"denied: {repo} store is not prepared -- start a ticket on it once")
+
+
+def _unsafe_store(repo: str, reason: str) -> StoreRefused:
+    return StoreRefused(f"denied: repo {repo}: {reason} -- cannot mount its store safely")
+
+
+def _require_kind(repo: str, rel: str, expected: str) -> None:
+    kind = _kind(f"{repo}/{rel}")
+    if kind != expected:
+        raise _unsafe_store(repo, f"{rel} is {'missing' if kind is None else f'a {kind}'}, expected a {expected}")
+
+
+# Both places a jj repo's git dir can be, and what the read-only `commondir` row holds: git and jj
+# take their config and hooks from the folder that file names, "." being the git dir itself. These
+# equal GIT_DIRS and COMMONDIR_PLACEHOLDER of cld/vcs/jj.py (TestStoreMountParity).
+_GIT_DIRS = (".git", ".jj/repo/store/git")
+_COMMONDIR_PLACEHOLDER = "."
+
+
+def check_git_dir(repo: str, git_dir: str) -> None:
+    """The launcher's cld/vcs/jj.py:check_git_dir. The git dir root is read-write for the agent: a
+    `commondir` other than the placeholder moves the config and hooks host git and jj load to a
+    folder it writes, and `modules/` holds submodule configs and hooks that no row protects.
+    Raises StoreRefused."""
+    commondir = f"{git_dir}/commondir"
+    if _kind(f"{repo}/{commondir}") is not None:
+        try:
+            content = read_repo_file(repo, commondir, len(_COMMONDIR_PLACEHOLDER))
+        except SecretsRefused:
+            content = None
+        if content != _COMMONDIR_PLACEHOLDER.encode():
+            raise _unsafe_store(repo, f"{commondir} exists: git and jj would load their config and hooks "
+                                      "from the folder it names. Check it, then delete it")
+    if _kind(f"{repo}/{git_dir}/modules") is not None:
+        raise _unsafe_store(repo, f"{git_dir}/modules exists: git submodules are not supported yet")
+
+
+def check_jj_ids(repo: str) -> None:
+    """Both jj ids of *repo* must be regular files, and neither git dir may fail check_git_dir.
+    With an id missing any jj call would migrate a legacy config file, planted or not, into the
+    host's jj config (design A10). Raises StoreRefused."""
+    for rel, legacy in _JJ_IDS:
+        if (kind := _kind(f"{repo}/{rel}")) is None:
+            if _kind(f"{repo}/{legacy}") is not None:
+                raise _unsafe_store(repo, f"unmigrated jj config {legacy}: check it, then run jj once on the host")
+            raise _not_prepared(repo)
+        if kind != "file":
+            raise _unsafe_store(repo, f"{rel} is a {kind}, expected a file")
+    for git_dir in _GIT_DIRS:
+        check_git_dir(repo, git_dir)
+
+
+@cache
+def _host_jj_version() -> str:
+    """Output of ``jj --version``, empty when jj is not installed. Asked once per broker
+    process. cwd is away from any repo: even this call must not load a repo config."""
+    return _text(_capture(["jj", "--version"], cwd="/"))
+
+
+def require_host_jj() -> None:
+    """The launcher's minimum (cld/docker.py:_check_jj_version) on the broker's own jj: its
+    PATH comes from broker.conf, and a jj older than 0.38 also reads the agent-writable repo
+    config files. Raises StoreRefused."""
+    version = _host_jj_version()
+    found = re.search(r"(\d+)\.(\d+)", version)
+    if not found or (int(found[1]), int(found[2])) < _JJ_MIN_VERSION:
+        raise StoreRefused(f"denied: host jj '{version or 'not found'}' is older than "
+                           f"{'.'.join(map(str, _JJ_MIN_VERSION))}")
+
+
+def host_jj(repo: str, *args: str, snapshot: bool = False) -> str | None:
+    """stdout of host ``jj -R <repo> <args>``, None if it failed or *repo* has no jj store.
+    Every host jj call on a repo goes through here: it runs after check_jj_ids, the git_target
+    check and require_host_jj, and never without them. Without *snapshot* the call leaves the
+    working copy alone. Raises StoreRefused."""
+    if _kind(f"{repo}/.jj") is None:
+        return None
+    check_jj_ids(repo)
+    _git_target_layout(repo)
+    require_host_jj()
+    return _out("jj", "-R", repo, *(() if snapshot else ("--ignore-working-copy",)), *args)
+
+
+def store_rows(layout: StoreLayout) -> list[tuple[str, str, bool]]:
+    """The eleven mount rows as ``(path, kind, readonly)``; the path is the same under the host
+    repo and under the container root. The ``commondir`` row is a placeholder that keeps the
+    agent from creating that file."""
+    git = layout.git_dir
+    rows = [
+        (".jj", "dir", False),
+        (".jj/working_copy", "dir", True),
+        (".jj/repo", "dir", False),
+        (".jj/repo/config-id", "file", True),
+        (".jj/repo/store", "dir", False),
+        (".jj/repo/store/git_target", "file", True),
+    ] if layout.jj else []
+    rows += [(git, "dir", False), (f"{git}/config", "file", True), (f"{git}/hooks", "dir", True),
+             (f"{git}/commondir", "file", True)]
+    if layout.jj:
+        rows.append((".jj/workspace-config-id", "file", True))
+    return rows
+
+
+def _git_target_layout(repo: str) -> StoreLayout:
+    """The layout of a jj repo, if ``git_target`` names the repo's own git dir."""
+    try:
+        raw = read_repo_file(repo, ".jj/repo/store/git_target", 4096)
+    except SecretsRefused as e:
+        raise _unsafe_store(repo, str(e)) from None
+    store = f"{repo}/.jj/repo/store"
+    target = os.path.normpath(os.path.join(store, (raw or b"").decode(errors="surrogateescape").strip()))
+    bases = {os.path.normpath(repo), os.path.realpath(repo)}
+    for git_dir in _GIT_DIRS:
+        if target in {os.path.normpath(os.path.join(base, git_dir)) for base in bases}:
+            return StoreLayout(jj=True, git_dir=git_dir)
+    raise _unsafe_store(repo, f"git_target points to {target}, outside this repo's git dirs")
+
+
+def store_layout(repo: str) -> StoreLayout:
+    """The launcher preflight (cld/docker.py:prepare_store_mounts) without its repairs: it
+    refuses where the launcher would create an id, ``hooks`` or the ``commondir`` placeholder.
+    Raises StoreRefused."""
+    if _kind(f"{repo}/.jj") is not None:
+        _require_kind(repo, ".jj", "dir")
+        if _kind(f"{repo}/.jj/repo") == "file":
+            raise _unsafe_store(repo, "secondary jj workspace (.jj/repo is a file)")
+        for rel, expected in ((".jj/repo", "dir"), (".jj/repo/store", "dir"), (".jj/repo/store/git_target", "file")):
+            _require_kind(repo, rel, expected)
+        check_jj_ids(repo)
+        layout = _git_target_layout(repo)
+    elif (git_kind := _kind(f"{repo}/.git")) == "file":
+        raise _unsafe_store(repo, "git worktree (.git is a file)")
+    elif git_kind is None:
+        raise _unsafe_store(repo, "neither a .jj nor a .git directory")
+    else:
+        layout = StoreLayout(jj=False, git_dir=".git")
+    check_git_dir(repo, layout.git_dir)
+    for rel, expected, _ in store_rows(layout):
+        if rel in (f"{layout.git_dir}/hooks", f"{layout.git_dir}/commondir") and _kind(f"{repo}/{rel}") is None:
+            raise _not_prepared(repo)
+        _require_kind(repo, rel, expected)
+    return layout
+
+
+def store_mounts(repo: str, root: str) -> list[str]:
+    """``--mount`` arguments of the store rows, host repo at *repo*, container side at *root*.
+    ``--mount`` instead of ``-v``: a missing source fails the run and is not created on the host."""
+    if _csv_unsafe(repo):
+        raise _unsafe_store(repo, "its path contains a comma or a quote, which would split the --mount value")
+    args: list[str] = []
+    for rel, _, readonly in store_rows(store_layout(repo)):
+        args += ["--mount", f"type=bind,src={repo}/{rel},dst={root}/{rel}" + (",readonly" if readonly else "")]
+    return args
+
+
+_JJ_VERSION_LABEL = "org.cld.jj-version"
+_JJ_MIN_VERSION = (0, 38)
+
+
+def require_jj_image(image: str) -> None:
+    """Exit 3 unless *image* labels a jj of 0.38 or newer (set from the JJ_VERSION build arg).
+    Older jj also reads the repo's own config files, which the container can write."""
+    version = _label(image, _JJ_VERSION_LABEL) or ""
+    found = re.match(r"(\d+)\.(\d+)", version)
+    if not found or (int(found[1]), int(found[2])) < _JJ_MIN_VERSION:
+        _die(f"denied: image {image} has no label {_JJ_VERSION_LABEL} of "
+             f"{'.'.join(map(str, _JJ_MIN_VERSION))} or newer (found '{version}') -- rebuild it with its build.sh", 3)
+
+
+def store_container_args(repo: str, image: str) -> list[str]:
+    """What replaces ``-v <repo>:/repo`` in a runner or server ``docker run`` of *image*: the store
+    at /repo, the label that keeps the launcher from warning about the container, and no
+    capabilities and no new privileges, so code under test cannot remount the read-only rows. Exits 3 on a refused store
+    or an image whose jj is too old."""
+    try:
+        mounts = store_mounts(repo, "/repo")
+    except StoreRefused as e:
+        _die(str(e), 3)
+    require_jj_image(image)
+    return [*mounts, "--label", _ORIGIN_MOUNT_LABEL, "--cap-drop=ALL", "--security-opt=no-new-privileges"]
+
+
+def _commit_id(repo: str, revset: str, *, snapshot: bool = False) -> str | None:
+    try:
+        return host_jj(repo, "log", "--no-graph", "-n1", "-r", revset, "-T", "commit_id", snapshot=snapshot)
+    except StoreRefused as e:
+        _die(str(e), 3)
+
+
+# Read a single quoted-string key from a flat cld TOML config (<repo>/.cld/config.toml).
+# Empty if the file or key is absent. Avoids a TOML parser in the broker.
+def cld_conf_get(repo: str, key: str) -> str:
+    try:
+        data = read_repo_file(repo, ".cld/config.toml")
+    except SecretsRefused as e:
+        _die(f"denied: config file {repo}/.cld/config.toml: {e}", 3)
+    if data is None:
         return ""
     pattern = re.compile(rf'\s*{re.escape(key)}\s*=\s*"([^"]*)"')
-    return next((match[1] for line in lines if (match := pattern.match(line))), "")
+    return next((match[1] for line in data.decode(errors="surrogateescape").splitlines()
+                 if (match := pattern.match(line))), "")
 
 
 # The host repo registry (`cld repos add`): name -> path of each [repos.<name>]
@@ -341,8 +743,7 @@ class LabelCaller:
     # §9) for no freshness gain -- watchman already wrote the container's own
     # snapshot independently.
     def revision(self, repo: str) -> str | None:
-        return _out("jj", "-R", repo, "--ignore-working-copy", "log", "--no-graph", "-n1",
-                    "-r", f"{self.name}@", "-T", "commit_id")
+        return _commit_id(repo, f"{self.name}@")
 
     # The agent already forwarded into the caller (cld/docker.py:stage_ssh_agent),
     # so a run can do with the key exactly what the caller itself can, no more:
@@ -379,7 +780,7 @@ class CliCaller:
     # operator's own working copy, and snapshotting it first is what makes
     # uncommitted edits part of the run.
     def revision(self, repo: str) -> str | None:
-        return _out("jj", "-R", repo, "log", "--no-graph", "-n1", "-r", self.revset, "-T", "commit_id")
+        return _commit_id(repo, self.revset, snapshot=True)
 
     # `cld-brokerctl run` clears the environment, so the operator's agent comes
     # from broker.conf, as for the task-agent launcher (stage_agent_socket).
@@ -398,13 +799,15 @@ class CliCaller:
 # here -- callers that only need the secrets path (e.g. a graphql alias lookup
 # for a repo whose graphql_command isn't even set, or a git-backed repo where
 # jj would exit 3) must not pay for jj resolution they don't need.
-def resolve_secrets_env_file(repo: str) -> SecretsEnv:
-    subdir = cld_conf_get(f"{repo}/.cld/config.toml", "pyproject_dir") or "."
-    if subdir.startswith("/"):
-        return SecretsEnv(subdir, f"{subdir}/.env")
-    if subdir == ".":
-        return SecretsEnv(subdir, f"{repo}/.env")
-    return SecretsEnv(subdir, f"{repo}/{subdir}/.env")
+def resolve_secrets_env_file(repo: str, *, stage: bool = True) -> Secrets:
+    subdir = cld_conf_get(repo, "pyproject_dir") or "."
+    source = f"{repo}/.env" if subdir == "." else f"{repo}/{subdir}/.env"
+    try:
+        return resolve_secrets(repo, source, stage=stage)
+    except SecretsRefused as e:
+        _die(f"denied: secrets file {source}: {e}", 3)
+    except OSError as e:
+        _die(f"denied: secrets file {source}: cannot stage a copy: {e.strerror}", 3)
 
 
 def resolve_revision(caller: Caller, repo: str) -> str:
@@ -416,12 +819,8 @@ def resolve_revision(caller: Caller, repo: str) -> str:
 # run-tests needs the session's current revision + the project's .env; resolve
 # those lazily here (not in the shared dispatcher) so read-only actions like
 # list-containers don't depend on the session's revision being resolvable.
-def resolve_test_context(caller: Caller, repo: str) -> tuple[str, SecretsEnv]:
+def resolve_test_context(caller: Caller, repo: str) -> tuple[str, Secrets]:
     return resolve_revision(caller, repo), resolve_secrets_env_file(repo)
-
-
-def _secret_mount(secrets: SecretsEnv) -> list[str]:
-    return ["-v", f"{secrets.env_file}:/secrets/.env:ro"] if os.path.isfile(secrets.env_file) else []
 
 
 # The caller's ssh-agent for the runner images, which fetch `git+ssh://`
@@ -441,24 +840,34 @@ def _agent_mount(sock: str) -> list[str]:
     return ["-v", f"{sock}:{_RUNNER_AGENT_SOCK}", "-e", f"SSH_AUTH_SOCK={_RUNNER_AGENT_SOCK}"]
 
 
-def _venv_cache_args(image: str) -> list[str]:
-    """The -v/-e args wiring the host-side venv + poetry download cache
+def venv_cache_dir(root: str, repo: str) -> str:
+    """The cache folder of one repo below *root*. Code under test writes it, and a venv or a
+    downloaded wheel in it is later run or installed by a run of the same repo, with that repo's
+    `.env`: the folder must not be shared with another repo. Named by the repo's real path."""
+    real = os.path.realpath(repo)
+    name = re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(real))
+    return f"{root}/repos/{name}-{hashlib.sha256(real.encode()).hexdigest()[:16]}"
+
+
+def _venv_cache_args(repo: str, image: str) -> list[str]:
+    """The -v/-e args wiring *repo*'s own host-side venv + poetry download cache
     (scripts/venv-cache.sh) into a run of *image*; none when the cache is
     disabled. The image id is part of the cache key -- a container cannot read its own."""
     # Not _setting: VENV_CACHE_ROOT set empty in the conf disables the cache.
     if not (root := CONF.get("VENV_CACHE_ROOT", os.path.expanduser("~/.cld/cache"))):
         return []
+    cache = venv_cache_dir(root, repo)
     for sub in ("venvs", "poetry", "locks"):
-        os.makedirs(f"{root}/{sub}", exist_ok=True)
+        os.makedirs(f"{cache}/{sub}", exist_ok=True)
     image_id = _out_strict("docker", "image", "inspect", "--format", "{{.Id}}", image, stderr=None)
-    return ["-v", f"{root}:/cache", "-e", f"VENV_CACHE_IMAGE_ID={image_id}"]
+    return ["-v", f"{cache}:/cache", "-e", f"VENV_CACHE_IMAGE_ID={image_id}"]
 
 
-def run_tests(repo: str, rev: str, secrets: SecretsEnv, agent: str, argv: list[str]) -> NoReturn:
+def run_tests(repo: str, rev: str, secrets: Secrets, agent: str, argv: list[str]) -> NoReturn:
     _exec([
         "docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
-        "-v", f"{repo}:/repo", *_secret_mount(secrets), *_agent_mount(agent),
-        *_venv_cache_args(_setting("RUNTESTS_IMAGE")),
+        *store_container_args(repo, _setting("RUNTESTS_IMAGE")), *secrets.mount_args(), *_agent_mount(agent),
+        *_venv_cache_args(repo, _setting("RUNTESTS_IMAGE")),
         "-e", f"REVISION={rev}", "-e", f"PROJECT_SUBDIR={secrets.project_subdir}",
         _setting("RUNTESTS_IMAGE"), *argv,
     ])
@@ -564,8 +973,10 @@ def resolve_task_agent_repo(caller: Caller, selector: str) -> str:
 #   --force   denied outright. Overriding a reap-readiness refusal is a human act;
 #             a container must not be able to discard uncaptured work or break a
 #             third agent's edge (§7).
-#   --parent  denied from the caller and appended by us as the validated session,
-#             so an agent's recorded owner is host-set and cannot be forged.
+#   --parent  denied from the caller and put by us before the caller's tokens as the
+#             validated session, so an agent's recorded owner is host-set and cannot be forged.
+#   --        denied: it ends option parsing on the host, so a token after it would
+#             be a positional that skips the `@ref` check.
 #   prompts   every positional must be an `@ref`. Refs are resolved host-side and their
 #             text composed into the new container's brief, so a bare path would let a
 #             container read any host file the user can. The container-side client folds
@@ -584,6 +995,8 @@ def action_task_agent(caller: Caller, argv: list[str]) -> None:
     # Both spellings of each denial: click accepts `--opt=value`, so matching the bare
     # token alone would let `--parent=<other-master>` through and forge an owner.
     for arg in args:
+        if arg == "--":
+            _die("denied: '--' is not accepted", 2)
         if arg == "--force" or arg.startswith("--force="):
             _die("denied: --force is host-only", 2)
         if arg == "--parent" or arg.startswith("--parent="):
@@ -616,9 +1029,9 @@ def action_task_agent(caller: Caller, argv: list[str]) -> None:
             _die(f"cannot cd to {repo}", 3)
     # --parent is what makes ownership host-set: it stamps the spawn, scopes the roster
     # and gates the reap. `logs` has no such option (a read needs no authority), so
-    # appending it there would just make cld reject the argv.
+    # adding it there would just make cld reject the argv.
     parent = [] if op == "logs" else ["--parent", caller.name]
-    _exec(["cld", "task-agent", op, *args, *parent])
+    _exec(["cld", "task-agent", op, *parent, *args])
 
 
 # ---- graphql: server lifecycle + credentialed queries over the broker -----
@@ -636,18 +1049,32 @@ def action_task_agent(caller: Caller, argv: list[str]) -> None:
 # poetry install on it. cld_conf_get parses double-quoted strings only:
 # `graphql_port = 8000` silently yields nothing, it must be `= "8000"`.
 def resolve_graphql_config(repo: str) -> GraphqlConfig:
-    conf = f"{repo}/.cld/config.toml"
-    return GraphqlConfig(
-        cld_conf_get(conf, "graphql_command"),
-        cld_conf_get(conf, "graphql_port") or "8000",
-        cld_conf_get(conf, "graphql_health_path") or "/graphql",
+    config = GraphqlConfig(
+        cld_conf_get(repo, "graphql_command"),
+        cld_conf_get(repo, "graphql_port") or "8000",
+        cld_conf_get(repo, "graphql_health_path") or "/graphql",
     )
+    # Both are repo-written and end up in a URL, `-p`, `docker port` and an env var.
+    if not (config.port.isascii() and config.port.isdecimal() and 0 < int(config.port) < 65536):
+        _die(f"denied: graphql_port '{config.port}' in {repo}/.cld/config.toml is not a port number", 3)
+    parts = urllib.parse.urlsplit(config.health_path)
+    if not config.health_path.startswith("/") or parts.scheme or parts.netloc:
+        _die(f"denied: graphql_health_path '{config.health_path}' in {repo}/.cld/config.toml "
+             "must be a path starting with '/'", 3)
+    return config
+
+
+def local_url(host_port: str, health_path: str) -> str:
+    """The server's URL from its own parts: the health path (resolve_graphql_config checked it)
+    can only add path and query, never change the host."""
+    parts = urllib.parse.urlsplit(health_path)
+    return urllib.parse.urlunsplit(("http", host_port, parts.path, parts.query, ""))
 
 
 # start's context: config (hard-required -- no guessed default, the old MCP's
 # `poetry run python manage.py` default was a lide-api-shaped guess and is not
 # being carried over) + the secrets path.
-def resolve_graphql_context(repo: str) -> tuple[SecretsEnv, GraphqlConfig]:
+def resolve_graphql_context(repo: str) -> tuple[Secrets, GraphqlConfig]:
     secrets = resolve_secrets_env_file(repo)
     config = resolve_graphql_config(repo)
     if not config.command:
@@ -672,10 +1099,11 @@ def resolve_graphql_bind() -> str:
 # Nothing reaps what `start` spawns: cld-brokerctl.sh manages only the sshd,
 # and no host-side hook fires when a session container is reaped. Run at the
 # top of `start` and `status` so staleness never survives past the next
-# lookup, and exposed standalone as `cld-brokerctl.sh graphql-sweep` for an
-# operator to reap after a host reboot without starting any session. Never
-# fatal -- a sweep failure must not block the caller's own request.
-def sweep_gql_orphans() -> None:
+# lookup, and exposed standalone as `cld-brokerctl.sh graphql-sweep` (the
+# `graphql-sweep` CLI route, main_cli) for an operator to reap after a host
+# reboot without starting any session. Never fatal -- a sweep failure must
+# not block the caller's own request. *announce* prints a line per reaped server.
+def sweep_gql_orphans(announce: bool = False) -> None:
     servers = _capture(["docker", "ps", "-a", "--filter", "label=org.cld.gql-session", "--format", "{{.Names}}"],
                        stderr=None)
     for container in _text(servers).split():
@@ -689,6 +1117,8 @@ def sweep_gql_orphans() -> None:
         if not _capture(["docker", "inspect", session]).returncode:
             continue  # owning session exists -- keep
         repo = _label(container, "org.cld.gql-repo")
+        if announce:
+            print(f"reaping orphaned graphql server {container} (session {session} gone)")
         _rm_container(container)
         if repo:
             _forget_workspace(repo, f"gql-{session}")
@@ -761,7 +1191,10 @@ def http_post(url: str, body: bytes, headers: dict[str, str], timeout: float) ->
     except urllib.error.HTTPError as e:
         return e.code, e.read()
     except (OSError, ValueError, http.client.HTTPException) as e:
-        print(f"[cld-broker] graphql request failed: {e}", file=sys.stderr)
+        # The text of these errors can quote the URL, which may carry userinfo from the repo's .env.
+        cause = e.reason if isinstance(getattr(e, "reason", None), BaseException) else e
+        reason = cause.strerror if isinstance(cause, OSError) and cause.strerror else type(cause).__name__
+        print(f"[cld-broker] graphql request failed: {reason}", file=sys.stderr)
         return None
 
 
@@ -776,10 +1209,9 @@ def _alias_key(alias: str) -> str:
 #   CLD_GRAPHQL_COOKIE_<ALIAS> = session=...          # full Cookie value
 # Parsed into a local dict over the broker's own settings, so the broker's
 # environment is never polluted by whatever else the repo's .env defines.
-def lookup_alias(alias: str, secrets_env_file: str) -> tuple[str, str, str]:
+def lookup_alias(alias: str, secrets: Secrets) -> tuple[str, str, str]:
     values = dict(CONF)
-    if os.path.isfile(secrets_env_file):
-        values.update(parse_env_file(secrets_env_file))
+    values.update(secrets.values())
     key = _alias_key(alias)
     return (values.get(f"CLD_GRAPHQL_URL_{key}", ""), values.get(f"CLD_GRAPHQL_AUTH_{key}", ""),
             values.get(f"CLD_GRAPHQL_COOKIE_{key}", ""))
@@ -820,18 +1252,18 @@ def resolve_target(scope: Scope, target: str) -> tuple[str, str, str]:
         host_port = _first_line(_out("docker", "port", f"cld_gql_{scope.session}", f"{config.port}/tcp") or "")
         if not host_port:
             _die(f"denied: no local graphql server running for {scope.session} -- start one first", 3)
-        _, auth, cookie = lookup_alias("local", resolve_secrets_env_file(scope.repo).env_file)
-        return f"http://{host_port}{config.health_path}", auth, cookie
+        _, auth, cookie = lookup_alias("local", resolve_secrets_env_file(scope.repo, stage=False))
+        return local_url(host_port, config.health_path), auth, cookie
     if target.startswith(("http://", "https://")):
         check_url_allowlisted(target)
         return target, "", ""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", target):
         _die(f"denied: bad target '{target}'", 2)
-    secrets_env_file = resolve_secrets_env_file(scope.repo).env_file
-    url, auth, cookie = lookup_alias(target, secrets_env_file)
+    secrets = resolve_secrets_env_file(scope.repo, stage=False)
+    url, auth, cookie = lookup_alias(target, secrets)
     if not url:
         _die(f"denied: unknown graphql alias '{target}' -- set CLD_GRAPHQL_URL_{_alias_key(target)} in "
-             f"{secrets_env_file}", 3)
+             f"{secrets.source}", 3)
     return url, auth, cookie
 
 
@@ -855,7 +1287,10 @@ def do_graphql_query(scope: Scope, target: str, query: str, variables: str = "")
         headers["Cookie"] = cookie
 
     if (response := http_post(url, body.encode(), headers, float(_setting("GRAPHQL_QUERY_TIMEOUT")))) is None:
-        _die(f"graphql request to {url} failed (connection error)", 3)
+        # Never the resolved URL: an alias URL from .env can hold credentials.
+        raw = urllib.parse.urlsplit(target)
+        shown = f"{raw.scheme}://{raw.hostname}" if raw.scheme in ("http", "https") else target
+        _die(f"graphql request to '{shown}' failed (connection error)", 3)
     status, data = response
 
     cap_output(mask_output(data), int(_setting("GRAPHQL_OUTPUT_MAX_BYTES")), "head")
@@ -877,11 +1312,7 @@ _GRAPHQL_INTROSPECTION_QUERY = "{__schema{queryType{name} mutationType{name} typ
 # lookup_alias, not necessarily byte-identical to however the operator
 # originally wrote it in .env).
 def do_graphql_endpoints(scope: Scope) -> None:
-    secrets_env_file = resolve_secrets_env_file(scope.repo).env_file
-    try:
-        text = Path(secrets_env_file).read_text(errors="surrogateescape")
-    except OSError:
-        return
+    text = (resolve_secrets_env_file(scope.repo, stage=False).data or b"").decode(errors="surrogateescape")
     for alias in re.findall(r"^CLD_GRAPHQL_URL_([A-Za-z0-9_]+)", text, re.MULTILINE):
         print(alias.replace("_", "-").lower())
 
@@ -932,10 +1363,10 @@ def do_graphql_status(scope: Scope, tip: str | None) -> None:
     # it) doesn't mean the server itself answers yet -- a live probe is the
     # only way to tell "running" from "starting" here, same probe do_graphql_start
     # waits on.
-    if not host_port or not _probe(f"http://{host_port}{config.health_path}", 3):
+    if not host_port or not _probe(local_url(host_port, config.health_path), 3):
         print_gql_status_line("starting", "", "", rev, cname, stale)
         return
-    print_gql_status_line("running", host_port.rpartition(":")[2], f"http://{host_port}{config.health_path}",
+    print_gql_status_line("running", host_port.rpartition(":")[2], local_url(host_port, config.health_path),
                           rev, cname, stale)
 
 
@@ -986,22 +1417,23 @@ def do_graphql_start(scope: Scope, rev: str, agent: str) -> None:
             do_graphql_status(scope, rev)
             return
         # Stopped/crashed leftover from a previous start -- clear it before
-        # relaunching so `docker run --name` below doesn't collide.
+        # relaunching so `docker run --name` below doesn't collide. Its workspace lives in
+        # the repo it was started for, as in do_graphql_stop.
+        left_repo = _label(cname, "org.cld.gql-repo")
         _rm_container(cname)
-        _forget_workspace(scope.repo, wsname)
+        _forget_workspace(left_repo or scope.repo, wsname)
 
     bind = resolve_graphql_bind()
 
-    # -v <repo>:/repo is read-write, as run-tests already does -- `jj
-    # workspace add` writes store objects. The server serves from its own
-    # workspace and never touches the caller's @ or bookmarks.
+    # The store at /repo is read-write where `jj workspace add` writes objects. The
+    # server serves from its own workspace and never touches the caller's @ or bookmarks.
     _out_strict(
         "docker", "run", "-d", "--name", cname,
         "--label", f"org.cld.gql-session={scope.session}",
         "--label", f"org.cld.gql-repo={scope.repo}",
         "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
-        "-v", f"{scope.repo}:/repo", *_secret_mount(secrets), *_agent_mount(agent),
-        *_venv_cache_args(_setting("GRAPHQL_IMAGE")),
+        *store_container_args(scope.repo, _setting("GRAPHQL_IMAGE")), *secrets.mount_args(), *_agent_mount(agent),
+        *_venv_cache_args(scope.repo, _setting("GRAPHQL_IMAGE")),
         "-e", f"REVISION={rev}", "-e", f"PROJECT_SUBDIR={secrets.project_subdir}",
         "-e", f"GQL_WORKSPACE={wsname}", "-e", f"GQL_COMMAND={config.command}",
         "-e", f"GQL_PORT={config.port}",
@@ -1026,7 +1458,7 @@ def do_graphql_start(scope: Scope, rev: str, agent: str) -> None:
         if _out("docker", "inspect", cname, "--format", "{{.State.Running}}") != "true":
             died = True
             break
-        if _probe(f"http://{bind}:{host_port}{config.health_path}", 5):
+        if _probe(local_url(f"{bind}:{host_port}", config.health_path), 5):
             ready = True
             break
         time.sleep(2)
@@ -1097,7 +1529,7 @@ def action_graphql(caller: Caller, argv: list[str]) -> None:
 #     repo = caller.repo("")
 #     rev, secrets = resolve_test_context(caller, repo)
 #     _exec(["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
-#            "-v", f"{repo}:/repo", "-e", f"REVISION={rev}",
+#            *store_container_args(repo, _setting("LINT_IMAGE") or "runlint:latest"), "-e", f"REVISION={rev}",
 #            "-e", f"PROJECT_SUBDIR={secrets.project_subdir}",
 #            _setting("LINT_IMAGE") or "runlint:latest", *argv])
 
@@ -1157,6 +1589,9 @@ def main_cli(argv: list[str]) -> None:
     """The host route (`cld-brokerctl run`): the Caller comes from the command
     line instead of docker labels. Every token after the action goes to it as
     given, so its own flags (pytest's -k, -r, ...) never clash with these."""
+    if argv == ["graphql-sweep"]:  # needs no repo, session or revision
+        sweep_gql_orphans(announce=True)
+        return
     parser = argparse.ArgumentParser(prog="cld-brokerctl run",
                                      description="Run one broker action as the host operator.")
     parser.add_argument("-C", dest="repo", default=".", help="repo to act on (default: the one containing cwd)")

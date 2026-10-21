@@ -7,7 +7,8 @@ The primary interactive workflow is the **ticket container** (v2): one container
 ## Prerequisites
 
 - Docker
-- A **jujutsu** or **git** repository (jj preferred; git used as fallback)
+- A **jujutsu** or **git** repository (jj preferred; git used as fallback). Git submodules are not supported: a repo with a `modules/` folder in its git dir is refused.
+- Host jj 0.38 or newer. cld refuses to mount a jj repo with an older host jj.
 - Python 3.11+ with [Poetry](https://python-poetry.org/)
 - Probably not Windows
 
@@ -22,7 +23,7 @@ poetry run cld --help
 
 # To run from any directory, add `/.venv/bin/cld` to your PATH. I have `~/.local/bin/cld` symlink pointing there.
 
-# Build images (one command builds both, devcontainer first)
+# Build images (one command builds all three: claude-base first, then claude-devcontainer and claude-run)
 cld build [--no-cache]
 ```
 
@@ -68,7 +69,7 @@ One container per ticket. The ticket (by convention a YouTrack id) is the unit o
 /workspace/<slug>/            harness cwd -- the "ticket root" (with a generated CLAUDE.md)
   <repo-a>/                   jj workspace (or git worktree) of repo-a
   <repo-b>/
-/workspace/origin/<repo-a>/   RW bind mount of the host repo
+/workspace/origin/<repo-a>/   the host repo's jj/git store only (.jj, .git), never the checkout
 /workspace/origin/<repo-b>/
 ```
 
@@ -325,7 +326,7 @@ prompts/                           Reusable task prompts for agents
 
 ### Workspace isolation
 
-Containers mount the host repo RW at `/workspace/origin` (ticket containers: one mount per repo at `/workspace/origin/<name>`). The container's own entrypoint runs `jj workspace add` / `git worktree add` on boot; the workspace directory lives in the container's own filesystem layer at `/workspace/current` (tickets: `/workspace/<slug>/<name>`), never on the host. jj writes all store objects through the RW origin mount, and watchman snapshots edits into the store autonomously, so work is durable and host-visible without a host-side workspace directory. The `-r` flag pins the anchor revision for v1 kinds (default: `@` for jj, `HEAD` for git; tickets default to the registry `default_rev`, falling back to `trunk()`). On shutdown, the session's bookmark and workspace registration are forgotten from the origin store host-side, by `cld shutdown` / `cld <role> shutdown`; committed work persists.
+Containers never mount the host checkout. They mount only the host repo's jj/git store at `/workspace/origin` (ticket containers: one store per repo at `/workspace/origin/<name>`), as the eleven-row mount set of `docs/design-secrets-containment.md` section 3.1. The store stays writable. The settings the host trusts stay read-only: the host default workspace's working-copy state, the jj config ids, `git_target`, and the git dir's `config`, `hooks` and `commondir`. So `.env` and other untracked host files never reach a container, and plain `jj` in origin fails. Before each launch a host preflight checks the store and refuses an unsafe one (host jj older than 0.38, a jj id missing next to a legacy config file, a `git_target` outside the repo, a foreign `commondir`, a git `modules/` folder, or another container that mounts the repo without the `org.cld.origin-mount=store-v1` label). The container's own entrypoint runs `jj workspace add` / `git worktree add` on boot, with `--ignore-working-copy` for every jj call in origin; the workspace directory lives in the container's own filesystem layer at `/workspace/current` (tickets: `/workspace/<slug>/<name>`), never on the host. The launcher refuses an image without the label `org.cld.boot-api=2` (rebuild with `cld build`). jj writes all store objects through the writable store rows, and watchman snapshots edits into the store autonomously, so work is durable and host-visible without a host-side workspace directory. The `-r` flag pins the anchor revision for v1 kinds (default: `@` for jj, `HEAD` for git; tickets default to the registry `default_rev`, falling back to `trunk()`). On shutdown, the session's bookmark and workspace registration are forgotten from the origin store host-side, by `cld shutdown` / `cld <role> shutdown`; committed work persists.
 
 ### Host file protection
 
@@ -333,12 +334,14 @@ Host `~/.claude.json` is mounted read-only. The entrypoint builds a container-lo
 
 All RO `$HOME` mounts (claude/anthropic/jj configs, `~/.claude.json`, plus devcontainer-only `~/.gitconfig`, `~/.bashrc`, and the nvim dirs `~/.config/nvim` / `~/.local/state/nvim` / `~/.cache/nvim`) are staged read-only under `/tmp/host-config/<rel>` and copied into `$HOME` on startup by `copy_host_configs`. Changes made inside the container do not persist to the host. The agent image has no editor and skips the devcontainer-only entries.
 
+Plugin marketplaces with a `directory` or `file` source are mounted read-only at their host path, with `--mount`, only when they come from the host `~/.claude` settings or plugin registry and the folder passes these checks: it holds `.claude-plugin/marketplace.json`; it is outside `~/.claude`, the mailbox root and every repo, and is not `$HOME` or one of its parents; and its literal path equals its real path (no symlink in it). Marketplaces listed in a repo's own `.claude/settings.json` are never mounted. Each skipped entry logs `plugin marketplace: '<path>' skipped: <reason>` on every launch.
+
 ### No docker socket in containers
 
 No container mounts `/var/run/docker.sock` (it was equivalent to host root; see the security notes below). What needs in-container docker goes through the host broker over SSH:
 
 - **Peer enumeration** (`list_agents`): the broker's `list-containers` action runs `docker ps` on the host and streams structured records back. Agents don't enumerate at all -- message replies address the sender by the full name carried in the message, delivered by filesystem, so agents need no host channel.
-- **Running tests and the GraphQL server** (`run-tests`, `graphql`): host-side, against the repo the caller's own `org.cld.repo-root` label names, with secrets mounted into a throwaway container the caller never sees.
+- **Running tests and the GraphQL server** (`run-tests`, `graphql`): host-side, against the repo the caller's own `org.cld.repo-root` label names, in a throwaway container the caller never sees. That container gets the same store-only mounts at `/repo` and a private 0600 copy of the repo's `.env`, never the file itself.
 
 See `cld/broker.py` (the host-vs-broker seam) and `broker/cld-broker.py` (the actions). Path translation (`CLD_HOST_PROJECT_DIR`/`CLD_HOST_HOME`) still converts container paths to host paths; it is set unconditionally rather than riding along with the socket mount.
 
@@ -368,7 +371,7 @@ Lowest → highest priority:
 
 ### TOML schema
 
-Flat snake_case keys mirroring `Config` field names, valid in both `~/.config/cld/config.toml` (user-wide) and `<repo_root>/.cld/config.toml` (per-repo). Unknown keys are warned about on stderr and ignored. Array-typed keys take a TOML array of strings. `host_project_dir` / `host_home` are container-internal and not exposed via TOML. The one table-typed key is the ticket repo registry, `[repos.<name>]` in the *user* config (see [Repo registry](#repo-registry)): per entry `path`, `default_rev`, `bootstrap`.
+Flat snake_case keys mirroring `Config` field names, valid in both `~/.config/cld/config.toml` (user-wide) and `<repo_root>/.cld/config.toml` (per-repo), except `home_mounts_always` and `home_mounts_devcontainer`, which only the user config may set. Unknown keys are warned about on stderr and ignored. Array-typed keys take a TOML array of strings. `host_project_dir` / `host_home` are container-internal and not exposed via TOML. The one table-typed key is the ticket repo registry, `[repos.<name>]` in the *user* config (see [Repo registry](#repo-registry)): per entry `path`, `default_rev`, `bootstrap`.
 
 ```toml
 base_image = "claude-base:latest"
@@ -388,10 +391,10 @@ Full set of keys:
 | `run_image` | string | `"claude-run:latest"` | One-shot run image (`cld run`) |
 | `pyproject_dir` | string | `"."` | Directory (relative to repo root) holding `pyproject.toml` and `.env`. Not a `Config` field -- read directly out of `.cld/config.toml` by `cld-broker.py` on the host, for the broker's `PROJECT_SUBDIR` and secrets path (see "Host-side test running" in `CLAUDE.md`) |
 | `ssl_certs_path` | string | `""` | Opt-in override: host path (dir or PEM file) that **replaces** the baked CA bundle. Empty = use the baked bundle |
-| `home_mounts_always` | array of strings | `[".claude.json", ".config/anthropic", ".config/claude", ".config/jj"]` | RO `$HOME` paths staged into every container |
-| `home_mounts_devcontainer` | array of strings | `[".gitconfig", ".bashrc", ".config/nvim", ".local/state/nvim", ".cache/nvim"]` | Additional RO `$HOME` paths staged only for interactive devcontainer sessions |
+| `home_mounts_always` | array of strings | `[".claude.json", ".config/anthropic", ".config/claude", ".config/jj"]` | RO `$HOME` paths staged into every container. User config only (a repo's `.cld/config.toml` value is ignored with a warning). A path must be relative, with no `..`, no symlink in it and no overlap with a repo; others are skipped with a warning |
+| `home_mounts_devcontainer` | array of strings | `[".gitconfig", ".bashrc", ".config/nvim", ".local/state/nvim", ".cache/nvim"]` | Additional RO `$HOME` paths staged only for interactive devcontainer sessions. Same rules as `home_mounts_always` |
 | `repos.<name>` | TOML table | none | Ticket repo registry entry (`path`, `default_rev`, `bootstrap`); user config only, managed by `cld repos add/rm` |
-| `ignore_gitignore` | array of strings | `[]` | Gitignored files (e.g. `.env`) to symlink from `/workspace/origin` into the isolated workspace |
+| `ignore_gitignore` | array of strings | `[]` | Off. The host checkout is no longer mounted, so no file reaches the workspace: each listed file is skipped with a warning on every launch |
 | `agent_timeout` | int (seconds) | `1800` | Chain orchestrator's per-agent wait timeout |
 | `poll_interval` | int (seconds) | `30` | Chain orchestrator's docker-ps poll interval |
 | `chain_max_parallel` | int | `4` | Max agents launched concurrently in a chain's parallel group |

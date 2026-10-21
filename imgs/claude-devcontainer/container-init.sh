@@ -33,7 +33,7 @@ cld_record_anchor_env() {
 }
 
 # Look up one repo's value in a per-repo env encoding: "<name>=<value>;..."
-# (CLD_REPO_FILES, CLD_REPO_BOOTSTRAP). Echoes nothing when the name is absent.
+# (CLD_REPO_BOOTSTRAP). Echoes nothing when the name is absent.
 cld_repo_kv_get() {
     local encoded="$1" name="$2" part
     local IFS=';'
@@ -43,34 +43,6 @@ cld_repo_kv_get() {
         esac
     done
     return 0
-}
-
-# Symlink workspace-root files (e.g., .env) from origin into workspace.
-# v1 (no args): WORKSPACE_FILES (colon-separated, e.g. ".env:.envrc") from
-# $WORKSPACE_ORIGIN into $WORKSPACE_CURRENT. Ticket kind: pass <name> <origin>
-# <workspace> -- the colon-list comes from that repo's CLD_REPO_FILES entry.
-link_workspace_files() {
-    local files origin workspace
-    if [ $# -eq 0 ]; then
-        files="${WORKSPACE_FILES:-}"
-        origin="$WORKSPACE_ORIGIN"
-        workspace="$WORKSPACE_CURRENT"
-    else
-        files=$(cld_repo_kv_get "${CLD_REPO_FILES:-}" "$1")
-        origin="$2"
-        workspace="$3"
-    fi
-    [ -z "$files" ] && return 0
-
-    local IFS=':'
-    for file in $files; do
-        if [ -f "$origin/$file" ]; then
-            ln -sf "$origin/$file" "$workspace/$file"
-            echo "[INFO] Linked $file from origin"
-        else
-            echo "[WARN] $file not found in origin, skipping"
-        fi
-    done
 }
 
 # Generate the ticket-root CLAUDE.md so a fresh harness session orients itself
@@ -95,6 +67,8 @@ The host may rebase the anchor, which changes its commit hash but not its
 change ID. Never rewrite, move or rebase the anchor yourself. Shared mode
 widens the editable tree to every descendant of the anchor; isolated mode
 (default) means only your own work descends from it.
+
+/workspace/origin/<repo> holds only the shared jj/git store. Run jj and edit files in your workspace.
 
 Each repo's own CLAUDE.md governs work in its subtree.
 EOF

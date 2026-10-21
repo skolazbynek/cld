@@ -414,7 +414,7 @@ class AgentSupervisor:
         origin = os.environ.get("WORKSPACE_ORIGIN", "/workspace/origin")
         try:
             result = subprocess.run(
-                ["jj", "bookmark", "forget", self.session_name],
+                ["jj", "--ignore-working-copy", "bookmark", "forget", self.session_name],
                 cwd=origin, capture_output=True, text=True,
             )
         except OSError as e:

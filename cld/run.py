@@ -13,6 +13,7 @@ from cld.docker import (
     ensure_image,
     find_target_repo,
     in_master_container,
+    prepare_store_mounts,
     require_docker,
     resolve_anchor_checked,
     run_extra_paths,
@@ -59,6 +60,8 @@ def launch_run(
         sys.exit(1)
 
     repo_root = find_target_repo(cfg)
+    # Before any host jj call on the repo (the anchor resolution below).
+    prepare_store_mounts(repo_root)
 
     cld_root = Path(__file__).resolve().parent.parent
     ensure_image(

@@ -25,7 +25,9 @@ debug = false
 # log_color = "auto"          # auto / always / never
 
 # RO $HOME paths staged into every container (relative to $HOME).
-# Extend or narrow this list to match your actual tooling.
+# Extend or narrow this list to match your actual tooling. Read from this file
+# only (a repo's .cld/config.toml is ignored). A path must be relative, with no
+# "..", no symlink in it and no overlap with a repo; others are skipped.
 home_mounts_always = [
     ".claude.json",
     ".config/claude"

@@ -19,9 +19,11 @@
 #   VENV_CACHE*           venv cache controls, see venv-cache.sh (the cache is
 #                         used only when the broker mounts it at /cache).
 #
-# The repo store is bind-mounted at /repo; the isolated working copy is created
-# under $HOME via `jj workspace add`, which never touches the store's default
-# workspace @ or bookmarks.
+# Only the repo's jj/git store is bind-mounted at /repo -- no checkout files, and the
+# settings and the default workspace's working_copy are read-only (docs/design-secrets-
+# containment.md section 3.1); the isolated working copy is created under $HOME via
+# `jj workspace add`, which never touches the store's default workspace @ or bookmarks.
+# The only secrets source is the broker's private copy of .env, mounted at /secrets/.env.
 set -euo pipefail
 
 : "${REVISION:=@}"
@@ -54,7 +56,7 @@ work="$HOME/gql-workspace"
 # which is exactly why the broker's `stop`/`restart` forgets $GQL_WORKSPACE
 # explicitly by its (deterministic) name rather than relying on this.
 # --ignore-working-copy wherever /repo is touched, as in runtests: a plain jj
-# command there snapshots the host user's checkout.
+# command there would snapshot a checkout that is not mounted, and fails instead.
 trap 'jj -R /repo --ignore-working-copy workspace forget "$GQL_WORKSPACE" >/dev/null 2>&1 || true' EXIT
 
 rev=$(jj --ignore-working-copy log --no-graph -n1 -r "$REVISION" -T commit_id)

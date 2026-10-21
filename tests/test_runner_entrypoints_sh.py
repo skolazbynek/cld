@@ -30,6 +30,13 @@ def _fragment(entrypoint: Path, repo: Path) -> str:
     return match.group(0).replace("/repo", str(repo))
 
 
+def _jj_has_secure_config() -> bool:
+    if shutil.which("jj") is None:
+        return False
+    found = re.search(r"(\d+)\.(\d+)", subprocess.run(["jj", "--version"], capture_output=True, text=True).stdout)
+    return bool(found) and (int(found[1]), int(found[2])) >= (0, 38)
+
+
 @pytest.fixture
 def env(tmp_path):
     config = tmp_path / "jj-config.toml"
@@ -100,6 +107,70 @@ class TestWorkspaceStep:
         assert result.returncode == 0, result.stderr
         assert result.stdout == "rewritten\n"
         assert _jj(env, repo, "log", "--no-graph", "-r", f"change_id({change})", "-T", 'commit_id ++ "\n"').count("\n") == 1
+
+
+def _read_only(path: Path) -> None:
+    """chmod -R a-w, the stand-in for a `readonly` bind mount."""
+    for entry in [path, *(path.rglob("*") if path.is_dir() else [])]:
+        entry.chmod(entry.stat().st_mode & ~0o222)
+
+
+@pytest.fixture
+def store_only(repo, env):
+    """*repo* as the broker mounts it into a runner: only `.jj` and the git dir, no checkout, and the
+    read-only rows of the mount set write-protected. Read-only binds are simulated with
+    chmod, which root ignores."""
+    for entry in repo.iterdir():
+        if entry.name not in (".jj", ".git"):
+            entry.unlink()
+    for scope in ("--repo", "--workspace"):  # the launcher preflight creates the ids this way
+        subprocess.run(["jj", "-R", str(repo), "--ignore-working-copy", "config", "path", scope], env=env,
+                       capture_output=True, check=True)
+    git = repo / ".git" if (repo / ".git").is_dir() else repo / ".jj/repo/store/git"
+    (git / "hooks").mkdir(exist_ok=True)
+    protected = [repo / ".jj/working_copy", repo / ".jj/repo/config-id", repo / ".jj/repo/store/git_target",
+                 repo / ".jj/workspace-config-id", git / "config", git / "hooks"]
+    for path in protected:
+        _read_only(path)
+    yield repo
+    for entry in [repo, *repo.rglob("*")]:
+        if not entry.is_symlink():
+            entry.chmod(entry.stat().st_mode | 0o200)
+
+
+@pytest.mark.skipif(not _jj_has_secure_config(), reason="needs jj 0.38+ (the jj ids exist)")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores read-only modes")
+@pytest.mark.parametrize("entrypoint", ENTRYPOINTS, ids=["runtests", "graphqlserver"])
+class TestStoreOnlyRepo:
+    """The broker mounts only the jj/git store at /repo (docs/design-secrets-containment.md
+    section 5): the workspace step must work with nothing but `.jj` there, with the
+    protected rows read-only, and never touch the default workspace."""
+
+    def _tree(self, repo: Path) -> dict[str, tuple[int, bytes]]:
+        return {str(p): (p.stat().st_mtime_ns, p.read_bytes())
+                for p in sorted(repo.rglob("*")) if p.is_file() and not p.is_symlink()
+                and any(part in p.parts for part in ("working_copy", "config-id", "git_target", "workspace-config-id"))}
+
+    def test_checks_out_the_revision_from_the_store_alone(self, entrypoint, store_only, env):
+        default_wc = _jj(env, store_only, "log", "--no-graph", "-r", "default@", "-T", "commit_id")
+        protected = self._tree(store_only)
+        result = _run(entrypoint, store_only, env, "@-", after="cat tracked.txt")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "committed\n"
+        assert {p.name for p in store_only.iterdir()} <= {".jj", ".git"}
+        assert _jj(env, store_only, "log", "--no-graph", "-r", "default@", "-T", "commit_id") == default_wc
+        assert _jj(env, store_only, "workspace", "list", "-T", 'name ++ "\\n"') == "default\n"
+        assert self._tree(store_only) == protected
+
+
+@pytest.mark.parametrize("entrypoint", ENTRYPOINTS, ids=["runtests", "graphqlserver"])
+def test_every_jj_call_in_the_store_ignores_its_working_copy(entrypoint, tmp_path):
+    """Static: every jj call before the `cd` into the new workspace. /repo holds no checkout,
+    so a plain jj there would snapshot every file as deleted (or fail on the read-only rows)."""
+    fragment = _fragment(entrypoint, tmp_path).split('\ncd "$work"\n')[0]
+    calls = re.findall(r"\bjj\b[^\n]*", re.sub(r"^\s*#.*$", "", fragment, flags=re.MULTILINE))
+    assert len(calls) >= 4
+    assert all("--ignore-working-copy" in call for call in calls)
 
 
 class TestSshWrapper:

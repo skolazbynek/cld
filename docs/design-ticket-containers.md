@@ -24,7 +24,7 @@ removal later is a deletion, not a disentanglement.
 | `cld/docker.py` | changed | `ticket_container_name()`, manifest label stamping, per-repo mounts/env in a new `build_ticket_container_args()`, prefix-map path translation (§6.4), overlap-check rework (§7) |
 | `cld/config.py` | changed | `[repos.*]` table parsing into `Config.repos: dict[str, RepoEntry]` (`_load_toml` today rejects tables, `config.py:130-155`); template block in `config.default.toml` |
 | `imgs/claude-devcontainer/entrypoint-claude-devcontainer.sh` | changed | grows a `TICKET_MODE` branch: the per-repo boot loop (§4). The v1 master/agent/bare branches stay untouched. |
-| `imgs/claude-devcontainer/container-init.sh` | changed | `link_workspace_files` parameterized per repo; ticket CLAUDE.md writer; `HOST_PROJECT_DIR` fix (§9) |
+| `imgs/claude-devcontainer/container-init.sh` | changed | `link_workspace_files` parameterized per repo (removed later, §12); ticket CLAUDE.md writer; `HOST_PROJECT_DIR` fix (§9) |
 | `cld/vcs/scratch.py` | changed | default-payload mode (no `AGENT_SCRATCH` env, §4.2); docstring fix (§9) |
 | `broker/cld-broker.sh`, `cld/broker.py` | changed | repo target parameter + manifest validation (§6.1) |
 | `cld/messenger/identity.py` | changed | host-side `resolve_self` replacement (§6.5) |
@@ -219,14 +219,13 @@ shared, not forked.
 - `-e CLD_TICKET_MANIFEST=<same JSON as the label>` — the boot loop's input,
   parsed with jq (already a hard dependency of `build_claude_config`,
   `container-init.sh:103-149`; the image ships it)
-- `-e CLD_REPO_FILES=<name>=<colon-list>;…` — per-repo `ignore_gitignore`,
-  resolved **host-side** from each repo's own `.cld/config.toml` at launch.
-  Alternative — entrypoint parses each repo's TOML in shell: rejected, the
-  host already has a correct TOML parser and the entrypoint should stay dumb;
-  cost is staleness until the next recreate, accepted.
+- ~~`-e CLD_REPO_FILES`~~ — removed with the store-only mounts (§12): no
+  host checkout file reaches the container, so `ignore_gitignore` entries
+  are only warned about at launch.
 - `-e CLD_PATH_MAP=<JSON>` — §6.4.
-- One mount per repo: `-v <path>:/workspace/origin/<name>` (replaces the
-  single mount + `-w` at `docker.py:543-546` for this kind). No `-w` on
+- One store mount set per repo at `/workspace/origin/<name>`: the eleven
+  `--mount` rows of `docs/design-secrets-containment.md` §3.1, never the host
+  checkout (§12). It replaced the single mount + `-w` of v1 for this kind. No `-w` on
   `docker run`: the daemon would pre-create the ticket root as root:root
   before the entrypoint can mkdir it as the container user; the post-boot
   `docker exec -w /workspace/<slug>` calls (§7) supply the working directory.
@@ -253,11 +252,11 @@ For each manifest entry, in manifest order:
    unchanged, per the §8 ruling.
 4. Set the bookmark; enable watchman fsmonitor + snapshot trigger per
    workspace (v1 `:130-134`).
-5. Per-repo workspace-file symlinks from `CLD_REPO_FILES` (generalizing
-   `link_workspace_files`, `container-init.sh:26-39`).
+5. ~~Per-repo workspace-file symlinks~~ — removed with the store-only mounts
+   (§12); origin holds no working-tree file to link.
 6. Optional bootstrap: registry `bootstrap = true` runs `poetry install` in
    the repo's `pyproject_dir` (from the repo's `.cld/config.toml`, resolved
-   host-side like `CLD_REPO_FILES`). Default off — replaces v1's unconditional
+   host-side and shipped as `CLD_REPO_BOOTSTRAP`). Default off — replaces v1's unconditional
    depth-3 scan (`:162-170`), which does not scale to N repos. Alternative —
    free-form bootstrap command string: rejected for scope; a boolean covers
    the actual use-case and a command string is a later addition, not a
@@ -282,10 +281,13 @@ failing repo is named.
    workspace so each repo's `.claude/skills/` loads at startup, model comes per-invocation from
    `cld claude -- --model …`.
    Plugin marketplaces sourced from a host directory or file (host
-   `known_marketplaces.json`, `extraKnownMarketplaces` in host and per-repo
-   settings) are mounted RO at their identical host path
+   `known_marketplaces.json` and `extraKnownMarketplaces` in the host
+   `~/.claude/settings.json`) are mounted RO at their identical host path
    (`stage_plugin_marketplaces`), so Claude's plugin registry resolves them
-   instead of failing with `cache-miss`.
+   instead of failing with `cache-miss`. A folder is mounted only if it holds
+   `.claude-plugin/marketplace.json`, lies outside `~/.claude`, the mailbox
+   root, every repo and the parents of `$HOME`, and has no symlink in its path.
+   Entries in a repo's own `.claude/settings.json` are never mounted (§12).
 4. Touch `/tmp/cld-ticket-ready`; PID 1 idles (`sleep infinity` + traps).
    **Traps:** TERM → plain `exit 0`. Unlike v1 master
    (`:242-251`), the ticket entrypoint never forgets bookmarks — `docker
@@ -432,16 +434,19 @@ level as v1 master: the interactive user's own session).
 ### 6.2 Per-repo secrets
 
 - Per-repo `.env` needs no design: broker-side resolution is already
-  per-`$REPO` (§6.1), and in-workspace `.env` symlinks are the
-  `ignore_gitignore` mechanism below.
+  per-`$REPO` (§6.1). No `.env` reaches a ticket container: origin holds only
+  the store, and `ignore_gitignore` is off (§6.3). The broker reads `.env`
+  without following symlinks and mounts only a private copy into its runner
+  and server containers (`docs/design-secrets-containment.md` §6).
 - (The per-repo MySQL config/mount/wrapper surface once designed here was
   removed entirely — cld carries no MySQL config plumbing anymore.)
 
 ### 6.3 `ignore_gitignore`
 
-Read from each repo's own `.cld/config.toml` host-side at launch, shipped as
-`CLD_REPO_FILES` (§4.1), applied to that repo's workspace only. The flattened
-global `WORKSPACE_FILES` env (`docker.py:598-601`) stays v1-only.
+Off since the store-only mounts (§12). The launcher reads each repo's
+`.cld/config.toml` at launch and warns once per listed file:
+`ignore_gitignore: '<file>' skipped: the host checkout is no longer mounted`.
+Neither `CLD_REPO_FILES` nor the v1 `WORKSPACE_FILES` is passed any more.
 
 ### 6.4 Path translation: prefix map
 
@@ -486,8 +491,10 @@ prefix. `Config` gains `path_map: dict[str, str]` parsed from the env.
 workspace path, anchor, mode) from `CLD_TICKET_MANIFEST`. The cwd-walk
 project-config discovery (`config.py:115-127`) finds nothing from the ticket
 root **by design** (spec §10): code needing a repo's `.cld/config.toml`
-receives the repo name explicitly and reads
-`/workspace/origin/<name>/.cld/config.toml`.
+receives the repo name explicitly. Inside the container it cannot read
+`/workspace/origin/<name>/.cld/config.toml`: origin holds only the store
+(§12). The host resolves what the container needs at launch
+(`CLD_REPO_BOOTSTRAP`).
 
 ## 7. Overlap check rework
 
@@ -611,7 +618,7 @@ parallel.
 | # | Workstream | Contents | Size | Depends on |
 |---|---|---|---|---|
 | W1 | **Registry & config** | `[repos.*]` parsing in `config.py`, `RepoEntry`, `cld/registry.py` with tomlkit writes, `cld repos` CRUD verbs, picker, `config.default.toml` template | M | — |
-| W2 | **Manifest & launcher** | `cld/manifest.py` (schema, codec, resolve, diff), `docker.py`: `ticket_container_name`, `build_ticket_container_args` (per-repo mounts, labels, `CLD_TICKET_MANIFEST`/`CLD_REPO_FILES`/`CLD_PATH_MAP`), per-repo secrets mounts | L | W1 |
+| W2 | **Manifest & launcher** | `cld/manifest.py` (schema, codec, resolve, diff), `docker.py`: `ticket_container_name`, `build_ticket_container_args` (per-repo mounts, labels, `CLD_TICKET_MANIFEST`/`CLD_REPO_FILES`/`CLD_PATH_MAP`; `CLD_REPO_FILES` removed later, §12), per-repo secrets mounts | L | W1 |
 | W3 | **Boot loop** | entrypoint `TICKET_MODE` branch, vcs-lib extraction, scratch `--default-payload`, per-repo watchman/symlinks/bootstrap, ticket-root CLAUDE.md, readiness sentinel, §9 fixups | L | W2 (env contract) |
 | W4 | **Ticket lifecycle verbs** | `cld/ticket.py` + `cli.py` verbs: start (create/warm/diff-recreate), claude (exec + session lock), shell, stop, restart-from-manifest, shutdown (host-side per-repo forget), status roster/detail, logs; scaled readiness wait | L | W2, W3 |
 | W5 | **Overlap rework** | effective-anchor derivation, per-repo check, warn path, caller-kind matrix, gap fixes (paths, fail-closed, stopped containers) | M | W2 (manifest readback); independent of W3/W4 |
@@ -636,7 +643,7 @@ verified against the working copy.
   `CLD_TICKET_MANIFEST`, `CLD_REPO_FILES`, `CLD_PATH_MAP`): which repos want a
   first-boot `poetry install`, and in which `pyproject_dir`, is resolved
   host-side (`ticket_repo_bootstrap`, `cld/docker.py`) and shipped as
-  `<name>=<subdir>;…`, symmetrical to `CLD_REPO_FILES`.
+  `<name>=<subdir>;…`.
 - **Session flock lives in the entrypoint-generated wrapper, not
   `cld/ticket.py`** (the W4 row filed "claude (exec + session lock)" under
   `cld/ticket.py`): the `TICKET_MODE` branch of the entrypoint writes
@@ -676,3 +683,14 @@ verified against the working copy.
   wrapper would exec its own path — an infinite self-exec loop that hangs
   `cld claude`. `TICKET_MODE` clears /tmp/bin next to the sentinel; the claude
   wrapper is rewritten after the loop as before.
+- **Store-only origin mounts** (CLD-001, `docs/design-secrets-containment.md`;
+  replaces the §4.1 `-v <path>:/workspace/origin/<name>` mount): each repo is
+  mounted as the eleven `--mount` rows of that doc's §3.1, the jj/git store
+  only, with host-trusted settings read-only, and the container gets the label
+  `org.cld.origin-mount=store-v1`. A host preflight (`prepare_store_mounts`)
+  runs before any host jj. The boot scripts run jj in origin only with
+  `--ignore-working-copy`, and the launcher refuses an image without
+  `org.cld.boot-api=2`. A warm start of a container without the `store-v1`
+  label is refused with a `cld restart <ticket>` hint. `link_workspace_files`,
+  `CLD_REPO_FILES` and `WORKSPACE_FILES` are gone; `ignore_gitignore` only
+  warns. Repo-settings marketplaces are never mounted.

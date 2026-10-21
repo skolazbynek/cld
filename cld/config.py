@@ -106,6 +106,11 @@ _TOML_KEYS = {
 }
 
 
+# Keys only the user config may set: a repo's .cld/config.toml can be an agent
+# commit, and these name host paths that get mounted into containers.
+_USER_ONLY_KEYS = {"home_mounts_always", "home_mounts_devcontainer"}
+
+
 _DEFAULT_CONFIG_TEMPLATE = Path(__file__).parent / "config.default.toml"
 
 
@@ -141,14 +146,14 @@ def _find_project_config(start: Path | None = None) -> Path | None:
     return None
 
 
-def _load_toml(path: Path, registry_layer: bool = False) -> dict:
+def _load_toml(path: Path, user_layer: bool = False) -> dict:
     """Read a TOML file, warn on parse errors or unknown keys; return known keys only.
 
-    ``registry_layer`` marks the one file allowed to define ``[repos.*]``
-    tables: the user config (PRODUCT_DESIGN.md section 4 puts the registry
-    solely there). Every other layer -- a repo's ``.cld/config.toml`` in
-    particular -- has its ``repos`` ignored with a warning, so a checked-out
-    repo cannot inject or override registry entries.
+    ``user_layer`` marks the one file allowed to define ``[repos.*]``
+    tables and ``_USER_ONLY_KEYS``: the user config (PRODUCT_DESIGN.md section 4
+    puts the registry solely there). Every other layer -- a repo's
+    ``.cld/config.toml`` in particular -- has them ignored with a warning, so a
+    checked-out repo cannot inject registry entries or host mounts.
     """
     try:
         with path.open("rb") as f:
@@ -168,9 +173,13 @@ def _load_toml(path: Path, registry_layer: bool = False) -> dict:
     for key in sorted(unknown):
         _log.warning("unknown key '%s' in %s", key, path)
     known = {k: v for k, v in data.items() if k in _TOML_KEYS}
+    if not user_layer:
+        for key in sorted(_USER_ONLY_KEYS & known.keys()):
+            _log.warning("'%s' in %s is ignored: it is read only from the user config", key, path)
+            del known[key]
     repos = data.get("repos")
     if repos is not None:
-        if not registry_layer:
+        if not user_layer:
             _log.warning(
                 "'repos' in %s is ignored: the registry lives only in the user "
                 "config (~/.config/cld/config.toml)", path,
@@ -329,7 +338,7 @@ class Config:
         up = user_config if user_config is not None else _user_config_path()
         _ensure_user_config(up)
         if up.is_file():
-            layered.update(_load_toml(up, registry_layer=True))
+            layered.update(_load_toml(up, user_layer=True))
         pp = project_config if project_config is not None else _find_project_config()
         if pp and pp.is_file():
             layered.update(_load_toml(pp))

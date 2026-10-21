@@ -5,6 +5,7 @@ and a temp mailbox root, per the design doc's suggested manual-test approach.
 """
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -337,6 +338,31 @@ class TestRun:
         supervisor.run()
 
         assert supervisor.msg_count == 1
+
+
+class TestForgetSessionBookmark:
+    """The origin's working copy is read-only: a plain jj there fails (design D2)."""
+
+    def test_passes_ignore_working_copy_in_origin(self, supervisor, tmp_path, monkeypatch):
+        origin = tmp_path / "origin"
+        monkeypatch.setenv("WORKSPACE_ORIGIN", str(origin))
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs["cwd"]))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("cld.messenger.agent_loop.subprocess.run", fake_run)
+        supervisor._forget_session_bookmark()
+        assert calls == [
+            (["jj", "--ignore-working-copy", "bookmark", "forget", "cld_agent_repoA"], str(origin)),
+        ]
+
+    def test_a_failed_forget_warns(self, supervisor, monkeypatch, caplog):
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="no such bookmark")
+        monkeypatch.setattr("cld.messenger.agent_loop.subprocess.run", lambda *a, **k: failed)
+        supervisor._forget_session_bookmark()
+        assert "jj bookmark forget cld_agent_repoA failed (rc=1): no such bookmark" in caplog.text
 
 
 # --- task mode ---------------------------------------------------------------

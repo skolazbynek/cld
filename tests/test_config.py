@@ -154,6 +154,31 @@ class TestLoadToml:
         assert _load_toml(p) == {"base_image": "x"}
 
 
+class TestUserOnlyKeys:
+    """``home_mounts_*`` name host paths that get mounted: only the user config may set them."""
+
+    @pytest.mark.parametrize("key", ["home_mounts_always", "home_mounts_devcontainer"])
+    def test_repo_layer_ignored_with_warning(self, tmp_path, capsys, key):
+        proj = _write(tmp_path / ".cld/config.toml", f'{key} = ["/etc", "../x"]\nbase_image = "p"\n')
+        user = _write(tmp_path / "user.toml", f'{key} = [".ok"]\n')
+        cfg = Config.from_env(user_config=user, project_config=proj)
+        assert getattr(cfg, key) == (".ok",)
+        assert cfg.base_image == "p"
+        assert f"'{key}' in {proj} is ignored: it is read only from the user config" in capsys.readouterr().err
+
+    def test_user_layer_applies_and_repo_layer_cannot_override(self, tmp_path):
+        user = _write(tmp_path / "user.toml", 'home_mounts_always = [".a"]\nhome_mounts_devcontainer = [".b"]\n')
+        proj = _write(tmp_path / ".cld/config.toml", 'home_mounts_always = [".evil"]\n')
+        cfg = Config.from_env(user_config=user, project_config=proj)
+        assert cfg.home_mounts_always == (".a",)
+        assert cfg.home_mounts_devcontainer == (".b",)
+
+    def test_load_toml_drops_them_unless_user_layer(self, tmp_path):
+        p = _write(tmp_path / "c.toml", 'home_mounts_always = [".a"]\nbase_image = "x"\n')
+        assert _load_toml(p) == {"base_image": "x"}
+        assert _load_toml(p, user_layer=True) == {"home_mounts_always": [".a"], "base_image": "x"}
+
+
 class TestReposTable:
     def test_parsed_into_config(self, tmp_path):
         user = _write(

@@ -70,7 +70,7 @@ streamed test output.
 | # | Decision |
 |---|---|
 | 1 | The docker socket is **no longer mounted** into any cld container. **Master has no docker socket** — the broker (SSH) is `claude`'s only host channel, so secrets genuinely stay away from `claude`. In-container docker needs (peer enumeration, sibling `cld agent` launches) route through broker actions; see `cld/broker.py` and the `list-containers`/`agent` actions in `broker/cld-broker.sh`. |
-| 2 | The **raw `.env` may be mounted** into the `runtests` container (`claude` cannot reach that container). |
+| 2 | A **private copy of `.env` is mounted** into the `runtests` container (`claude` cannot reach that container). The broker reads `.env` without following symlinks, writes a 0600 copy in its own stage dir and mounts only that (`docs/design-secrets-containment.md` §6). |
 | 3 | `runtests` accepts an **arbitrary `REVISION`**; when run ad-hoc it **defaults to `@`**. In the brokered path the broker supplies the change. |
 | 4 | The broker passes **the current change of the `cld master` container's jj workspace**. |
 | 5 | The broker is **purely store-reading**: it resolves the master session bookmark's tip from the jj store. It does **not** `docker exec` into master to force a snapshot (accepts minor watchman-snapshot lag). |
@@ -130,14 +130,15 @@ CA bundle (needed for TLS to the DBs). Nothing from cld.
 
 | Input | Via | Default | Meaning |
 |---|---|---|---|
-| jj store | `-v <repo>:/repo` (RW) | — | repo whose store holds the change |
+| jj store | `-v <repo>:/repo` standalone; from the broker, the store-only `--mount` rows at `/repo` (`docs/design-secrets-containment.md` §3.1) | — | repo whose store holds the change |
 | `REVISION` | `-e` | `@` | the change to test (any revset) |
-| secrets | `-v <.env>:/secrets/.env:ro` | — | raw `.env`, sourced into env |
+| secrets | `-v <.env>:/secrets/.env:ro` standalone; from the broker, a read-only `--mount` of its private copy | — | `.env`, sourced into env |
 | `SECRETS_FILE` | `-e` | `/secrets/.env` | override secrets path |
 | `PROJECT_SUBDIR` | `-e` | `.` | where `pyproject.toml` lives |
 | `POETRY_INSTALL_ARGS` | `-e` | `--all-extras --all-groups` | `poetry install` flags (install test deps however declared) |
 | `PYTEST_ADDOPTS` | `-e` | `--tb=short --disable-warnings -q --maxfail=30` | default pytest opts; explicit argv wins |
 | `OUTPUT_MAX_BYTES` | `-e` | `65536` | cap on returned output (last N bytes = the summary) |
+| venv cache | `-v <dir>:/cache` (rw) | — | from the broker: the repo's own folder `<VENV_CACHE_ROOT>/repos/<name>-<hash>/`, never shared between repos (`runtests/README.md`) |
 | pytest args | container **argv** | `(none)` | passed straight to pytest |
 
 Image ships **Poetry 2.x** (reads PEP 621 `[project]` metadata; 1.x does not).
@@ -212,12 +213,12 @@ REV=$(jj -R "$REPO" log --no-graph -n1 -r "$session" -T commit_id) || exit 3  # 
 
 # Project subdir: <repo>/. by default; overridable by pyproject_dir in <repo>/.cld/config.toml.
 PROJECT_SUBDIR=$(cld_conf_get "$REPO/.cld/config.toml" pyproject_dir); : "${PROJECT_SUBDIR:=.}"
-SECRETS_ENV_FILE="$REPO/$PROJECT_SUBDIR/.env"     # (absolute PROJECT_SUBDIR used as-is)
+SECRETS_ENV_FILE="$REPO/$PROJECT_SUBDIR/.env"     # (now: absolute or '..' PROJECT_SUBDIR refused)
 
 mapfile -d '' args < <(printf %s "$payload" | base64 -d)   # no eval, no host injection
 "$fn" "${args[@]}"
 
-# action_run_tests: docker run --rm -v $REPO:/repo [-v $SECRETS_ENV_FILE:/secrets/.env:ro]
+# action_run_tests: docker run --rm <store rows of $REPO at /repo> [<private copy of .env>:/secrets/.env,readonly]
 #                   -e REVISION=$REV -e PROJECT_SUBDIR=$PROJECT_SUBDIR $RUNTESTS_IMAGE "$@"
 ```
 
@@ -265,7 +266,7 @@ master> cld broker run-tests -k login -x tests/                       (claude or
   → ssh (restricted key) → host sshd → ForceCommand cld-broker.sh
       → validate action=run-tests, session=cld_master_…
       → REV = tip of session bookmark   (store-reading; may lag watchman by seconds)
-      → docker run --rm runtests  -e REVISION=REV  -v repo  -v .env  -- -k login -x tests/
+      → docker run --rm runtests  -e REVISION=REV  store rows  .env copy  -- -k login -x tests/
           → jj workspace add -r REV /work        (host @ untouched)
           → source .env; poetry install; pytest -k login -x tests/
           → stdout/stderr + exit code
@@ -278,8 +279,16 @@ master> cld broker run-tests -k login -x tests/                       (claude or
   config + `ForceCommand`. The container can only pass a session id (validated) and
   pytest argv. It cannot change *what* runs or run anything else on the host.
 - **Secret isolation depends on the socket being gone** (decision 1). With no socket,
-  `cld broker` is `claude`'s only host channel, and it returns only test output. The
-  raw `.env` is mounted into the ephemeral `--rm` runner, which `claude` cannot reach.
+  `cld broker` is `claude`'s only host channel, and it returns only test output. A
+  private 0600 copy of `.env` is mounted into the ephemeral `--rm` runner, which `claude`
+  cannot reach. The broker reads `.env` and `.cld/config.toml` without following a
+  symlink. Copies older than 24 h are swept from the stage dir.
+- **Store-only runner mounts:** runner and server containers get the jj/git store at
+  `/repo` as the eleven rows of `docs/design-secrets-containment.md` §3.1, never the host
+  checkout, with `--cap-drop=ALL` and `no-new-privileges`. The broker refuses a runner or
+  server image whose `org.cld.jj-version` label is missing or below 0.38. Every host jj
+  call goes through `host_jj`, which first checks the jj ids, `commondir`, `modules/`,
+  `git_target` and the host jj version.
 - **VCS isolation:** `jj workspace add` guarantees the host user's `@` is never moved.
 - **Repo scoping (multi-repo, §13):** the target repo comes from the calling master's
   host-set label, never caller input, so a request can only reach a repo that already
@@ -359,8 +368,9 @@ launch for every one of those roles, so it always exists once the container is u
 
 **Secrets per repo.** Default `<repo>/.env`; overridable by `pyproject_dir` in the
 repo's own `<repo>/.cld/config.toml` (the broker reads that one flat key directly — no
-docker label, no cld import). Relative to the repo root. A missing file is fine: the
-runner just runs without it.
+docker label, no cld import). Relative to the repo root; an absolute or `..` value is
+refused. Both files are read with no symlink followed below the repo. A missing file is
+fine: the runner just runs without it.
 
 **PROJECT_SUBDIR follows `pyproject_dir`.** `pyproject.toml` and `.env` are assumed to
 share a directory, named directly by `pyproject_dir` (→ `.` by default, `svc` for a
@@ -441,9 +451,9 @@ and executing credentialed queries against it — see
 `graphql-tester` MCP ran the server as a subprocess *inside* the calling
 container, meaning the container held the server's environment directly,
 including any DB/API credentials in it. That is no longer true: the server
-now runs from the real repo checkout, on the exact jj revision the calling
+now runs from the repo's jj/git store (never the checkout), on the exact jj revision the calling
 container is on, in its own `graphqlserver` container on the host, sourcing
-the repo's real `.env`.
+a private copy of the repo's real `.env`.
 
 **Rulings made for this feature (settled, not reopened by future work
 without a fresh discussion):**

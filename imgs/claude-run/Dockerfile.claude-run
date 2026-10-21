@@ -15,4 +15,6 @@ COPY run-system-prompt.md /opt/cld/run-system-prompt.md
 
 USER claude
 
+LABEL org.cld.boot-api=2
+
 ENTRYPOINT ["/workspace/run"]

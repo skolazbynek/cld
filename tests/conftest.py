@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from cld.docker import StoreLayout
 from cld.vcs.git import GitBackend
 from cld.vcs.jj import JjBackend
 
@@ -59,6 +60,25 @@ def reset_cld_loggers():
         cld_log.removeHandler(h)
     cld_log.setLevel(logging.NOTSET)
     cld_log.propagate = True
+
+
+@pytest.fixture
+def stub_launch_checks(monkeypatch):
+    """Skip the daemon-bound launch checks of the arg builders: the image
+    labels, the refusal scan for other containers that mount the repo, and the list
+    of repos other containers use (the marketplace filter)."""
+    monkeypatch.setattr("cld.docker.require_boot_api", lambda *images: None)
+    monkeypatch.setattr("cld.docker.docker_occupant_list", lambda: [])
+    monkeypatch.setattr("cld.docker.refuse_unprotected_containers", lambda name, host_repo: None)
+
+
+@pytest.fixture
+def stub_store_preflight(monkeypatch, stub_launch_checks):
+    """Builder tests on bare directories: report a git layout with no host checks."""
+    monkeypatch.setattr(
+        "cld.docker.prepare_store_mounts",
+        lambda host_repo, name="": StoreLayout(jj=False, git_dir=".git"),
+    )
 
 
 # --- VCS repo fixtures (use tmp_path -- fast, no Docker visibility needed) ----

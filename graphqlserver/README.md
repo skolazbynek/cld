@@ -10,7 +10,10 @@ that server is (Django, Strawberry, anything that speaks HTTP).
 
 ## How it works
 
-The repo whose jj store holds the change is bind-mounted at `/repo`. The
+The repo whose jj store holds the change is mounted at `/repo`. The broker mounts only
+the jj/git store there (the eleven rows of `docs/design-secrets-containment.md` section 3.1,
+with the settings and the default workspace's `working_copy` read-only), never the
+checkout, so the entrypoint reads nothing from `/repo` but the store. The
 entrypoint runs:
 
 ```
@@ -36,9 +39,9 @@ and sourced into the server's environment only.
 
 | Input | Via | Default | Meaning |
 |---|---|---|---|
-| jj store | `-v <repo>:/repo` (rw) | -- | repo whose store holds the change |
+| jj store | `--mount` rows at `/repo` (the broker) or `-v <repo>:/repo` (standalone) | -- | repo whose store holds the change; only `.jj` and the git dir are needed |
 | `REVISION` | `-e` | `@` | revset to serve (any jj revset); read without a snapshot, so `@` is `/repo`'s last snapshot |
-| secrets | `-v <file>:/secrets/.env:ro` | -- | env file, sourced into the server's env |
+| secrets | `--mount` of the broker's private 0600 copy (the broker) or `-v <file>:/secrets/.env:ro` (standalone) | -- | env file, sourced into the server's env; the broker never mounts the repo's own `.env` |
 | `SECRETS_FILE` | `-e` | `/secrets/.env` | override secrets path |
 | `PROJECT_SUBDIR` | `-e` | `.` | dir holding `pyproject.toml` |
 | ssh-agent | `-v <socket>:/run/ssh-agent.sock -e SSH_AUTH_SOCK=/run/ssh-agent.sock` | — | key for `git+ssh://` dependencies; see [git+ssh dependencies](../runtests/README.md#gitssh-dependencies) |
@@ -46,7 +49,7 @@ and sourced into the server's environment only.
 | `GQL_COMMAND` | `-e` | *(required)* | shell command that starts the server; no guessed default |
 | `GQL_PORT` | `-e` | `8000` | port the server must bind **inside** the container |
 | `POETRY_INSTALL_ARGS` | `-e` | `--all-extras --all-groups` | `poetry install` flags |
-| venv cache | `-v <dir>:/cache` (rw) | — | host cache holding `venvs/`, `poetry/`, `locks/`; see [Venv cache](../runtests/README.md#venv-cache) |
+| venv cache | `-v <dir>:/cache` (rw) | — | the repo's own host cache folder holding `venvs/`, `poetry/`, `locks/`; see [Venv cache](../runtests/README.md#venv-cache) |
 | `VENV_CACHE_IMAGE_ID` | `-e` | — | image id, part of the cache key; the cache is skipped without it |
 | `VENV_CACHE` | `-e` | `on` | `on`, `off`, or `rebuild` (rebuild this key's venv) |
 | `VENV_CACHE_KEEP` | `-e` | `10` | most recently used venvs kept in the cache |
@@ -72,6 +75,9 @@ into `$GQL_COMMAND`, so signals reach it directly).
 ./build.sh                        # -> graphqlserver:latest
 GRAPHQL_IMAGE=graphqlserver:dev ./build.sh
 ```
+
+The image carries the label `org.cld.jj-version`, set from the `JJ_VERSION` build
+argument. The broker refuses an image whose label is missing or older than 0.38.
 
 `build.sh` passes `../scripts` as the extra build context `scripts` (for
 `venv-cache.sh`), which needs BuildKit (the default builder since Docker 23).

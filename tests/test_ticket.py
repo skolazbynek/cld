@@ -176,6 +176,7 @@ class TestStartTicket:
 
     def test_running_without_specs_reports_and_launches_nothing(self, tmp_path, capsys):
         with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.container_has_store_mounts", return_value=True), \
              patch("cld.ticket._launch") as launch, \
              patch("cld.ticket.subprocess.run") as run:
             start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
@@ -186,6 +187,7 @@ class TestStartTicket:
     def test_stopped_without_specs_warm_starts(self, tmp_path, capsys):
         with patch("cld.ticket._docker_status", return_value="stopped"), \
              patch("cld.ticket.read_manifest", return_value=_manifest()), \
+             patch("cld.ticket.container_has_store_mounts", return_value=True), \
              patch("cld.ticket.subprocess.run", return_value=_res()) as run, \
              patch("cld.ticket.wait_ticket_ready", return_value=True) as wait, \
              patch("cld.ticket._launch") as launch:
@@ -195,6 +197,73 @@ class TestStartTicket:
         # Warm-start wait is scaled by the labeled repo count, not a flat 60 s.
         assert wait.call_args.args == ("cld_ticket_lide-2600", 2)
         assert "warm" in capsys.readouterr().out
+
+
+class TestWarmStartRefusesOldMounts:
+    """A container made before the store mounts existed carries no label; the
+    protected paths are not mounted in it, so it must be recreated."""
+
+    def _cfg(self, tmp_path):
+        return Config(repos={"lide-api": RepoEntry(path=str(tmp_path), default_rev="trunk()")})
+
+    def test_stopped_container_without_label_is_refused_and_not_started(self, tmp_path):
+        with patch("cld.ticket._docker_status", return_value="stopped"), \
+             patch("cld.ticket.read_manifest", return_value=_manifest()), \
+             patch("cld.ticket.container_has_store_mounts", return_value=False), \
+             patch("cld.ticket.subprocess.run") as run, \
+             patch("cld.ticket._launch") as launch, \
+             pytest.raises(RuntimeError, match="cld restart lide-2600") as refused:
+            start_ticket(self._cfg(tmp_path), "LIDE-2600", [], [])
+        assert "full host checkout" in str(refused.value)
+        run.assert_not_called()
+        launch.assert_not_called()
+
+    @pytest.mark.parametrize("label", ["", "store-pins-v1"], ids=["unlabelled", "pins-v1"])
+    def test_only_the_store_v1_label_warm_starts(self, tmp_path, label):
+        """The label is read for real: an unlabelled container and the never-deployed
+        store-pins-v1 one both still mount the checkout."""
+        with patch("cld.ticket._docker_status", return_value="stopped"), \
+             patch("cld.ticket.read_manifest", return_value=_manifest()), \
+             patch("cld.docker._image_label", return_value=label), \
+             patch("cld.ticket.subprocess.run") as run, \
+             patch("cld.ticket.wait_ticket_ready", return_value=True), \
+             pytest.raises(RuntimeError, match="mounts the full host checkout; run `cld restart lide-2600`"):
+            start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
+        run.assert_not_called()
+
+    def test_store_v1_label_warm_starts(self, tmp_path):
+        with patch("cld.ticket._docker_status", return_value="stopped"), \
+             patch("cld.ticket.read_manifest", return_value=_manifest()), \
+             patch("cld.docker._image_label", return_value="store-v1"), \
+             patch("cld.ticket.subprocess.run", return_value=_res()) as run, \
+             patch("cld.ticket.wait_ticket_ready", return_value=True):
+            start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
+        assert run.call_args.args[0] == ["docker", "start", "cld_ticket_lide-2600"]
+
+    def test_label_is_read_off_the_container(self, tmp_path):
+        with patch("cld.ticket._docker_status", return_value="stopped"), \
+             patch("cld.ticket.read_manifest", return_value=_manifest()), \
+             patch("cld.ticket.container_has_store_mounts", return_value=False) as has, \
+             patch("cld.ticket.subprocess.run"), \
+             pytest.raises(RuntimeError):
+            start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
+        has.assert_called_once_with("cld_ticket_lide-2600")
+
+    def test_running_container_without_label_warns_and_stays_running(self, tmp_path, caplog):
+        with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.container_has_store_mounts", return_value=False), \
+             patch("cld.ticket.subprocess.run") as run, \
+             caplog.at_level("WARNING", logger="cld.ticket"):
+            start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
+        assert "cld restart lide-2600" in caplog.text
+        run.assert_not_called()
+
+    def test_running_container_with_label_does_not_warn(self, tmp_path, caplog):
+        with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.container_has_store_mounts", return_value=True), \
+             caplog.at_level("WARNING", logger="cld.ticket"):
+            start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
+        assert not caplog.text
 
 
 class TestStartRepoSetChange:
@@ -303,6 +372,7 @@ class TestStartRepoSetChange:
         ))
         with patch("cld.ticket._docker_status", return_value="running"), \
              patch("cld.ticket.read_manifest", return_value=old), \
+             patch("cld.ticket.container_has_store_mounts", return_value=True), \
              patch("cld.ticket.ticket_anchor_resolver", lambda cfg: lambda p, r, m: "b" * 40), \
              patch("cld.ticket.typer.confirm") as confirm, \
              patch("cld.ticket._launch") as launch:
@@ -312,6 +382,14 @@ class TestStartRepoSetChange:
         assert "already running" in capsys.readouterr().out
 
 
+@pytest.fixture
+def stub_restart_preflight():
+    """Restart on manifests of fake repo paths: skip the host preflight."""
+    with patch("cld.ticket.prepare_store_mounts") as preflight:
+        yield preflight
+
+
+@pytest.mark.usefixtures("stub_restart_preflight")
 class TestRestartTicket:
     def test_relaunches_from_labels_read_before_removal(self):
         """The manifest survives the recreate byte-for-byte: read from the real
@@ -339,6 +417,7 @@ class TestRestartTicket:
             restart_ticket(Config(), "lide-2600")
 
 
+@pytest.mark.usefixtures("stub_restart_preflight")
 class TestReanchorRestart:
     """``cld restart --reanchor`` (anchor-move design section 5)."""
 

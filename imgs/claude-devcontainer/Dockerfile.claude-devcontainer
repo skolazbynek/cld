@@ -41,4 +41,6 @@ USER claude
 RUN printf '#!/bin/sh\nexec python3 -P -m cld.cli_container "$@"\n' > /home/claude/.local/bin/cld \
     && chmod +x /home/claude/.local/bin/cld
 
+LABEL org.cld.boot-api=2
+
 ENTRYPOINT ["/workspace/container_run.sh"]

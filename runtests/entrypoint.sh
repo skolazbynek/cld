@@ -17,9 +17,11 @@
 #   VENV_CACHE*         venv cache controls, see venv-cache.sh (the cache is
 #                       used only when the broker mounts it at /cache).
 #
-# The repo store is bind-mounted at /repo; the isolated working copy is created
-# under $HOME via `jj workspace add`, which never touches the store's default
-# workspace @ or bookmarks.
+# Only the repo's jj/git store is bind-mounted at /repo -- no checkout files, and the
+# settings and the default workspace's working_copy are read-only (docs/design-secrets-
+# containment.md section 3.1); the isolated working copy is created under $HOME via
+# `jj workspace add`, which never touches the store's default workspace @ or bookmarks.
+# The only secrets source is the broker's private copy of .env, mounted at /secrets/.env.
 set -euo pipefail
 
 : "${REVISION:=@}"
@@ -50,9 +52,10 @@ ws="runtests-${HOSTNAME:-$$}"
 # Workspace dir lives under $HOME: with `--user` (the broker path always uses
 # it) the container user cannot mkdir at / (root-owned), but $HOME is writable.
 work="$HOME/rt-workspace"
-# --ignore-working-copy wherever /repo is touched: a plain jj command there
-# snapshots /repo's own working copy -- the host user's checkout, possibly
-# mid-edit -- and racing their jj commands that way forks divergent changes.
+# --ignore-working-copy wherever /repo is touched: a plain jj command there would
+# snapshot /repo's own working copy -- the host user's checkout, which is not mounted,
+# so the snapshot would record every file as deleted -- and its read-only working_copy
+# makes such a command fail instead.
 # Forgetting from inside the workspace would snapshot it instead, keeping the
 # run's byproducts as a stray commit (or failing if the run went stale).
 trap 'jj -R /repo --ignore-working-copy workspace forget "$ws" >/dev/null 2>&1 || true' EXIT

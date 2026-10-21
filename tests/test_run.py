@@ -49,16 +49,26 @@ class TestLaunchAgentExtensions:
         with (
             patch("cld.run.require_docker"),
             patch("cld.run.find_target_repo", return_value=Path("/fake/repo")),
+            patch("cld.run.prepare_store_mounts") as preflight,
             patch("cld.run.ensure_image"),
             patch("cld.run.build_session_name", return_value=session),
             patch("cld.run.build_container_args", return_value=[]),
-            patch("cld.run.resolve_anchor_checked", return_value="cafef00d1234"),
+            patch("cld.run.resolve_anchor_checked", return_value="cafef00d1234") as resolve,
             patch("cld.run.anchor_env_args", return_value=["-e", "AGENT_REVISION_HINT=cafef00d1234"]) as anchor,
             patch("cld.run.subprocess.run", return_value=docker_result) as mock_run,
         ):
+            self.order = MagicMock()
+            self.order.attach_mock(preflight, "preflight")
+            self.order.attach_mock(resolve, "resolve")
             launch_run(Config(), brief, quiet=True, **kwargs)
             self.anchor_call = anchor.call_args
             return list(mock_run.call_args.args[0])
+
+    def test_store_preflight_runs_before_the_anchor_is_resolved(self):
+        self._capture_docker_cmd()
+        calls = self.order.mock_calls
+        assert [name for name, _, _ in calls] == ["preflight", "resolve"]
+        assert calls[0].args == (Path("/fake/repo"),)
 
     def test_brief_goes_to_the_anchor_envelope(self):
         self._capture_docker_cmd(brief="# Role\n\ndo the thing")

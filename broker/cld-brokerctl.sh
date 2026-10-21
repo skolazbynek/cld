@@ -47,22 +47,11 @@ shutdown() {
 
 restart() { shutdown; sleep 0.3; start; }
 
-# Duplicates cld-broker.py's sweep_gql_orphans() so this script stays plain
-# bash, and adds a line per reaped server. Reaps any `graphql`
-# broker-action server whose owning session container is gone -- useful after
-# a host reboot, without needing to start any session first. Cross-reference:
-# broker/cld-broker.py:sweep_gql_orphans.
-graphql-sweep() {
-    local c s r
-    for c in $(docker ps -a --filter label=org.cld.gql-session --format '{{.Names}}'); do
-        s=$(docker inspect "$c" --format '{{index .Config.Labels "org.cld.gql-session"}}' 2>/dev/null) || continue
-        docker inspect "$s" >/dev/null 2>&1 && continue   # owning session alive -- keep
-        r=$(docker inspect "$c" --format '{{index .Config.Labels "org.cld.gql-repo"}}' 2>/dev/null) || true
-        echo "reaping orphaned graphql server $c (session $s gone)"
-        docker rm -f "$c" >/dev/null 2>&1 || true
-        [ -n "$r" ] && jj -R "$r" --ignore-working-copy workspace forget "gql-$s" >/dev/null 2>&1 || true
-    done
-}
+# Reaps any `graphql` broker-action server whose owning session container is
+# gone -- useful after a host reboot, without needing to start any session
+# first. Runs the broker's own sweep (cld-broker.py:sweep_gql_orphans), so the
+# jj store checks guarding its `workspace forget` are the broker's, not a copy.
+graphql-sweep() { run graphql-sweep; }
 
 # Run one broker action from the host, for debugging -- no sshd, no container.
 # Runs the same ForceCommand with the sshd config's SetEnv lines and an

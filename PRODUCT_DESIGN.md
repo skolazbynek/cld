@@ -61,9 +61,13 @@ target validation. This fixes v1's parameter-dropping restart.
 /workspace/<slug>/            harness cwd — the "ticket root"
   <repo-a>/                   jj workspace (or git worktree) of repo-a
   <repo-b>/
-/workspace/origin/<repo-a>/   RW bind mount of the host repo
+/workspace/origin/<repo-a>/   the host repo's jj/git store only, never the checkout
 /workspace/origin/<repo-b>/
 ```
+
+Origin holds only `.jj` and `.git`, through the store mount set of
+`docs/design-secrets-containment.md` section 3.1. Host settings stay read-only
+there, and untracked host files such as `.env` never reach the container.
 
 Workspace directories live in the container layer, exactly as v1's
 `/workspace/current`: watchman + jj snapshot all content into the host-side
@@ -109,7 +113,9 @@ path = "~/projects/diskuze-api"
 - `cld repos` lists the registry; `cld repos add <name> <path>` /
   `cld repos rm <name>` edit it.
 - Per-repo `.cld/config.toml` inside each repo keeps its v1 meaning
-  (`pyproject_dir`, `ignore_gitignore`, graphql keys) and is read per repo.
+  (`pyproject_dir`, graphql keys) and is read per repo. `ignore_gitignore` is
+  off: listed files are skipped with a warning. `home_mounts_always` and
+  `home_mounts_devcontainer` are read from the user config only.
 
 ## 5. Command surface
 
@@ -172,7 +178,10 @@ skills, which claude would otherwise load only once it touches a file in the
 repo), cwd = ticket root. Model and prompt are
 per-invocation pass-through. Host plugin marketplaces sourced from a directory
 or file are mounted RO at their identical host path so Claude's plugin registry
-resolves them.
+resolves them. Only folders that hold `.claude-plugin/marketplace.json`, lie
+outside `~/.claude`, the mailbox root, every repo and the parents of `$HOME`,
+and have no symlink in their path are mounted. Marketplaces listed in a repo's
+own `.claude/settings.json` are never mounted. Each skipped entry warns.
 
 - POC: if a session is already live in the container, refuse with a clear
   message naming it [ruled: single session for now].
@@ -246,8 +255,9 @@ in v2. Product-level requirements only:
   repo from `org.cld.repo-root` and the actions take no target at all).
 - **Secrets**: per-repo `.env` resolution becomes per-repo (keyed by registry
   name), not one fixed path per container.
-- **`ignore_gitignore`**: read from each repo's own `.cld/config.toml` and
-  applied to that repo's workspace only (today: one flattened env var).
+- **`ignore_gitignore`**: off since the store-only mounts
+  (`docs/design-secrets-containment.md`). Each listed file is skipped with a
+  warning; no file from the host checkout reaches a workspace.
 - **Path translation**: a prefix map (container path → host path per repo)
   replaces the scalar `CLD_HOST_PROJECT_DIR`.
 - **Labels**: `org.cld.repo-root` (singular) is replaced by the launch

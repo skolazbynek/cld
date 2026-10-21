@@ -11,7 +11,7 @@ Prefers jujutsu; falls back to git.
 
 ## Core Contracts
 
-**Anchor + descendant tree:** Containers can only edit changes descending from anchor (`-r`, default `@`). Works in isolated `/workspace/current`; origin at `/workspace/origin`.
+**Anchor + descendant tree:** Containers can only edit changes descending from anchor (`-r`, default `@`). Works in isolated `/workspace/current`; origin at `/workspace/origin` holds only the jj/git store (never the host checkout), with host-trusted settings read-only. See `docs/design-secrets-containment.md`.
 
 **Persistence:** Sessions survive restart via jj bookmarks. Watchman snapshots autonomously.
 
@@ -26,9 +26,9 @@ No overlap: live anchor trees checked host-wide.
 
 ## Subsystems
 
-**Workspace files:** `ignore_gitignore` in `.cld/config.toml` symlinks `.env` from origin into workspace.
+**Workspace files:** `ignore_gitignore` is off: listed files are skipped with a warning. No host checkout file reaches a container.
 
-**Broker:** SSH ForceCommand for tests, container enumeration, task-agent lifecycle and the GraphQL server. Secrets mounted RO into ephemeral `runtests`. See `broker/README.md`.
+**Broker:** SSH ForceCommand for tests, container enumeration, task-agent lifecycle and the GraphQL server. Runner and server containers get the same store-only mounts at `/repo` and a private 0600 copy of `.env`, read without following symlinks. See `broker/README.md`.
 
 **Messenger:** Mailbox at `~/.cld/mailboxes`. `send()/list_inbox()/read_message()/archive()` via MCP. Hop budgets; explicit reply obligations. See `docs/design-agent-messaging.md`.
 

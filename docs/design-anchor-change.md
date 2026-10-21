@@ -167,7 +167,7 @@ These three helpers form the entire shared contract. There is no separate
 4. launch the container with AGENT_ANCHOR_HASH=B and no bind-mount at
    /workspace/current -- the container entrypoint creates its own
    ephemeral workspace at /workspace/current on top of B (jj store lives
-   in /workspace/origin/.jj/repo via the RW bind mount) and sets a
+   in /workspace/origin/.jj/repo via the writable store mount rows) and sets a
    bookmark <session> tracking @.
 5. on each subsequent advance of the persistent branch:
        assert_descendant(B, new_tip)

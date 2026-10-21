@@ -275,7 +275,10 @@ Cost: one jj call per repo per Bash call, with no snapshot.
   container remains the trust boundary.
 - Git-backend repos: file writes only (§6.1 rule 3). No git command
   parsing yet.
-- Writes to the host repo mount: out of scope.
+- Writes to the host repo mount: out of scope. Since the store-only mounts
+  (`docs/design-secrets-containment.md`), `/workspace/origin/<repo>` holds only
+  the jj/git store. Its `working_copy` is read-only, so plain jj there fails;
+  boot calls pass `--ignore-working-copy`.
 - A `jj git init` (or any mutating jj command) under an unregistered
   `/workspace` path is denied as a foreign workspace.
 - Hook latency: Python start dominates. The `python:3.13-slim` base ships

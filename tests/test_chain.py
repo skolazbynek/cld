@@ -234,6 +234,11 @@ class TestRunChain:
 
 
 class TestChainRunDetached:
+    @pytest.fixture(autouse=True)
+    def _no_store_preflight(self, monkeypatch):
+        """The store preflight needs host jj 0.38+ and is covered in test_docker.py."""
+        monkeypatch.setattr("cld.cli.prepare_store_mounts", lambda repo: None)
+
     def test_pins_anchor_and_records_running_state(self, vcs_repo, monkeypatch):
         vcs = vcs_repo
         monkeypatch.chdir(vcs.repo_root)

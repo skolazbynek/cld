@@ -78,7 +78,6 @@ if [ -n "${TICKET_MODE:-}" ]; then
                 exit 1
                 ;;
         esac
-        link_workspace_files "$REPO_NAME" "$REPO_ORIGIN" "$REPO_WORKSPACE"
         # Optional per-repo bootstrap, opted in via the registry `bootstrap`
         # key and resolved host-side into CLD_REPO_BOOTSTRAP (<name>=<pyproject
         # subdir>;...). Replaces v1's unconditional depth-3 poetry scan, which
@@ -194,8 +193,6 @@ if [ -n "${TASK_AGENT_MODE:-}" ] && [ -n "${AGENT_DELIVERABLE_BRANCH:-}" ]; then
 fi
 
 build_claude_config
-
-link_workspace_files
 
 if command -v poetry &>/dev/null; then
     while IFS= read -r pyproject; do

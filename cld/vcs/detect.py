@@ -6,6 +6,7 @@ from pathlib import Path
 
 from cld.log import get_logger
 from cld.vcs.base import VcsBackend
+from cld.vcs.jj import check_jj_ids
 
 log = get_logger(__name__)
 
@@ -61,7 +62,11 @@ def get_backend(start: Path | None = None) -> VcsBackend:
         workspace_rev = ""
         workspace_path = None
         if resolved != jj_root:
-            name = JjBackend._current_workspace_name(jj_root)
+            # The name lookup is a jj call on the main repo: not before its ids exist.
+            reason = check_jj_ids(resolved)
+            if reason:
+                log.warning("VCS detection: no workspace lookup in %s: %s", resolved, reason)
+            name = "" if reason else JjBackend._current_workspace_name(jj_root)
             workspace_rev = f"{name}@" if name else ""
             workspace_path = jj_root
         log.debug("VCS detection: chose jj backend rooted at %s", resolved)

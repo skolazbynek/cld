@@ -9,7 +9,10 @@ a secrets file, and pytest arguments.
 
 ## How it works
 
-The repo whose jj store holds the change is bind-mounted at `/repo`. The
+The repo whose jj store holds the change is mounted at `/repo`. The broker mounts only
+the jj/git store there (the eleven rows of `docs/design-secrets-containment.md` section 3.1,
+with the settings and the default workspace's `working_copy` read-only), never the
+checkout, so the entrypoint reads nothing from `/repo` but the store. The
 entrypoint runs:
 
 ```
@@ -36,16 +39,16 @@ into pytest's environment only.
 
 | Input | Via | Default | Meaning |
 |---|---|---|---|
-| jj store | `-v <repo>:/repo` (rw) | — | repo whose store holds the change |
+| jj store | `--mount` rows at `/repo` (the broker) or `-v <repo>:/repo` (standalone) | — | repo whose store holds the change; only `.jj` and the git dir are needed |
 | `REVISION` | `-e` | `@` | revset to test (any jj revset); read without a snapshot, so `@` is `/repo`'s last snapshot |
-| secrets | `-v <file>:/secrets/.env:ro` | — | env file, sourced into pytest env |
+| secrets | `--mount` of the broker's private 0600 copy (the broker) or `-v <file>:/secrets/.env:ro` (standalone) | — | env file, sourced into pytest env; the broker never mounts the repo's own `.env` |
 | `SECRETS_FILE` | `-e` | `/secrets/.env` | override secrets path |
 | `PROJECT_SUBDIR` | `-e` | `.` | dir holding `pyproject.toml` |
 | ssh-agent | `-v <socket>:/run/ssh-agent.sock -e SSH_AUTH_SOCK=/run/ssh-agent.sock` | — | key for `git+ssh://` dependencies; see [git+ssh dependencies](#gitssh-dependencies) |
 | `POETRY_INSTALL_ARGS` | `-e` | `--all-extras --all-groups` | `poetry install` flags (installs test deps however declared); set e.g. `--no-root` or `--with dev` to narrow |
 | `PYTEST_ADDOPTS` | `-e` | `--tb=short --disable-warnings -q --maxfail=30` | default pytest opts; explicit argv still overrides them |
 | `OUTPUT_MAX_BYTES` | `-e` | `65536` | cap on returned output; only the last N bytes (the summary) are emitted |
-| venv cache | `-v <dir>:/cache` (rw) | — | host cache holding `venvs/`, `poetry/`, `locks/`; see [Venv cache](#venv-cache) |
+| venv cache | `-v <dir>:/cache` (rw) | — | the repo's own host cache folder holding `venvs/`, `poetry/`, `locks/`; see [Venv cache](#venv-cache) |
 | `VENV_CACHE_IMAGE_ID` | `-e` | — | image id, part of the cache key; the cache is skipped without it |
 | `VENV_CACHE` | `-e` | `on` | `on`, `off`, or `rebuild` (rebuild this key's venv) |
 | `VENV_CACHE_KEEP` | `-e` | `10` | most recently used venvs kept in the cache |
@@ -80,13 +83,21 @@ the calling container's own agent. Without one, the fetch fails with
 RUNTESTS_IMAGE=runtests:dev ./build.sh
 ```
 
+The image carries the label `org.cld.jj-version`, set from the `JJ_VERSION` build
+argument. The broker refuses an image whose label is missing or older than 0.38.
+
 `build.sh` passes `../scripts` as the extra build context `scripts` (for
 `venv-cache.sh`), which needs BuildKit (the default builder since Docker 23).
 
 ## Venv cache
 
 Before `poetry install`, `venv-cache.sh` seeds the venv at `/opt/venv` from a
-host cache mounted at `/cache` (the broker mounts `~/.cld/cache`):
+host cache mounted at `/cache`. The broker mounts one folder per repo, `~/.cld/cache/repos/<repo name>-<hash of
+its real path>`, never the cache root: code under test writes the folder, and a venv or a wheel in it is later
+run or installed with the `.env` of whichever repo restores it, so repos must not share one. The same repo's
+runs share it (the same `.env`). Everything below, the download cache and the learned ssh host keys included,
+is per repo, and so is the `VENV_CACHE_KEEP` limit. A cache root from before this layout (`venvs/`, `poetry/`,
+`locks/`, `ssh/` directly in it) is no longer used: delete it.
 
 - The key hashes `pyproject.toml`, `poetry.lock`, `POETRY_INSTALL_ARGS`, the
   Python and Poetry versions and `VENV_CACHE_IMAGE_ID`.
@@ -101,7 +112,9 @@ host cache mounted at `/cache` (the broker mounts `~/.cld/cache`):
   lock file or the image id, the cache is skipped.
 
 Poetry's download cache lives at `/cache/poetry`, so a miss downloads only new
-packages.
+packages. It is split per repo with the rest: poetry installs a cached wheel as it
+is, so a download cache shared between repos would be as open to poisoning as the
+venvs.
 
 ## Run
 

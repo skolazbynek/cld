@@ -10,8 +10,10 @@
 #
 #   VIRTUAL_ENV          venv path, fixed per image (a venv only works at the
 #                        absolute path it was built at, so it is copied back there)
-#   VENV_CACHE_DIR       cache root holding venvs/ poetry/ locks/ (default: /cache);
-#                        used only when it is a mount point
+#   VENV_CACHE_DIR       cache dir holding venvs/ poetry/ locks/ (default: /cache);
+#                        used only when it is a mount point. The broker mounts a
+#                        folder of its own per repo here, never one shared by repos:
+#                        a restored venv runs with its repo's .env
 #   VENV_CACHE           on | off | rebuild (default: on)
 #   VENV_CACHE_KEEP      number of most recently used venvs kept (default: 10)
 #   VENV_CACHE_IMAGE_ID  image id, part of the key -- system libs under compiled

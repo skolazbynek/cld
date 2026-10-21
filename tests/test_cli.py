@@ -348,6 +348,7 @@ def start_env(tmp_path, monkeypatch):
             anchor_hash="c0ffee" * 6 + "abcd",
             require_docker=p("require_docker"),
             find_target_repo=p("find_target_repo", return_value=repo_root),
+            preflight=p("prepare_store_mounts"),
             ensure_image=p("ensure_image"),
             capacity=p("assert_task_agent_capacity"),
             resolve_anchor=p("resolve_anchor_checked", return_value="c0ffee" * 6 + "abcd"),
@@ -439,6 +440,14 @@ class TestTaskAgentStart:
         assert spec.parent_master == "cld_master_myrepo_ab12ef34"
         start_env.capacity.assert_called_once()
         assert start_env.capacity.call_args.args[1] == "cld_master_myrepo_ab12ef34"
+
+    def test_store_preflight_runs_before_the_anchor_is_resolved(self, start_env):
+        order = []
+        start_env.preflight.side_effect = lambda repo: order.append(("preflight", repo))
+        start_env.resolve_anchor.side_effect = lambda *a, **k: order.append("resolve") or start_env.anchor_hash
+        result = self._invoke("-p", "do it", "-n", "add-oauth")
+        assert result.exit_code == 0, result.output
+        assert order == [("preflight", start_env.repo_root), "resolve"]
 
     def test_persona_recorded_for_display(self, start_env):
         """The first persona-kind ref names the role; nothing is mounted for it."""

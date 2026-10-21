@@ -29,6 +29,30 @@ cld_detect_backend() {
     fi
 }
 
+cld_store_jj() {
+    # Run jj against the origin store without touching its working copy: the
+    # origin's .jj/working_copy is mounted read-only, and a plain jj call there
+    # would try to snapshot it (and fail). Args: $1=origin, rest=jj arguments.
+    local origin="$1"
+    shift
+    (cd "$origin" && jj --ignore-working-copy "$@")
+}
+
+cld_add_workspace() {
+    # Add jj workspace $2 at $4, based on revision $3, through the origin
+    # store. Without a snapshot jj creates the workspace but refuses to check
+    # it out; `jj new` inside it does the checkout. Any other failure is real.
+    # Same pattern as runtests/entrypoint.sh. Args: $1=origin $2=name $3=rev
+    # $4=workspace_dir.
+    local origin="$1" name="$2" rev="$3" workspace="$4" err
+    err=$(cld_store_jj "$origin" workspace add --name "$name" -r "$rev" "$workspace" 2>&1) ||
+        case "$err" in
+            *"must be able to update the working copy"*) ;;
+            *) echo "$err" >&2; return 1 ;;
+        esac
+    (cd "$workspace" && jj new "$rev")
+}
+
 cld_recover_anchor() {
     # Recover AGENT_ANCHOR_HASH on a warm restart or bookmark reattach: find
     # the ancestor of $bookmark carrying our own 'cld anchor: <session>
@@ -42,14 +66,14 @@ cld_recover_anchor() {
     # branch of cld_boot_workspace and cld.vcs.scratch.stage_in_workspace).
     # Args: $1=bookmark $2=session. cwd must be inside the jj store.
     local bookmark="$1" session="$2" scratch_hash desc
-    scratch_hash=$(jj log --no-graph -n 1 \
+    scratch_hash=$(cld_store_jj . log --no-graph -n 1 \
         -r "heads(ancestors(${bookmark}) & description(glob:'cld anchor: ${session} *'))" \
         -T change_id 2>/dev/null || true)
     [ -n "$scratch_hash" ] || return 0
-    desc=$(jj log --no-graph -n 1 -r "$scratch_hash" -T description 2>/dev/null || true)
+    desc=$(cld_store_jj . log --no-graph -n 1 -r "$scratch_hash" -T description 2>/dev/null || true)
     case "$desc" in
         *"mode=shared"*)
-            jj log --no-graph -n 1 -r "parents($scratch_hash)" -T change_id 2>/dev/null || true
+            cld_store_jj . log --no-graph -n 1 -r "parents($scratch_hash)" -T change_id 2>/dev/null || true
             ;;
         *)
             echo "$scratch_hash"
@@ -66,7 +90,8 @@ cld_recover_anchor() {
 # Returns non-zero on any fatal boot error; the caller decides whether that
 # kills the whole boot.
 #
-# Args: $1=origin_dir (the RW bind mount holding the jj store)
+# Args: $1=origin_dir (the bind mount holding the jj store; its working-copy
+#          record is read-only, so every call there goes through cld_store_jj)
 #       $2=workspace_dir (container-layer path the workspace lives at)
 #       $3=bookmark (session bookmark = workspace name)
 #       $4=base_rev (revision to anchor on at first launch)
@@ -104,11 +129,11 @@ cld_boot_workspace() {
     # first-launch the stale registration would make `jj workspace add --name`
     # fail with "Workspace named X already exists" and leave the workspace dir
     # empty. No-op when absent (first-ever launch).
-    (cd "$origin" && jj workspace forget "$bookmark" 2>&1) || true
+    cld_store_jj "$origin" workspace forget "$bookmark" 2>&1 || true
 
-    if (cd "$origin" && jj bookmark list -T 'name ++ "\n"') | grep -qx "$bookmark"; then
+    if cld_store_jj "$origin" bookmark list -T 'name ++ "\n"' | grep -qx "$bookmark"; then
         echo "[cld] reattaching workspace '$bookmark'"
-        if ! (cd "$origin" && jj workspace add --name "$bookmark" -r "$bookmark" "$workspace"); then
+        if ! cld_add_workspace "$origin" "$bookmark" "$bookmark" "$workspace"; then
             echo "Error: jj workspace add failed (reattach)" >&2
             return 1
         fi
@@ -126,12 +151,12 @@ cld_boot_workspace() {
     fi
     CLD_BOOT_FIRST_LAUNCH=1
     local a_hash b_hash
-    if ! a_hash=$(cd "$origin" && jj log --no-graph -n 1 -r "$base_rev" -T change_id 2>/dev/null); then
+    if ! a_hash=$(cld_store_jj "$origin" log --no-graph -n 1 -r "$base_rev" -T change_id 2>/dev/null); then
         echo "Error: could not resolve base revision '$base_rev'" >&2
         return 1
     fi
     echo "[cld] first launch, base=${a_hash:0:12}"
-    if ! (cd "$origin" && jj workspace add --name "$bookmark" -r "$a_hash" "$workspace"); then
+    if ! cld_add_workspace "$origin" "$bookmark" "$a_hash" "$workspace"; then
         echo "Error: jj workspace add failed (first launch)" >&2
         return 1
     fi
@@ -188,7 +213,7 @@ cld_boot_worktree() {
 
     CLD_BOOT_FIRST_LAUNCH=1
     echo "[cld] first launch (git), base=${base_rev:0:12}"
-    if ! git -C "$origin" worktree add -b "$bookmark" "$workspace" "$base_rev"; then
+    if ! git -C "$origin" worktree add --no-track -b "$bookmark" "$workspace" "$base_rev"; then
         echo "Error: git worktree add failed (first launch)" >&2
         return 1
     fi

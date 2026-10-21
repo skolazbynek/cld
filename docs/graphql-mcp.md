@@ -8,8 +8,8 @@ Setting this up for the first time? Follow
 Lifecycle and queries run on the **host**, through the cld broker's `graphql`
 action (see `docs/design-cld-broker.md` §16 and
 `docs/impl-graphql-broker-plan.md`), not as a subprocess inside this
-container. That means: the server runs from the real repo checkout with the
-real `.env` secrets, on the exact jj revision the calling container is on
+container. That means: the server runs from the repo's jj/git store (never
+the checkout) with a private copy of the real `.env` secrets, on the exact jj revision the calling container is on
 (the client snapshots its workspaces first, so uncommitted edits count) --
 and this container never holds a database password or an API token. The
 tradeoff is speed: every start/restart is a fresh container + `poetry
@@ -48,7 +48,10 @@ repo's **host checkout** (`.cld/config.toml` as it stands on disk when a
 lifecycle op runs), not from the session's revision -- so editing config takes
 effect on the next `start`/`restart` regardless of what the session's `@` is
 on, unlike the server's own code, which is materialized fresh at that revision
-every time (`graphqlserver/entrypoint.sh`).
+every time (`graphqlserver/entrypoint.sh`). The broker reads the file without
+following a symlink. `graphql_port` must be a port number (1-65535) and
+`graphql_health_path` must be a path starting with `/`; otherwise the broker
+refuses the `graphql` op with exit 3.
 
 Editing `cld/mcp/graphql.py` needs `cld build` + a container restart: `cld/`
 is `COPY`'d into the image, not bind-mounted.

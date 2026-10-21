@@ -35,6 +35,10 @@ RUN curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj
     rm -f /tmp/jj.tar.gz && \
     /usr/local/bin/jj --version
 
+# The broker refuses an image whose jj is older than 0.38 (broker/cld-broker.py:
+# require_jj_image): older jj reads the repo's own config files.
+LABEL org.cld.jj-version="${JJ_VERSION}"
+
 # Poetry, pinned.
 RUN curl -sSL https://install.python-poetry.org | \
         POETRY_HOME=/opt/poetry python3 - --version "${POETRY_VERSION}" && \
