@@ -61,6 +61,10 @@ RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.
 RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=~/.opt/poetry python3 - && \
     ln -s ~/.opt/poetry/bin/poetry ~/.local/bin/poetry
 
+# Install Pyright: the pyright-lsp Claude plugin only names `pyright-langserver`
+# and expects it on PATH. Pinned; installed under ~/.local so it needs no root.
+RUN npm install -g --prefix ~/.local pyright@1.1.414
+
 # Install uv/uvx (needed by uvx-based MCP servers, e.g. mcp-grafana)
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" sh
 
