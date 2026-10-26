@@ -18,7 +18,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 ENTRYPOINTS = [ROOT / "runtests" / "entrypoint.sh", ROOT / "graphqlserver" / "entrypoint.sh"]
-SSH_WRAPPER = ROOT / "scripts" / "ssh-wrapper.sh"
+SCRIPTS = ROOT / "scripts"
+SSH_WRAPPER = SCRIPTS / "ssh-wrapper.sh"
 
 
 def _fragment(entrypoint: Path, repo: Path) -> str:
@@ -42,7 +43,8 @@ def env(tmp_path):
     config = tmp_path / "jj-config.toml"
     config.write_text('[user]\nname = "test"\nemail = "test@localhost"\n')
     (tmp_path / "home").mkdir()
-    return {**os.environ, "JJ_CONFIG": str(config), "HOME": str(tmp_path / "home"), "HOSTNAME": "abc123",
+    return {**os.environ, "PATH": f"{SCRIPTS}:{os.environ['PATH']}", "JJ_CONFIG": str(config),
+            "HOME": str(tmp_path / "home"), "HOSTNAME": "abc123",
             "GQL_WORKSPACE": "gql-abc123", "PROJECT_SUBDIR": "."}
 
 
@@ -146,8 +148,8 @@ class TestStoreOnlyRepo:
     section 5): the workspace step must work with nothing but `.jj` there, with the
     protected rows read-only, and never touch the default workspace."""
 
-    def _tree(self, repo: Path) -> dict[str, tuple[int, bytes]]:
-        return {str(p): (p.stat().st_mtime_ns, p.read_bytes())
+    def _tree(self, repo: Path) -> dict[str, tuple[int, int, bytes]]:
+        return {str(p): (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes())
                 for p in sorted(repo.rglob("*")) if p.is_file() and not p.is_symlink()
                 and any(part in p.parts for part in ("working_copy", "config-id", "git_target", "workspace-config-id"))}
 
@@ -160,6 +162,15 @@ class TestStoreOnlyRepo:
         assert {p.name for p in store_only.iterdir()} <= {".jj", ".git"}
         assert _jj(env, store_only, "log", "--no-graph", "-r", "default@", "-T", "commit_id") == default_wc
         assert _jj(env, store_only, "workspace", "list", "-T", 'name ++ "\\n"') == "default\n"
+        assert self._tree(store_only) == protected
+
+    def test_fresh_home_leaves_the_config_ids_alone(self, entrypoint, store_only, env, tmp_path):
+        """The broker runs the images with an empty $HOME. Without a config record there, jj rewrites
+        each config id by rename, which the read-only bind over it refuses (EBUSY)."""
+        (tmp_path / "fresh").mkdir()
+        protected = self._tree(store_only)
+        result = _run(entrypoint, store_only, {**env, "HOME": str(tmp_path / "fresh")}, "@-", after="cat tracked.txt")
+        assert result.returncode == 0, result.stderr
         assert self._tree(store_only) == protected
 
 

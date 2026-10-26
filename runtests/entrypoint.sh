@@ -46,6 +46,8 @@ export JJ_CONFIG=/tmp/jj-config.toml
 printf '[user]\nname = "runtests"\nemail = "runtests@localhost"\n' > "$JJ_CONFIG"
 
 cd /repo
+# Before any jj call: jj would rewrite the read-only config ids otherwise.
+seed-secure-config.sh /repo
 # Container hostname is a unique per-container id; keeps the workspace name
 # collision-free across concurrent runs without a SIGPIPE-prone random pipe.
 ws="runtests-${HOSTNAME:-$$}"

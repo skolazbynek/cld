@@ -49,6 +49,8 @@ export JJ_CONFIG=/tmp/jj-config.toml
 printf '[user]\nname = "graphqlserver"\nemail = "graphqlserver@localhost"\n' > "$JJ_CONFIG"
 
 cd /repo
+# Before any jj call: jj would rewrite the read-only config ids otherwise.
+seed-secure-config.sh /repo
 # Workspace dir lives under $HOME: with `--user` (the broker path always uses
 # it) the container user cannot mkdir at / (root-owned), but $HOME is writable.
 work="$HOME/gql-workspace"

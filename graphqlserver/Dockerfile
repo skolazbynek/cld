@@ -60,6 +60,7 @@ ENV VIRTUAL_ENV=/opt/venv \
     POETRY_CACHE_DIR=/cache/poetry
 # From the `scripts` build context (../scripts, passed by build.sh).
 COPY --from=scripts venv-cache.sh /usr/local/bin/venv-cache.sh
+COPY --from=scripts seed-secure-config.sh /usr/local/bin/seed-secure-config.sh
 # `git+ssh://` dependencies: git and poetry's dulwich run `ssh` from PATH, and
 # this wrapper (ahead of /usr/bin/ssh) makes it work as the broker's --user uid.
 COPY --from=scripts ssh-wrapper.sh /usr/local/bin/ssh

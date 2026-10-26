@@ -396,5 +396,8 @@ Deviations from the sections above. Host checks: `MANUAL_TESTS.md` section 10.
   `<VENV_CACHE_ROOT>/repos/<name>-<hash>/`. `graphql_health_path` and `graphql_port` are
   validated, failed requests print no URL, `task-agent` refuses `--`, and `cld-brokerctl.sh
   graphql-sweep` uses the broker's own sweep.
+- **Runner and server jj config:** both entrypoints run `scripts/seed-secure-config.sh` before
+  any jj call. With an empty `$HOME`, jj otherwise rewrites both ids by rename, which the
+  read-only binds refuse with EBUSY.
 - **Tests (10.1):** the 4.1 classes do not exist. The old-image and old-container cases are unit
   tests in `TestLaunchWiring` (`tests/test_docker.py`).
