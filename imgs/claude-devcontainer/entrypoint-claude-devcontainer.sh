@@ -187,8 +187,8 @@ if [ -n "${TASK_AGENT_MODE:-}" ] && [ -n "${AGENT_DELIVERABLE_BRANCH:-}" ]; then
     else
         echo "[WARN] could not create deliverable bookmark '$AGENT_DELIVERABLE_BRANCH'" >&2
     fi
-    # Wrap-up may push this branch to the remote; task-agent containers ship no
-    # known_hosts, so a first push would fail host-key verification.
+    # Wrap-up may push this branch to the remote; a remote missing from the
+    # host's known_hosts would fail host-key verification.
     seed_known_hosts
 fi
 

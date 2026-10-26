@@ -399,7 +399,7 @@ Full set of keys:
 | `poll_interval` | int (seconds) | `30` | Chain orchestrator's docker-ps poll interval |
 | `chain_max_parallel` | int | `4` | Max agents launched concurrently in a chain's parallel group |
 | `chain_default_model` | string | `""` | Model override for chain agents; empty = each step's own default |
-| `ssh_auth_sock` | string | unset (auto-detect) | SSH agent forwarding into every devcontainer-image launch (`task-agent`, tickets). Unset = auto-detect host `$SSH_AUTH_SOCK`; `""` = explicitly disable; a path = use that socket. Launches the broker makes on a container's behalf need `SSH_AUTH_SOCK` in `broker.conf` -- see `broker/README.md` |
+| `ssh_auth_sock` | string | unset (auto-detect) | SSH agent forwarding into every devcontainer-image launch (`task-agent`, tickets). Unset = auto-detect host `$SSH_AUTH_SOCK`; `""` = explicitly disable; a path = use that socket. The host `~/.ssh/known_hosts` is copied in with it. Launches the broker makes on a container's behalf need `SSH_AUTH_SOCK` in `broker.conf` -- see `broker/README.md` |
 | `mailbox_root` | string | `"~/.cld/mailboxes"` | Host root of the inter-container mailbox tree (bind-mounted RW into every task-agent and ticket container) |
 | `agent_max_turns` | int | `120` | Per-message turn cap passed to the agent supervisor's `claude -p --max-turns` |
 | `agent_kickoff_persona` | string | `"agent"` | Kickoff persona for the supervisor's non-task mode. Vestigial: the standing `cld agent` role that used it is gone, and every live launch is a task-agent, which composes its kickoff from the task brief instead |

@@ -110,9 +110,9 @@ ensure_own_mailbox() {
 }
 
 # Seed ~/.ssh/known_hosts from the repo's SSH remote.
-# Containers get the ssh-agent forwarded but ship no known_hosts, so a first
-# `jj git push` / `git push` fails with "Host key verification failed" -- a trust
-# gap, not a reachability one. Best-effort: no remote, an https remote, or no
+# The host's known_hosts is copied in with the ssh-agent forward; this covers a
+# remote the host never accepted, which would otherwise fail a first push with
+# "Host key verification failed". Best-effort: no remote, an https remote, or no
 # network all just skip (the push, if any, will report the real problem).
 seed_known_hosts() {
     local url host

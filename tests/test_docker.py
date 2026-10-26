@@ -40,6 +40,7 @@ from cld.docker import (
     stage_home_ro,
     stage_plugin_marketplaces,
     stage_broker,
+    stage_ssh_agent,
     store_mount_args,
     task_agent_container_name,
     ticket_anchor_resolver,
@@ -641,6 +642,37 @@ class TestPluginMarketplaceFilter:
 
         monkeypatch.setattr("cld.docker.docker_occupant_list", fail)
         assert stage_plugin_marketplaces(Config(), [repo]) == []
+
+
+class TestStageSshAgent:
+    @pytest.fixture
+    def sock(self, tmp_path):
+        import socket
+        path = tmp_path / "agent.sock"
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(str(path))
+        yield path
+        s.close()
+
+    def test_known_hosts_staged_with_agent(self, tmp_path, monkeypatch, sock):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".ssh").mkdir()
+        (tmp_path / ".ssh" / "known_hosts").write_text("h")
+        args = stage_ssh_agent(Config(ssh_auth_sock=str(sock)))
+        assert f"{sock}:/run/host-ssh-agent.sock" in args
+        assert any(a.endswith(":/tmp/host-config/.ssh/known_hosts:ro") for a in args)
+
+    def test_no_known_hosts_on_host(self, tmp_path, monkeypatch, sock):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        args = stage_ssh_agent(Config(ssh_auth_sock=str(sock)))
+        assert f"{sock}:/run/host-ssh-agent.sock" in args
+        assert not any("/tmp/host-config/.ssh/known_hosts" in a for a in args)
+
+    def test_disabled_stages_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".ssh").mkdir()
+        (tmp_path / ".ssh" / "known_hosts").write_text("h")
+        assert stage_ssh_agent(Config(ssh_auth_sock="")) == []
 
 
 class TestEnsureImageNested:

@@ -1379,7 +1379,8 @@ _CONTAINER_SSH_AUTH_SOCK = "/run/host-ssh-agent.sock"
 def stage_ssh_agent(cfg: Config) -> list[str]:
     """Return -v/-e args to forward the host ssh-agent socket into a devcontainer.
 
-    Tri-state on ``cfg.ssh_auth_sock``:
+    The host's ``~/.ssh/known_hosts`` rides along, so the container trusts the
+    same host keys the host already accepted. Tri-state on ``cfg.ssh_auth_sock``:
       - ``""`` (explicit) -> disabled, return [].
       - ``None`` (unset)  -> auto-detect from $SSH_AUTH_SOCK.
       - path              -> use that host socket path.
@@ -1400,6 +1401,7 @@ def stage_ssh_agent(cfg: Config) -> list[str]:
     return [
         "-v", f"{host_sock}:{_CONTAINER_SSH_AUTH_SOCK}",
         "-e", f"SSH_AUTH_SOCK={_CONTAINER_SSH_AUTH_SOCK}",
+        *stage_home_ro(".ssh/known_hosts", cfg),
     ]
 
 
