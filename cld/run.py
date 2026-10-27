@@ -15,10 +15,11 @@ from cld.docker import (
     in_master_container,
     prepare_store_mounts,
     require_docker,
-    resolve_anchor_checked,
     run_extra_paths,
 )
 from cld.log import get_logger
+from cld.vcs import get_backend
+from cld.vcs.anchor import resolve_anchor
 
 log = get_logger(__name__)
 
@@ -80,7 +81,9 @@ def launch_run(
 
     session = session_name or build_session_name("run", name)
     mode = "shared" if shared_anchor else "isolated"
-    anchor = resolve_anchor_checked(cfg, repo_root, revision, mode, caller_kind="run")
+    # No overlap check: a run may start inside a live container's tree (a ticket
+    # launches runs on its own work through the broker).
+    anchor = resolve_anchor(get_backend(repo_root), revision)
 
     args = ["--name", session]
     args += build_container_args(repo_root, session, cfg, anchor_hash=anchor, anchor_mode=mode)

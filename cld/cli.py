@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1010,6 +1011,8 @@ def _chain_runner(
         )
         final_status = "success" if result.success else "failed"
         reason = result.failure_reason if not result.success else ""
+        if reason == "interrupted":
+            final_status = "interrupted"  # `cld chain cancel` waits for this
         try:
             writer.mark_finished(final_status, reason=reason)
         except Exception as write_err:
@@ -1127,6 +1130,49 @@ def chain_status(
 ):
     """List status of running (and optionally all) chains in this repo."""
     _render_status(all_, json_out, watch)
+
+
+# How long `cld chain cancel` waits for the runner to record the interrupt itself.
+_CANCEL_WAIT_SECONDS = 10.0
+
+
+@chain_app.command("cancel")
+@_handle_errors
+def chain_cancel(
+    name: str = typer.Argument(..., help="Chain name (as shown by `cld chain status`)"),
+):
+    """Interrupt a running chain: signal its runner and stop its step containers."""
+    cfg = Config.from_env()
+    setup_logging(cfg)
+    state_file = chain_state_dir(find_repo_root(), name) / "state.json"
+    if not state_file.is_file():
+        typer.echo(f"Error: no chain named '{name}' in this repo.", err=True)
+        raise typer.Exit(1)
+    state = ChainState.load(state_file)
+    if state.status != "running":
+        typer.echo(f"Error: chain '{name}' is not running (status: {state.status}).", err=True)
+        raise typer.Exit(1)
+
+    # The runner leads its own process group (start_new_session in _spawn_chain_runner).
+    if _is_pid_alive(state.pid):
+        try:
+            os.killpg(state.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass  # exited between the liveness probe and the signal
+    # wait_for_agent only polls, so the step containers keep going unless stopped here.
+    if state.current_step_sessions:
+        subprocess.run(["docker", "stop", *state.current_step_sessions], capture_output=True)
+
+    deadline = time.monotonic() + _CANCEL_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        state = ChainState.load(state_file)
+        if state.status != "running":
+            break
+        time.sleep(0.2)
+    else:
+        # Dead or stuck runner: never leave `cld chain status` showing it as running.
+        StateWriter(state_file, state).mark_finished("interrupted", reason="cancelled")
+    typer.echo(f"Chain '{name}' cancelled.")
 
 
 @chain_app.command("ps", hidden=True)
@@ -1274,6 +1320,11 @@ def _resolve_chain_path(arg: str) -> Path:
         cld_root = Path(__file__).resolve().parent.parent
         for base in (repo_root, cld_root):
             cand = base / "chains" / short
+            if not cand.resolve().is_relative_to((base / "chains").resolve()):
+                raise ValueError(
+                    f"chain ref '{arg}' escapes the chains folder at {base / 'chains'} -- "
+                    "a ref names a chain file under chains/, not a path"
+                )
             if cand.is_file():
                 return cand
         return repo_root / "chains" / short

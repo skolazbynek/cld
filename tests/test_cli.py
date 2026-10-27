@@ -1,6 +1,8 @@
 """Tests for CLI argument validation via typer's CliRunner."""
 
 import json
+import os
+import signal
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,14 +11,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+from cld.chain_state import ChainState, StateWriter
 from cld.cli import (
     _assert_reap_ready,
     _reap_task_agent,
+    _resolve_chain_path,
     app,
 )
 from cld.task_agent import parse_peer_specs, resolve_task_agent
 from cld.config import Config
 from cld.docker import task_agent_container_name
+from tests.test_chain import _seed_state
 
 
 runner = CliRunner()
@@ -1045,3 +1050,117 @@ class TestTaskAgentRosterScoping:
         assert result.exit_code == 0, result.output
         assert "cld_agent_r_mine" in result.output
         assert "cld_agent_r_theirs" not in result.output
+
+
+class TestChainCancel:
+    @pytest.fixture
+    def chain_dir(self, tmp_path):
+        d = tmp_path / ".cld" / "chains" / "chain_demo"
+        d.mkdir(parents=True)
+        return d
+
+    def _seed(self, chain_dir, status="running", pid=None, sessions=("run_demo_s1",)):
+        _seed_state(chain_dir, "demo", status=status, pid=os.getpid() if pid is None else pid)
+        writer = StateWriter(chain_dir / "state.json", ChainState.load(chain_dir / "state.json"))
+        writer.update(current_step_sessions=list(sessions))
+
+    def _cancel(self, tmp_path, name="demo"):
+        with patch("cld.cli.find_repo_root", return_value=tmp_path):
+            return runner.invoke(app, ["chain", "cancel", name])
+
+    def test_signals_the_runner_group_and_stops_step_containers(self, tmp_path, chain_dir):
+        self._seed(chain_dir, sessions=("run_demo_s1", "run_demo_s2"))
+
+        def runner_records_interrupt(pid, sig):
+            StateWriter(chain_dir / "state.json", ChainState.load(chain_dir / "state.json")) \
+                .mark_finished("interrupted", reason="SIGINT")
+
+        with patch("cld.cli.os.killpg", side_effect=runner_records_interrupt) as killpg, \
+             patch("cld.cli.subprocess.run") as run:
+            result = self._cancel(tmp_path)
+        assert result.exit_code == 0, result.output
+        killpg.assert_called_once_with(os.getpid(), signal.SIGINT)
+        assert run.call_args.args[0] == ["docker", "stop", "run_demo_s1", "run_demo_s2"]
+        # The runner's own record is kept, not overwritten by the fallback.
+        assert ChainState.load(chain_dir / "state.json").failure_reason == "SIGINT"
+
+    def test_marks_interrupted_itself_when_the_runner_does_not(self, tmp_path, chain_dir):
+        self._seed(chain_dir)
+        with patch("cld.cli.os.killpg"), patch("cld.cli.subprocess.run"), \
+             patch("cld.cli._CANCEL_WAIT_SECONDS", 0.3):
+            result = self._cancel(tmp_path)
+        assert result.exit_code == 0, result.output
+        state = ChainState.load(chain_dir / "state.json")
+        assert state.status == "interrupted"
+        assert state.failure_reason == "cancelled"
+        assert state.finished_at
+
+    def test_dead_runner_is_not_signalled_but_still_cleaned_up(self, tmp_path, chain_dir):
+        self._seed(chain_dir, pid=999999)
+        with patch("cld.cli.os.killpg") as killpg, patch("cld.cli.subprocess.run") as run, \
+             patch("cld.cli._CANCEL_WAIT_SECONDS", 0.3):
+            result = self._cancel(tmp_path)
+        assert result.exit_code == 0, result.output
+        killpg.assert_not_called()
+        assert run.call_args.args[0] == ["docker", "stop", "run_demo_s1"]
+        assert ChainState.load(chain_dir / "state.json").status == "interrupted"
+
+    def test_no_step_sessions_runs_no_docker(self, tmp_path, chain_dir):
+        self._seed(chain_dir, sessions=())
+        with patch("cld.cli.os.killpg"), patch("cld.cli.subprocess.run") as run, \
+             patch("cld.cli._CANCEL_WAIT_SECONDS", 0.3):
+            result = self._cancel(tmp_path)
+        assert result.exit_code == 0, result.output
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("status", ["success", "failed", "interrupted"])
+    def test_refuses_a_chain_that_is_not_running(self, tmp_path, chain_dir, status):
+        self._seed(chain_dir, status=status)
+        with patch("cld.cli.os.killpg") as killpg, patch("cld.cli.subprocess.run") as run:
+            result = self._cancel(tmp_path)
+        assert result.exit_code == 1
+        assert f"not running (status: {status})" in result.output
+        killpg.assert_not_called()
+        run.assert_not_called()
+        assert ChainState.load(chain_dir / "state.json").status == status
+
+    def test_unknown_chain_errors(self, tmp_path):
+        result = self._cancel(tmp_path, name="nope")
+        assert result.exit_code == 1
+        assert "no chain named 'nope'" in result.output
+
+
+class TestResolveChainPath:
+    @pytest.fixture
+    def repo(self, tmp_path):
+        (tmp_path / "chains").mkdir()
+        return tmp_path
+
+    def test_name_resolves_under_the_chains_folder(self, repo):
+        chain = repo / "chains" / "demo.yaml"
+        chain.write_text("name: demo\n")
+        with patch("cld.cli.find_repo_root", return_value=repo):
+            assert _resolve_chain_path("@demo") == chain
+
+    def test_dotdot_name_is_refused(self, repo):
+        (repo / "outside.yaml").write_text("name: outside\n")
+        with patch("cld.cli.find_repo_root", return_value=repo), \
+             pytest.raises(ValueError, match="escapes the chains folder"):
+            _resolve_chain_path("@../outside")
+
+    def test_symlink_out_of_the_chains_folder_is_refused(self, repo, tmp_path_factory):
+        target = tmp_path_factory.mktemp("elsewhere") / "secret.yaml"
+        target.write_text("name: secret\n")
+        (repo / "chains" / "link.yaml").symlink_to(target)
+        with patch("cld.cli.find_repo_root", return_value=repo), \
+             pytest.raises(ValueError, match="escapes the chains folder"):
+            _resolve_chain_path("@link")
+
+    def test_cli_reports_the_escape(self, repo, caplog):
+        with patch("cld.cli.find_repo_root", return_value=repo):
+            result = runner.invoke(app, ["chain", "validate", "@../outside"])
+        assert result.exit_code == 1
+        assert "escapes the chains folder" in caplog.text
+
+    def test_plain_path_is_untouched(self, repo):
+        assert _resolve_chain_path("some/dir/c.yaml") == Path("some/dir/c.yaml")
