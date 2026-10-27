@@ -7,9 +7,10 @@ conversation. See docs/design-cli-split.md.
 
 import json
 import os
+import subprocess
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -44,8 +45,6 @@ class TestHostOnlyStubs:
     """Verbs that need a docker daemon say so instead of failing obscurely."""
 
     @pytest.mark.parametrize("argv", [
-        ["run", "task.md"],
-        ["chain", "run", "c.yaml"],
         ["build"],
         [],
         # Ticket lifecycle verbs (v2) drive the docker daemon, so they are
@@ -67,11 +66,11 @@ class TestHostOnlyStubs:
     def test_hidden_from_help(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        for verb in ("run", "chain", "build", "start", "claude",
+        for verb in ("build", "start", "claude",
                      "shell", "stop", "restart", "shutdown", "status", "logs"):
             assert f"│ {verb}" not in result.output
-        assert "task-agent" in result.output
-        assert "msg" in result.output
+        for verb in ("task-agent", "msg", "run", "chain"):
+            assert f"│ {verb}" in result.output
 
 
 class TestTaskAgentDispatch:
@@ -190,6 +189,253 @@ class TestTaskAgentDispatch:
         assert result.exit_code == 0, result.output
         assert "kick off" in result.output
         assert "start here" in result.output
+
+
+_TICKET = {"v": 1, "ticket": "t1", "repos": [
+    {"name": "api", "path": "/h/api", "anchor_base": "a" * 40},
+    {"name": "web", "path": "/h/web", "anchor_base": "b" * 40},
+]}
+_CHANGE_ID = "k" * 32
+
+
+def _jj_result(stdout: str = "", returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+
+class _Clock:
+    """A fake `time` module: sleeping advances the clock instead of waiting."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture(params=["run", "chain"])
+def kind(request) -> str:
+    return request.param
+
+
+class TestRunAndChainDispatch:
+    """`cld run|chain` go through the broker with a change id, never a revset or a path."""
+
+    @pytest.fixture(autouse=True)
+    def ticket(self, monkeypatch):
+        monkeypatch.setenv("CLD_TICKET_MANIFEST", json.dumps({**_TICKET, "repos": _TICKET["repos"][:1]}))
+
+    @pytest.fixture
+    def stack(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch("cld.cli_container.broker_available", return_value=True))
+            yield stack
+
+    def _ops(self, stack) -> dict[str, MagicMock]:
+        return {
+            k: stack.enter_context(patch(f"cld.cli_container.broker_{k}_op", return_value=_jj_result()))
+            for k in ("run", "chain")
+        }
+
+    def _jj(self, stack, *, resolved: str = _CHANGE_ID + "\n", working_copy: str = "") -> MagicMock:
+        def fake(argv, **_):
+            revset = argv[argv.index("-r") + 1]
+            return _jj_result(working_copy if "working_copies()" in revset else resolved)
+        return stack.enter_context(patch("cld.cli_container.subprocess.run", side_effect=fake))
+
+    def _first_ref(self, kind: str) -> list[str]:
+        return ["@personas/implementer"] if kind == "run" else ["@review-chain"]
+
+    def test_start_sends_the_change_id_not_the_revset(self, stack, kind):
+        ops = self._ops(stack)
+        jj = self._jj(stack)
+        result = runner.invoke(app, [
+            kind, "start", *self._first_ref(kind), "-r", "@-", "-n", "job", "-m", "opus", "-p", "do it",
+        ])
+        assert result.exit_code == 0, result.output
+        assert ops[kind].call_args.args == (
+            "start", *self._first_ref(kind), "-n", "job", "-p", "do it", "-m", "opus", "-r", _CHANGE_ID,
+        )
+        assert ops[kind].call_args.kwargs["repo"] == ""
+        assert not ops["chain" if kind == "run" else "run"].called
+        assert jj.call_args_list[0].args[0][:4] == ["jj", "-R", "/workspace/t1/api", "log"]
+        assert jj.call_args_list[0].args[0][jj.call_args_list[0].args[0].index("-r") + 1] == "@-"
+
+    def test_start_folds_local_files_into_the_prompt(self, stack, tmp_path, kind):
+        local = tmp_path / "brief.md"
+        local.write_text("# Brief\n")
+        ops = self._ops(stack)
+        self._jj(stack)
+        result = runner.invoke(app, [
+            kind, "start", *self._first_ref(kind), str(local), "-r", "@-", "-p", "and this",
+        ])
+        assert result.exit_code == 0, result.output
+        argv = ops[kind].call_args.args
+        assert str(local) not in argv
+        assert argv[argv.index("-p") + 1] == "# Brief\n\nand this"
+
+    def test_start_passes_repo_to_the_helper_and_resolves_in_its_workspace(self, stack, monkeypatch, kind):
+        monkeypatch.setenv("CLD_TICKET_MANIFEST", json.dumps(_TICKET))
+        ops = self._ops(stack)
+        jj = self._jj(stack)
+        result = runner.invoke(app, [kind, "start", *self._first_ref(kind), "-r", "@-", "--repo", "web"])
+        assert result.exit_code == 0, result.output
+        assert ops[kind].call_args.kwargs["repo"] == "web"
+        assert "--repo" not in ops[kind].call_args.args
+        assert jj.call_args_list[0].args[0][2] == "/workspace/t1/web"
+
+    def test_start_requires_a_revision(self, stack, kind):
+        ops = self._ops(stack)
+        result = runner.invoke(app, [kind, "start", *self._first_ref(kind)])
+        assert result.exit_code == 2
+        assert not ops[kind].called
+
+    def test_working_copy_base_is_refused_with_a_hint(self, stack, kind):
+        ops = self._ops(stack)
+        self._jj(stack, working_copy=_CHANGE_ID + "\n")
+        result = runner.invoke(app, [kind, "start", *self._first_ref(kind), "-r", "@"])
+        assert result.exit_code == 1
+        assert "jj new" in result.output
+        assert not ops[kind].called
+
+    def test_working_copy_probe_uses_the_resolved_change_id(self, stack, kind):
+        self._ops(stack)
+        jj = self._jj(stack)
+        runner.invoke(app, [kind, "start", *self._first_ref(kind), "-r", "a | b"])
+        probe = jj.call_args_list[1].args[0]
+        assert probe[probe.index("-r") + 1] == f"{_CHANGE_ID} & working_copies()"
+
+    @pytest.mark.parametrize("resolved", ["", f"{'k' * 32}\n{'m' * 32}\n"], ids=["none", "several"])
+    def test_revision_must_resolve_to_exactly_one_change(self, stack, kind, resolved):
+        ops = self._ops(stack)
+        self._jj(stack, resolved=resolved)
+        result = runner.invoke(app, [kind, "start", *self._first_ref(kind), "-r", "x"])
+        assert result.exit_code == 1
+        assert "exactly one change" in result.output
+        assert not ops[kind].called
+
+    def test_a_failing_jj_is_an_error(self, stack, kind):
+        ops = self._ops(stack)
+        stack.enter_context(patch(
+            "cld.cli_container.subprocess.run", return_value=_jj_result(returncode=1, stderr="no such revision"),
+        ))
+        result = runner.invoke(app, [kind, "start", *self._first_ref(kind), "-r", "nope"])
+        assert result.exit_code == 1
+        assert "no such revision" in result.output
+        assert not ops[kind].called
+
+    def test_chain_needs_an_at_ref_first(self, stack, tmp_path):
+        local = tmp_path / "chain.yaml"
+        local.write_text("x")
+        ops = self._ops(stack)
+        self._jj(stack)
+        result = runner.invoke(app, ["chain", "start", str(local), "-r", "@-"])
+        assert result.exit_code == 1
+        assert "@<chain-name>" in result.output
+        assert not ops["chain"].called
+
+    @pytest.mark.parametrize(("manifest", "argv", "message"), [
+        (_TICKET, [], "mounts 2 repos"),
+        (_TICKET, ["--repo", "other"], "not mounted"),
+        (None, [], "only in a ticket container"),
+    ], ids=["ambiguous", "unmounted", "no-ticket"])
+    def test_repo_must_be_one_of_the_mounted_ones(self, stack, monkeypatch, kind, manifest, argv, message):
+        if manifest is None:
+            monkeypatch.delenv("CLD_TICKET_MANIFEST")
+        else:
+            monkeypatch.setenv("CLD_TICKET_MANIFEST", json.dumps(manifest))
+        ops = self._ops(stack)
+        jj = self._jj(stack)
+        result = runner.invoke(app, [kind, "start", *self._first_ref(kind), "-r", "@-", *argv])
+        assert result.exit_code == 1
+        assert message in result.output
+        assert not ops[kind].called and not jj.called
+
+    def test_status_and_cancel_dispatch(self, stack, kind):
+        ops = self._ops(stack)
+        assert runner.invoke(app, [kind, "status"]).exit_code == 0
+        assert ops[kind].call_args.args == ("status",)
+        assert runner.invoke(app, [kind, "status", "job"]).exit_code == 0
+        assert ops[kind].call_args.args == ("status", "job")
+        assert runner.invoke(app, [kind, "cancel", "job"]).exit_code == 0
+        assert ops[kind].call_args.args == ("cancel", "job")
+        assert ops[kind].call_args.kwargs["capture"] is False
+
+    def test_broker_exit_code_is_propagated(self, stack, kind):
+        ops = self._ops(stack)
+        ops[kind].return_value = _jj_result(returncode=3)
+        assert runner.invoke(app, [kind, "cancel", "job"]).exit_code == 3
+
+    def test_missing_broker_is_reported(self, kind):
+        with patch("cld.cli_container.broker_available", return_value=False), \
+             patch(f"cld.cli_container.broker_{kind}_op") as op:
+            result = runner.invoke(app, [kind, "status"])
+        assert result.exit_code == 1
+        assert "broker_key" in result.output
+        assert not op.called
+
+
+class TestRunAndChainWait:
+    """`wait` polls `status <name>` every 15 s, bounded under the agent's command limit."""
+
+    @pytest.fixture
+    def clock(self):
+        clock = _Clock()
+        with patch("cld.cli_container.time", clock), patch("cld.cli_container.broker_available", return_value=True):
+            yield clock
+
+    @staticmethod
+    def _status(state: str) -> subprocess.CompletedProcess:
+        return _jj_result(f"name: job\nkind: run\nstate: {state}\nbookmark: job\n")
+
+    def _wait(self, kind: str, states: list[subprocess.CompletedProcess], *argv: str):
+        with patch(f"cld.cli_container.broker_{kind}_op", side_effect=states) as op:
+            return runner.invoke(app, [kind, "wait", "job", *argv]), op
+
+    def test_finished_at_once_prints_the_detail_and_exits_zero(self, clock, kind):
+        result, op = self._wait(kind, [self._status("success")])
+        assert result.exit_code == 0, result.output
+        assert "state: success" in result.output
+        assert op.call_args.args == ("status", "job")
+        assert op.call_args.kwargs["capture"] is True
+        assert clock.sleeps == []
+
+    def test_polls_every_fifteen_seconds_until_not_running(self, clock, kind):
+        result, op = self._wait(kind, [self._status("running")] * 3 + [self._status("failed")])
+        assert result.exit_code == 0, result.output
+        assert clock.sleeps == [15, 15, 15]
+        assert op.call_count == 4
+        assert "state: failed" in result.output
+
+    def test_timeout_exits_124_after_a_final_poll(self, clock, kind):
+        result, op = self._wait(kind, [self._status("running")] * 10, "--timeout", "40")
+        assert result.exit_code == 124
+        assert clock.sleeps == [15, 15, 10]
+        assert op.call_count == 4
+        assert "state: running" in result.output
+
+    def test_default_timeout_is_540_seconds(self, clock, kind):
+        result, _ = self._wait(kind, [self._status("running")] * 100)
+        assert result.exit_code == 124
+        assert sum(clock.sleeps) == 540
+
+    def test_timeout_above_the_maximum_is_rejected(self, clock, kind):
+        result, op = self._wait(kind, [], "--timeout", "541")
+        assert result.exit_code == 2
+        assert not op.called
+
+    def test_broker_errors_propagate(self, clock, kind):
+        result, _ = self._wait(kind, [_jj_result(returncode=1, stderr="denied: not your job")])
+        assert result.exit_code == 1
+        assert "denied: not your job" in result.output
+
+    def test_a_status_without_a_state_line_is_an_error(self, clock, kind):
+        result, _ = self._wait(kind, [_jj_result("something else\n")])
+        assert result.exit_code == 1
 
 
 class TestBrokerExitCodes:

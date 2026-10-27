@@ -32,7 +32,7 @@ _DEFAULT_USER = "zet"
 
 # Actions that act on the caller's revision, which the broker reads from the
 # jj store without snapshotting (broker/cld-broker.py:LabelCaller.revision).
-_REVISION_ACTIONS = ("run-tests", "graphql")
+_REVISION_ACTIONS = ("run-tests", "graphql", "run", "chain")
 
 
 def broker_available() -> bool:
@@ -242,6 +242,32 @@ def broker_task_agent_op(op: str, extra_args: list[str] | None = None) -> int:
     mounts, then the host registry; the other ops need no repo.
     """
     return run_action("task-agent", op, *(extra_args or [])).returncode
+
+
+def _broker_job_op(
+    action: str, op: str, args: tuple[str, ...], repo: str, capture: bool,
+) -> subprocess.CompletedProcess:
+    repo_args = ("--repo", repo) if repo else ()
+    return run_action(action, *repo_args, op, *args, capture=capture)
+
+
+def broker_run_op(
+    op: str, *args: str, repo: str = "", capture: bool = False,
+) -> subprocess.CompletedProcess:
+    """Delegate a `cld run <op>` (start|status|cancel) to the host broker.
+
+    *repo* names the target repo of a multi-repo ticket container as a leading
+    ``--repo <name>``, before *op*, the way ``graphql_op`` sends it. Output streams to
+    the user unless ``capture=True``, which ``wait`` needs to read the state.
+    """
+    return _broker_job_op("run", op, args, repo, capture)
+
+
+def broker_chain_op(
+    op: str, *args: str, repo: str = "", capture: bool = False,
+) -> subprocess.CompletedProcess:
+    """Delegate a `cld chain <op>` (start|status|cancel) to the host broker, like ``broker_run_op``."""
+    return _broker_job_op("chain", op, args, repo, capture)
 
 
 def list_registered_repos() -> list[tuple[str, str, bool]]:

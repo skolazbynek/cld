@@ -30,6 +30,8 @@ No overlap: live anchor trees checked host-wide.
 
 **Broker:** SSH ForceCommand for tests, container enumeration, task-agent lifecycle and the GraphQL server. Runner and server containers get the same store-only mounts at `/repo` and a private 0600 copy of `.env`, read without following symlinks. See `broker/README.md`.
 
+**Broker run/chain:** a ticket container starts `cld run` / `cld chain` on a committed change in its own tree through the broker (`start|status|wait|cancel`, at most 2 live jobs). See skill `broker-run-chain`.
+
 **Messenger:** Mailbox at `~/.cld/mailboxes`. `send()/list_inbox()/read_message()/archive()` via MCP. Hop budgets; explicit reply obligations. See `docs/design-agent-messaging.md`.
 
 **Chain:** `cld chain <file.yaml>` runs declarative multi-step pipeline. Persistent accumulator; transient per-step branches.

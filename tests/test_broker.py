@@ -143,7 +143,7 @@ class TestSnapshotBeforeRevisionActions:
     def _commands(self, run_mock) -> list[list[str]]:
         return [c[0][0] for c in run_mock.call_args_list]
 
-    @pytest.mark.parametrize("action", ["run-tests", "graphql"])
+    @pytest.mark.parametrize("action", ["run-tests", "graphql", "run", "chain"])
     def test_ticket_snapshots_every_mounted_repo_before_ssh(self, configured, monkeypatch, action):
         monkeypatch.setenv("CLD_TICKET_MANIFEST", self._MANIFEST)
         with patch("cld.broker.subprocess.run", return_value=_cp()) as run:
@@ -228,6 +228,36 @@ class TestBrokerTaskAgentOp:
     def test_propagates_exit_code(self, configured):
         with patch("cld.broker.subprocess.run", return_value=_cp(returncode=2)):
             assert broker.broker_task_agent_op("shutdown", ["--all"]) == 2
+
+
+class TestBrokerJobOps:
+    """`run` and `chain` send an optional leading --repo, then the op, then its args."""
+
+    @pytest.mark.parametrize(("helper", "action"), [
+        (broker.broker_run_op, "run"), (broker.broker_chain_op, "chain"),
+    ], ids=["run", "chain"])
+    def test_uses_its_own_action(self, configured, helper, action):
+        with patch("cld.broker.subprocess.run", return_value=_cp()) as run:
+            helper("start", "@x", "-r", "abc")
+        assert run.call_args[0][0][-1].startswith(f"{action} cld_agent_cld ")
+        assert _argv_of(run) == ["start", "@x", "-r", "abc"]
+
+    def test_repo_leads_the_op(self, configured):
+        with patch("cld.broker.subprocess.run", return_value=_cp()) as run:
+            broker.broker_run_op("start", "@x", repo="api")
+        assert _argv_of(run) == ["--repo", "api", "start", "@x"]
+
+    def test_streams_by_default_and_captures_on_request(self, configured):
+        with patch("cld.broker.subprocess.run", return_value=_cp()) as run:
+            broker.broker_chain_op("status")
+            assert run.call_args.kwargs["capture_output"] is False
+            broker.broker_chain_op("status", "c", capture=True)
+            assert run.call_args.kwargs["capture_output"] is True
+
+    def test_returns_the_completed_process(self, configured):
+        with patch("cld.broker.subprocess.run", return_value=_cp(returncode=3, stdout="out")):
+            result = broker.broker_run_op("cancel", "run_x")
+        assert (result.returncode, result.stdout) == (3, "out")
 
 
 class TestListRegisteredRepos:

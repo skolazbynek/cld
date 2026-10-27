@@ -7,14 +7,18 @@ say so instead of failing obscurely. See docs/design-cli-split.md.
 """
 
 import os
+import subprocess
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import typer
 
 from cld.cli_msg import handle_errors as _handle_errors, msg_app
 from cld.config import Config
-from cld.broker import broker_available, broker_task_agent_op, list_registered_repos, run_action
+from cld.broker import (
+    broker_available, broker_chain_op, broker_run_op, broker_task_agent_op, list_registered_repos, run_action,
+)
 from cld.log import get_logger, setup_logging
 from cld.manifest import TicketManifest
 from cld.prompts import list_prompt_items
@@ -37,16 +41,6 @@ def main(ctx: typer.Context):
     """cld inside a container: task-agents, mailbox messaging, the broker."""
     if ctx.invoked_subcommand is None:
         _host_only("cld")
-
-
-@app.command("run", hidden=True, context_settings=_ANY_ARGS)
-def run_stub(ctx: typer.Context):
-    _host_only("cld run")
-
-
-@app.command("chain", hidden=True, context_settings=_ANY_ARGS)
-def chain_stub(ctx: typer.Context):
-    _host_only("cld chain")
 
 
 @app.command("build", hidden=True, context_settings=_ANY_ARGS)
@@ -270,6 +264,208 @@ def task_agent_transcript(
     print_task_agent_transcript(cfg, resolve_task_agent(cfg, name))
 
 
+# --- Runs and chains ----------------------------------------------------------
+
+# `wait` stays under the agent's 10-minute command limit.
+_WAIT_MAX_SECONDS = 540
+_WAIT_POLL_SECONDS = 15
+_WAIT_TIMEOUT_EXIT = 124
+
+
+def _job_op(
+    kind: Literal["run", "chain"], op: str, *args: str, repo: str = "", capture: bool = False,
+) -> subprocess.CompletedProcess:
+    """Send `cld <kind> <op>` through the broker; the helper is picked late so tests can patch it."""
+    if not broker_available():
+        typer.echo(
+            f"Error: the host broker is not configured for this container, so `cld {kind}` "
+            "cannot reach the host. Set `broker_key` (and `broker_known_hosts`) "
+            "in cld config and restart this container.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    helper = broker_run_op if kind == "run" else broker_chain_op
+    return helper(op, *args, repo=repo, capture=capture)
+
+
+def _repo_workspace(repo: str) -> str:
+    """This container's workspace of *repo*, where a revset means this ticket's own tree."""
+    raw = os.environ.get("CLD_TICKET_MANIFEST")
+    if not raw:
+        raise ValueError("`cld run` and `cld chain` work only in a ticket container")
+    manifest = TicketManifest.from_json(raw)
+    names = [entry.name for entry in manifest.repos]
+    if not repo and len(names) != 1:
+        raise ValueError(f"this ticket mounts {len(names)} repos -- pass --repo <name> ({', '.join(names)})")
+    if repo and repo not in names:
+        raise ValueError(f"repo '{repo}' is not mounted here -- its base must lie in your own tree ({', '.join(names)})")
+    return f"/workspace/{manifest.ticket}/{repo or names[0]}"
+
+
+def _jj_change_ids(workspace: str, revset: str) -> list[str]:
+    result = subprocess.run(
+        ["jj", "-R", workspace, "log", "-r", revset, "--no-graph", "-T", 'change_id ++ "\\n"'],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"cannot resolve revision '{revset}': {result.stderr.strip()}")
+    return result.stdout.split()
+
+
+def _resolve_base_change_id(workspace: str, revision: str) -> str:
+    """Resolve *revision* in this workspace to the one change id the broker gets.
+
+    The host would read an ``@``-style revset in its own repo, not in this ticket's
+    workspace; a change id means the same commit on both sides. A working-copy commit
+    is refused because it changes on every snapshot.
+    """
+    ids = _jj_change_ids(workspace, revision)
+    if len(ids) != 1:
+        raise ValueError(f"revision '{revision}' must resolve to exactly one change, got {len(ids)}")
+    if _jj_change_ids(workspace, f"{ids[0]} & working_copies()"):
+        raise ValueError(
+            f"revision '{revision}' is a working-copy commit, which changes on every snapshot. "
+            "Run `jj new` first and pass the parent change, or pick another committed change."
+        )
+    return ids[0]
+
+
+def _job_start(
+    kind: Literal["run", "chain"], refs: list[str], name: str, prompt: str, model: str, revision: str, repo: str,
+) -> None:
+    if kind == "chain" and not (refs and refs[0].startswith("@")):
+        raise ValueError("`cld chain start` needs `@<chain-name>` as the first argument")
+    change_id = _resolve_base_change_id(_repo_workspace(repo), revision)
+    argv = _task_agent_start_argv(refs, name, prompt, "", model, change_id, [])
+    raise typer.Exit(_job_op(kind, "start", *argv, repo=repo).returncode)
+
+
+def _job_status(kind: Literal["run", "chain"], name: str | None) -> None:
+    raise typer.Exit(_job_op(kind, "status", *([name] if name else [])).returncode)
+
+
+def _job_cancel(kind: Literal["run", "chain"], name: str) -> None:
+    raise typer.Exit(_job_op(kind, "cancel", name).returncode)
+
+
+def _job_wait(kind: Literal["run", "chain"], name: str, timeout: int) -> None:
+    """Poll `status <name>` until the state leaves `running`; exit 124 when *timeout* runs out."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = _job_op(kind, "status", name, capture=True)
+        if result.returncode != 0:
+            typer.echo(result.stderr.strip() or result.stdout.strip(), err=True)
+            raise typer.Exit(result.returncode)
+        state = next((line.partition(":")[2].strip() for line in result.stdout.splitlines()
+                      if line.startswith("state:")), None)
+        if state is None:
+            raise RuntimeError(f"the broker's status of '{name}' has no state line:\n{result.stdout}")
+        if state != "running":
+            typer.echo(result.stdout.rstrip())
+            raise typer.Exit(0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            typer.echo(result.stdout.rstrip())
+            typer.echo(f"Timed out after {timeout}s: '{name}' is still running. Wait again.", err=True)
+            raise typer.Exit(_WAIT_TIMEOUT_EXIT)
+        time.sleep(min(_WAIT_POLL_SECONDS, remaining))
+
+
+_REFS_HELP = "Prompt refs in order: @<ref> resolved host-side, or a path in this container (folded into -p)"
+_REPO_HELP = "Repo to target: a name mounted in this ticket. Omit when it mounts exactly one repo."
+_REVISION_HELP = "Base change in your own tree, committed (not the working copy). Resolved here to a change id."
+_TIMEOUT_HELP = f"Seconds to wait, at most {_WAIT_MAX_SECONDS} (the default); exit {_WAIT_TIMEOUT_EXIT} on timeout"
+
+run_app = typer.Typer(help="One-shot headless runs, launched on the host (see skill broker-run-chain).")
+chain_app = typer.Typer(help="Declarative multi-step chains, launched on the host (see skill broker-run-chain).")
+app.add_typer(run_app, name="run")
+app.add_typer(chain_app, name="chain")
+
+
+@run_app.command("start")
+@_handle_errors
+def run_start(
+    refs: Optional[list[str]] = typer.Argument(None, help=_REFS_HELP),
+    revision: str = typer.Option(..., "-r", "--revision", help=_REVISION_HELP),
+    name: str = typer.Option("", "-n", "--name", help="Run name (default: random)"),
+    model: str = typer.Option("", "-m", "--model", help="Claude model (e.g. opus, sonnet)"),
+    prompt: str = typer.Option("", "-p", "--prompt", help="Inline task, appended after the refs"),
+    repo: str = typer.Option("", "--repo", help=_REPO_HELP),
+):
+    """Start a run on top of -r. Prints `started: <name>`."""
+    setup_logging(Config.from_env())
+    _job_start("run", refs or [], name, prompt, model, revision, repo)
+
+
+@run_app.command("status")
+@_handle_errors
+def run_status(name: Optional[str] = typer.Argument(None, help="Run name; omit for the list")):
+    """List this ticket's runs, or show one in detail."""
+    setup_logging(Config.from_env())
+    _job_status("run", name)
+
+
+@run_app.command("wait")
+@_handle_errors
+def run_wait(
+    name: str = typer.Argument(..., help="Run name"),
+    timeout: int = typer.Option(_WAIT_MAX_SECONDS, "--timeout", min=0, max=_WAIT_MAX_SECONDS, help=_TIMEOUT_HELP),
+):
+    """Wait until the run is no longer running, then print its detail."""
+    setup_logging(Config.from_env())
+    _job_wait("run", name, timeout)
+
+
+@run_app.command("cancel")
+@_handle_errors
+def run_cancel(name: str = typer.Argument(..., help="Run name")):
+    """Stop a live run. Work committed so far stays on its bookmark."""
+    setup_logging(Config.from_env())
+    _job_cancel("run", name)
+
+
+@chain_app.command("start")
+@_handle_errors
+def chain_start(
+    refs: Optional[list[str]] = typer.Argument(None, help="`@<chain-name>` first, then the initial brief. " + _REFS_HELP),
+    revision: str = typer.Option(..., "-r", "--revision", help=_REVISION_HELP),
+    name: str = typer.Option("", "-n", "--name", help="Chain name (default: the chain's own)"),
+    model: str = typer.Option("", "-m", "--model", help="Claude model (e.g. opus, sonnet)"),
+    prompt: str = typer.Option("", "-p", "--prompt", help="Inline brief, appended after the refs"),
+    repo: str = typer.Option("", "--repo", help=_REPO_HELP),
+):
+    """Start a chain on top of -r. Prints `started: <name>`."""
+    setup_logging(Config.from_env())
+    _job_start("chain", refs or [], name, prompt, model, revision, repo)
+
+
+@chain_app.command("status")
+@_handle_errors
+def chain_status(name: Optional[str] = typer.Argument(None, help="Chain name; omit for the list")):
+    """List this ticket's chains, or show one in detail."""
+    setup_logging(Config.from_env())
+    _job_status("chain", name)
+
+
+@chain_app.command("wait")
+@_handle_errors
+def chain_wait(
+    name: str = typer.Argument(..., help="Chain name"),
+    timeout: int = typer.Option(_WAIT_MAX_SECONDS, "--timeout", min=0, max=_WAIT_MAX_SECONDS, help=_TIMEOUT_HELP),
+):
+    """Wait until the chain is no longer running, then print its detail."""
+    setup_logging(Config.from_env())
+    _job_wait("chain", name, timeout)
+
+
+@chain_app.command("cancel")
+@_handle_errors
+def chain_cancel(name: str = typer.Argument(..., help="Chain name")):
+    """Stop a live chain. Work committed so far stays on its bookmark."""
+    setup_logging(Config.from_env())
+    _job_cancel("chain", name)
+
+
 # --- Mailbox messaging --------------------------------------------------------
 app.add_typer(msg_app, name="msg")
 
@@ -281,7 +477,7 @@ app.add_typer(msg_app, name="msg")
 @_handle_errors
 def broker(
     ctx: typer.Context,
-    action: str = typer.Argument(..., help="Broker action: run-tests, list-containers, task-agent, graphql"),
+    action: str = typer.Argument(..., help="Broker action: run-tests, list-containers, task-agent, graphql, run, chain"),
 ):
     """Run a host-side action through the cld broker (docs/design-cld-broker.md).
 
