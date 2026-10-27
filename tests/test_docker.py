@@ -1861,6 +1861,9 @@ def jj_home(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(home / "state"))
     monkeypatch.delenv("JJ_CONFIG", raising=False)
+    # With no config record in HOME, jj run inside a workspace on a read-only store
+    # (the broker runner, a ticket container) rewrites that store's config ids and fails.
+    monkeypatch.chdir(tmp_path)
 
 
 @pytest.fixture(params=list(_INIT_COMMANDS))

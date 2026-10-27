@@ -39,10 +39,12 @@ def _jj_has_secure_config() -> bool:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
     config = tmp_path / "jj-config.toml"
     config.write_text('[user]\nname = "test"\nemail = "test@localhost"\n')
     (tmp_path / "home").mkdir()
+    # Out of the runner's own workspace: see tests/test_docker.py:jj_home.
+    monkeypatch.chdir(tmp_path)
     return {**os.environ, "PATH": f"{SCRIPTS}:{os.environ['PATH']}", "JJ_CONFIG": str(config),
             "HOME": str(tmp_path / "home"), "HOSTNAME": "abc123",
             "GQL_WORKSPACE": "gql-abc123", "PROJECT_SUBDIR": "."}

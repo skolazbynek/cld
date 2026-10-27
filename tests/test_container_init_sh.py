@@ -214,10 +214,12 @@ class _RealJjOrigin:
     BOOKMARK = "cld_ticket_ro"
 
     @pytest.fixture
-    def env(self, tmp_path):
+    def env(self, tmp_path, monkeypatch):
         config = tmp_path / "jj-config.toml"
         config.write_text('[user]\nname = "test"\nemail = "test@localhost"\n')
         (tmp_path / "home").mkdir()
+        # Out of the caller's own workspace: see tests/test_docker.py:jj_home.
+        monkeypatch.chdir(tmp_path)
         python_bin = str(Path(sys.executable).parent)
         return {**os.environ, "JJ_CONFIG": str(config), "HOME": str(tmp_path / "home"),
                 "PATH": f"{python_bin}:{os.environ['PATH']}", "PYTHONPATH": str(REPO_ROOT),
