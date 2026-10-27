@@ -29,6 +29,10 @@
 # operator's own allowlist) -- see resolve_task_agent_repo; its other ops need
 # no repo at all (docs/design-ticket-task-agents.md).
 #
+# The `run` / `chain` actions (ticket callers only) start `cld run` / `cld chain run` on a
+# commit inside the caller's own editable tree, and report on or cancel the caller's own
+# jobs (docs/design-broker-run-chain.md).
+#
 # The regex below is a format check only, not an authorization boundary --
 # the session doubles as the docker container name, and the label read below
 # (set at launch, trusted) is what actually gates repo/target access.
@@ -43,7 +47,9 @@
 # venv and no `cld` import.
 import argparse
 import base64
+import calendar
 import errno
+import fcntl
 import hashlib
 import http.client
 import json
@@ -59,7 +65,8 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache, cached_property
 from pathlib import Path
@@ -1032,6 +1039,431 @@ def action_task_agent(caller: Caller, argv: list[str]) -> None:
     # adding it there would just make cld reject the argv.
     parent = [] if op == "logs" else ["--parent", caller.name]
     _exec(["cld", "task-agent", op, *parent, *args])
+
+
+# ---- run / chain: jobs a ticket starts on the host (docs/design-broker-run-chain.md §5) ----
+# `cld run` and `cld chain run` re-run on the host with a rebuilt argv: the broker parses the
+# caller's tokens into fields and builds the command from them, so nothing it has not checked
+# can cross. The base must be one committed change inside the caller's own editable tree.
+# Launches are recorded in ~/.cld/broker-jobs/<caller session>/ -- only to enforce the cap and to
+# scope status / cancel to the caller's own jobs; nothing in a record reaches the job.
+
+_JOB_CAP = 2
+# A record is "launching" until the host command shows its container or state.json: the cap
+# has to count a start that is between the lock and the host command, or parallel starts pass it.
+_JOB_LAUNCH_GRACE = 120
+_JOB_KEEP_SECONDS = 7 * 24 * 3600
+_JOB_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+_JOB_OPS = ("start", "status", "cancel")
+# The only options of `cld run` / `cld chain run` that take a *separate* value and that the
+# broker passes on; any other `-*` token is refused, so the arity is never guessed.
+_JOB_VALUE_OPTS = {"-n": "name", "--name": "name", "-m": "model", "--model": "model",
+                   "-p": "prompt", "--prompt": "prompt", "-r": "revision", "--revision": "revision"}
+_JOB_DENIED_OPTS = ("--shared-anchor", "--no-detach", "--force", "--parent")
+_JOB_TEXT_LINES = 5
+_JOB_TEXT_WIDTH = 200
+
+
+class Job(NamedTuple):
+    """One launch record. *name* is the run's session (``run_<suffix>``) or the chain name,
+    *base* the change id the job was anchored on."""
+
+    kind: str
+    name: str
+    repo: str
+    base: str
+    started_at: int
+
+
+class JobArgs(NamedTuple):
+    refs: list[str]
+    name: str
+    model: str
+    prompt: str
+    revision: str
+
+
+def parse_job_start(kind: str, args: list[str]) -> JobArgs:
+    """The checked fields of a `start` argv. Positionals are `@refs` (a chain's first is
+    `@<name>`), the value options are listed in _JOB_VALUE_OPTS in both spellings, `-r` is
+    required. Exits 2 on anything else."""
+    for arg in args:
+        if arg == "--":
+            _die("denied: '--' is not accepted", 2)
+        if denied := next((opt for opt in _JOB_DENIED_OPTS if arg == opt or arg.startswith(f"{opt}=")), None):
+            _die(f"denied: {denied} is not allowed from a container", 2)
+    values: dict[str, str] = {}
+    refs: list[str] = []
+    tokens = iter(args)
+    for arg in tokens:
+        opt, equals, inline = arg.partition("=")
+        if arg in _JOB_VALUE_OPTS:
+            field, value = _JOB_VALUE_OPTS[arg], next(tokens, None)
+        elif equals and opt.startswith("--") and opt in _JOB_VALUE_OPTS:
+            field, value = _JOB_VALUE_OPTS[opt], inline
+        elif arg.startswith("-"):
+            _die(f"denied: option '{arg}' is not accepted (allowed: -n -m -p -r and their long forms)", 2)
+        else:
+            refs.append(arg)
+            continue
+        if value is None:
+            _die(f"denied: {arg} needs a value", 2)
+        if field in values:
+            _die(f"denied: {field} is given twice", 2)
+        values[field] = value
+    if kind == "chain" and not (refs and re.fullmatch(r"@[A-Za-z0-9_-]+", refs[0])):
+        _die("denied: chain start needs @<name> first, with <name> matching [A-Za-z0-9_-]+", 2)
+    for ref in refs:
+        if not ref.startswith("@") or ref == "@":
+            _die(f"denied: prompt ref '{ref}' must be an @ref, not a path", 2)
+    if (name := values.get("name", "")) and not _JOB_NAME_RE.fullmatch(name):
+        _die(f"denied: -n '{name}' must match {_JOB_NAME_RE.pattern}", 2)
+    if not values.get("revision"):
+        _die("denied: -r <revision> is required", 2)
+    return JobArgs(refs, name, values.get("model", ""), values.get("prompt", ""), values["revision"])
+
+
+def require_ticket(caller: Caller, action: str) -> None:
+    """Only a ticket container starts jobs: agents never spawn (design-task-agents D14)."""
+    if not (isinstance(caller, LabelCaller) and caller.kind == "ticket"):
+        _die(f"denied: {action} is only for ticket containers", 3)
+
+
+# The revset cld/docker.py:_effective_anchor uses for an isolated anchor's scratch commit
+# (a test keeps the two copies equal). The broker imports nothing from cld.
+def effective_anchor_revset(session: str) -> str:
+    return (
+        f'heads(ancestors(bookmarks(exact:"{session}")) & '
+        # The trailing space before the wildcard is load-bearing, as in docker.py.
+        f"description(glob:'cld anchor: {session} *'))"
+    )
+
+
+def _jj(repo: str, *args: str) -> str | None:
+    try:
+        return host_jj(repo, *args)
+    except StoreRefused as e:
+        _die(str(e), 3)
+
+
+def _jj_nonempty(repo: str, revset: str) -> bool:
+    if (out := _jj(repo, "log", "--no-graph", "-r", revset, "-T", "commit_id")) is None:
+        _die("denied: jj could not evaluate the base check", 3)
+    return bool(out.strip())
+
+
+def caller_effective_anchor(caller: Caller, repo: str) -> str:
+    """Change id of the root of *caller*'s editable tree in *repo*: its scratch commit in
+    isolated mode, its base in shared mode. Base and mode come from the host-set launch manifest."""
+    try:
+        entries = json.loads(_label(caller.name, "org.cld.manifest") or "")["repos"]
+        entry = next(e for e in entries if os.path.realpath(e["path"]) == os.path.realpath(repo))
+        base, mode = entry["anchor_base"], entry.get("anchor_mode", "isolated")
+    except (ValueError, KeyError, TypeError, StopIteration):
+        _die(f"denied: no anchor of {caller.name} for this repo in its launch manifest", 3)
+    if not (isinstance(base, str) and re.fullmatch(r"[0-9a-z]+", base)):
+        _die(f"denied: the anchor base of {caller.name} in its launch manifest is not an id", 3)
+    if mode != "isolated":
+        return base
+    found = _jj(repo, "log", "--no-graph", "-n", "1", "-r", effective_anchor_revset(caller.name), "-T", "change_id")
+    if not (found and found.strip()):
+        _die(f"denied: the scratch commit of {caller.name} was not found -- cannot tell its editable tree", 3)
+    return found.strip()
+
+
+def _job_commits(repo: str, revset: str) -> list[str]:
+    """Up to two ``<commit id> <change id>`` rows of *revset*; none when it does not resolve."""
+    out = _jj(repo, "log", "--no-graph", "-n", "2", f"--revisions={revset}", "-T",
+              'commit_id ++ " " ++ change_id ++ "\\n"')
+    return (out or "").splitlines()
+
+
+def resolve_job_base(caller: Caller, repo: str, revision: str) -> str:
+    """Change id of the one commit *revision* names, once it is a commit the caller may build
+    on: inside its tree and not any workspace's working copy. Exits 3 otherwise. The host
+    command gets the change id, so it must resolve the same commit the checks saw."""
+    rows = _job_commits(repo, revision)
+    if len(rows) != 1:
+        _die(f"denied: -r '{revision}' must resolve to exactly one commit (none or several found)", 3)
+    commit, change = rows[0].split()
+    if _job_commits(repo, change) != rows:
+        _die(f"denied: change id {change} is divergent or shadowed by a bookmark -- pick another commit", 3)
+    # commit_id() / change_id() read the id namespace only: a bookmark named like an id cannot shadow it.
+    if not _jj_nonempty(repo, f"commit_id({commit}) & descendants(change_id({caller_effective_anchor(caller, repo)}))"):
+        _die(f"denied: -r '{revision}' is outside the editable tree of {caller.name}", 3)
+    if _jj_nonempty(repo, f"commit_id({commit}) & working_copies()"):
+        _die(f"denied: -r '{revision}' is a working-copy commit, which changes with every snapshot -- "
+             "run `jj new` first, or pick its parent change", 3)
+    return change
+
+
+def _job_dir(caller: Caller) -> Path:
+    return Path.home() / ".cld" / "broker-jobs" / caller.name
+
+
+@contextmanager
+def _job_lock(caller: Caller) -> Iterator[None]:
+    """Exclusive lock on the caller's job folder, so two starts cannot both pass the cap."""
+    folder = _job_dir(caller)
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    with open(folder / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _job_write(caller: Caller, job: Job) -> None:
+    path = _job_dir(caller) / f"{job.kind}-{job.name}.json"
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as file:
+        json.dump(job._asdict(), file)
+    os.replace(tmp, path)
+
+
+def _job_records(caller: Caller) -> list[Job]:
+    """The caller's records, oldest first. Finished ones past the retention are removed here,
+    so every call sweeps."""
+    jobs = []
+    for path in _job_dir(caller).glob("*.json"):
+        try:
+            job = Job(**json.loads(path.read_text()))
+            old = time.time() - job.started_at > _JOB_KEEP_SECONDS
+        except (OSError, ValueError, TypeError):
+            continue
+        if old and not _job_running(job):
+            path.unlink(missing_ok=True)
+        else:
+            jobs.append(job)
+    return sorted(jobs, key=lambda job: job.started_at)
+
+
+def _chain_state(job: Job) -> dict | None:
+    try:
+        data = read_repo_file(job.repo, f".cld/chains/chain_{job.name}/state.json")
+        state = json.loads(data) if data else None
+    except (SecretsRefused, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _pid_alive(pid: object) -> bool:
+    if not (isinstance(pid, int) and pid > 0):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _job_launching(job: Job) -> bool:
+    return time.time() - job.started_at < _JOB_LAUNCH_GRACE
+
+
+def _job_running(job: Job) -> bool:
+    """Liveness (design §5.6): a run's container is running; a chain's state.json says running
+    and its pid is alive. A young record with no sign of the job yet counts as live."""
+    if job.kind == "run":
+        running = _out("docker", "inspect", "-f", "{{.State.Running}}", job.name)
+        return _job_launching(job) if running is None else running == "true"
+    state = _chain_state(job)
+    if state is None:
+        return _job_launching(job)
+    if state.get("status") != "running":
+        return False
+    return _pid_alive(state.get("pid")) or (state.get("pid") == 0 and _job_launching(job))
+
+
+def _jj_file(job: Job, revision: str, path: str) -> str | None:
+    return _jj(job.repo, "file", "show", "-r", revision, path)
+
+
+def _jj_json(job: Job, revision: str, path: str) -> dict | None:
+    """A JSON object committed on *revision*: None when the file is absent, {} when unreadable."""
+    if (raw := _jj_file(job, revision, path)) is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _status_text(value: object) -> str:
+    return value if isinstance(value, str) and value else "unknown"
+
+
+def _job_state(job: Job) -> str:
+    """running, a run's summary status (success, failed, no_changes, ...), a chain's state.json
+    status (success, failed, interrupted, ...), `stale` (running, runner gone) or `gone`."""
+    if _job_running(job):
+        return "running"
+    if job.kind == "run":
+        summary = _jj_json(job, job.name, f"agent-output-{job.name}/summary.json")
+        return "gone" if summary is None else _status_text(summary.get("status"))
+    state = _chain_state(job)
+    if state is None:
+        return "gone"
+    return "stale" if state.get("status") == "running" else _status_text(state.get("status"))
+
+
+def _clip(text: str) -> str:
+    return text[:_JOB_TEXT_WIDTH]
+
+
+def _number(value: object, template: str) -> str | None:
+    return template.format(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def _iso_epoch(text: object) -> int | None:
+    try:
+        return calendar.timegm(time.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def _job_detail(job: Job) -> list[str]:
+    """The `key: value` lines of `status <name>`: name, kind and state first, the rest as
+    available (design §5.5). Capped, and relative to the repo: no host path is printed."""
+    state = _job_state(job)
+    fields: dict[str, str | None] = {"name": job.name, "kind": job.kind, "state": state}
+    failure = ""
+    if job.kind == "run":
+        summary = _jj_json(job, job.name, f"agent-output-{job.name}/summary.json")
+        result = _jj_json(job, job.name, f"agent-output-{job.name}/result.json") or {}
+        fields |= {"bookmark": job.name, "base": job.base,
+                   "cost": _number(result.get("cost_usd", result.get("total_cost_usd")), "{:.4f}"),
+                   "duration": _number((summary or {}).get("duration_seconds"), "{:.0f}s"),
+                   "outputs": None if summary is None else f"agent-output-{job.name}/"}
+        failure = _jj_file(job, job.name, f"agent-output-{job.name}/AGENT-FAILURE.md") or ""
+    else:
+        chain = _chain_state(job) or {}
+        started, finished = _iso_epoch(chain.get("started_at")), _iso_epoch(chain.get("finished_at"))
+        steps = [step for step in chain.get("completed_steps") or [] if isinstance(step, dict)]
+        fields |= {"bookmark": f"chain_{job.name}", "base": job.base,
+                   "cost": _number(chain.get("total_cost_usd"), "{:.4f}"),
+                   "duration": None if started is None else f"{(finished or int(time.time())) - started}s",
+                   "outputs": f"chain-outputs/{job.name}/" if steps else None,
+                   "steps": " ".join(f"{step.get('name')}={step.get('status')}" for step in steps) or None}
+        failure = chain.get("failure_reason") if isinstance(chain.get("failure_reason"), str) else ""
+    lines = [f"{key}: {_clip(value)}" for key, value in fields.items() if value is not None]
+    if shown := [_clip(line) for line in failure.splitlines() if line.strip()][:_JOB_TEXT_LINES]:
+        lines += [f"failure: {shown[0]}", *(f"  {line}" for line in shown[1:])]
+    return lines
+
+
+def _job_name_free(kind: str, repo: str, name: str, jobs: list[Job]) -> bool:
+    if any(job.kind == kind and job.name == name and _job_running(job) for job in jobs):
+        return False
+    if kind == "run":  # a stopped container of that name would still block `docker run --name`
+        return _out("docker", "inspect", "-f", "{{.State.Running}}", name) is None
+    return (_chain_state(Job(kind, name, repo, "", 0)) or {}).get("status") != "running"
+
+
+def _job_pick_name(kind: str, repo: str, requested: str, jobs: list[Job]) -> str:
+    if kind == "run" and not requested:
+        while not _job_name_free(kind, repo, name := f"run_{os.urandom(3).hex()}", jobs):
+            pass
+        return name
+    name = f"run_{requested}" if kind == "run" else requested
+    if not _job_name_free(kind, repo, name, jobs):
+        _die(f"denied: a {kind} named '{name}' already exists or is running", 3)
+    return name
+
+
+def _job_command(kind: str, args: JobArgs, name: str, change: str) -> list[str]:
+    command = (["cld", "run", *args.refs, "-n", name.removeprefix("run_")] if kind == "run"
+               else ["cld", "chain", "run", *args.refs, "-n", name])
+    command += ["-r", change]
+    if args.model:
+        command += ["-m", args.model]
+    if args.prompt:
+        command += ["-p", args.prompt]
+    return command
+
+
+def _job_start(caller: Caller, kind: str, selector: str, argv: list[str]) -> NoReturn:
+    args = parse_job_start(kind, argv)
+    repo = caller.repo(selector)
+    if _kind(f"{repo}/.jj") is None:
+        _die(f"denied: repo '{Path(repo).name}' is not jj-backed -- {kind} start needs jj", 3)
+    change = resolve_job_base(caller, repo, args.revision)
+    with _job_lock(caller):
+        jobs = _job_records(caller)
+        if len(live := [job.name for job in jobs if _job_running(job)]) >= _JOB_CAP:
+            _die(f"denied: {caller.name} already has {len(live)} live jobs ({', '.join(live)}) -- "
+                 "wait for one to finish or cancel it", 3)
+        name = _job_pick_name(kind, repo, args.name or (args.refs[0][1:] if kind == "chain" else ""), jobs)
+        _job_write(caller, Job(kind, name, repo, change, int(time.time())))
+    try:
+        os.chdir(repo)
+    except OSError:
+        _die(f"cannot cd to {repo}", 3)
+    print(f"started: {name}")
+    _exec(_job_command(kind, args, name, change))
+
+
+def _find_job(caller: Caller, kind: str, selector: str, name: str) -> Job:
+    if not _JOB_NAME_RE.fullmatch(name):
+        _die(f"denied: '{name}' is not a {kind} name", 2)
+    repo = caller.repo(selector) if selector else ""
+    if job := next((job for job in _job_records(caller)
+                    if job.kind == kind and job.name == name and repo in ("", job.repo)), None):
+        return job
+    _die(f"denied: {caller.name} has no {kind} '{name}' started through the broker", 3)
+
+
+def _job_status(caller: Caller, kind: str, selector: str, args: list[str]) -> None:
+    if len(args) > 1:
+        _die("denied: status takes at most one name", 2)
+    if args:
+        print("\n".join(_job_detail(_find_job(caller, kind, selector, args[0]))))
+        return
+    repo = caller.repo(selector) if selector else ""
+    for job in _job_records(caller):
+        if job.kind == kind and repo in ("", job.repo):
+            print(f"{job.name}\t{job.kind}\t{_job_state(job)}\t{job.base}")
+
+
+def _job_cancel(caller: Caller, kind: str, selector: str, args: list[str]) -> None:
+    if len(args) != 1:
+        _die("denied: cancel takes exactly one name", 2)
+    job = _find_job(caller, kind, selector, args[0])
+    # A stale chain is cancelled too: `cld chain cancel` is what marks it interrupted.
+    if (state := _job_state(job)) not in ("running", "stale"):
+        _die(f"denied: {kind} '{job.name}' is not running (state: {state})", 3)
+    if kind == "run":
+        _exec(["docker", "stop", job.name])
+    else:
+        try:
+            os.chdir(job.repo)
+        except OSError:
+            _die(f"cannot cd to {job.repo}", 3)
+        _exec(["cld", "chain", "cancel", job.name])
+
+
+# `run` and `chain` share everything: the argv is `[--repo <name>] <op> <args...>`, the kind
+# only picks the host command and the record's namespace.
+def _job_action(kind: str, caller: Caller, argv: list[str]) -> None:
+    require_ticket(caller, kind)
+    selector, rest = parse_repo_arg(argv)
+    if not rest:
+        _die(f"denied: {kind} needs an op", 2)
+    op, *args = rest
+    if op not in _JOB_OPS:
+        _die(f"denied: bad {kind} op '{op}'", 2)
+    {"start": _job_start, "status": _job_status, "cancel": _job_cancel}[op](caller, kind, selector, args)
+
+
+def action_run(caller: Caller, argv: list[str]) -> None:
+    _job_action("run", caller, argv)
+
+
+def action_chain(caller: Caller, argv: list[str]) -> None:
+    _job_action("chain", caller, argv)
 
 
 # ---- graphql: server lifecycle + credentialed queries over the broker -----

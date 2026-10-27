@@ -18,7 +18,9 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -2321,3 +2323,711 @@ class TestGraphqlStartLeftover:
         with pytest.raises(SystemExit):
             broker.do_graphql_start(broker.Scope("cld_ticket_x", "/repos/b"), "rev", "")
         assert forgotten == [("/repos/a", "gql-cld_ticket_x")]
+
+
+# ---- run / chain actions (docs/design-broker-run-chain.md §5) ------------------
+
+_JOB_DOCKER = r"""
+cmd="$1"; shift
+case "$cmd" in
+  inspect)
+    case "$*" in
+      *org.cld.kind*)     printf 'ticket\n' ;;
+      *org.cld.manifest*) printf '%s\n' "${FAKE_MANIFEST:-}" ;;
+      *State.Running*)
+        for last; do :; done
+        [ -f "$FAKE_DOCKER_DIR/state-$last" ] || exit 1
+        sleep "${FAKE_PROBE_SLEEP:-0}"
+        cat "$FAKE_DOCKER_DIR/state-$last" ;;
+      *range*)            printf '%s' "${FAKE_LABELS:-}" ;;
+    esac ;;
+  stop) printf '%s\n' "$*" >> "$FAKE_DOCKER_DIR/stops" ;;
+esac
+"""
+_JOB_CLD = r"""
+printf 'CWD %s\n' "$PWD"
+printf '%s\n' "$@"
+"""
+TICKET = broker.LabelCaller("cld_ticket_x", "ticket", "")
+OTHER_TICKET = broker.LabelCaller("cld_ticket_other", "ticket", "")
+_HOUR = 3600
+
+
+class _JobHost:
+    """A faked host for the run / chain actions: docker (containers and their running state, the
+    ticket's labels and manifest) and cld on PATH, a HOME for the launch records, one mounted repo."""
+
+    def __init__(self, tmp_path: Path, monkeypatch, repo: Path):
+        self.repo = repo
+        self.docker = tmp_path / "docker-state"
+        self.docker.mkdir()
+        (tmp_path / "home").mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("FAKE_DOCKER_DIR", str(self.docker))
+        self.monkeypatch = monkeypatch
+        _fakebin(tmp_path, monkeypatch, docker=_JOB_DOCKER, cld=_JOB_CLD)
+        self.mount(repo)
+
+    def mount(self, repo: Path, manifest: str = "") -> None:
+        for caller in (TICKET, OTHER_TICKET):  # the module-level callers cache their labels
+            caller.__dict__.pop("_mounts", None)
+        self.monkeypatch.setenv("FAKE_LABELS", f"org.cld.kind=ticket\norg.cld.repo.lide={repo}\n")
+        self.monkeypatch.setenv("FAKE_MANIFEST", manifest)
+
+    def container(self, name: str, running: bool) -> None:
+        (self.docker / f"state-{name}").write_text("true" if running else "false")
+
+    def seed(self, name: str, kind: str = "run", age: int = 0, caller=TICKET, base: str = "baseid") -> "broker.Job":
+        job = broker.Job(kind, name, str(self.repo), base, int(time.time()) - age)
+        broker._job_dir(caller).mkdir(parents=True, exist_ok=True)
+        broker._job_write(caller, job)
+        return job
+
+    def chain_state(self, name: str, **fields) -> None:
+        state = {"status": "running", "pid": os.getpid(), "started_at": "2026-10-27T10:00:00Z", "finished_at": None,
+                 "total_cost_usd": 0.0, "completed_steps": [], "failure_reason": "", **fields}
+        path = self.repo / ".cld" / "chains" / f"chain_{name}" / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+
+    def committed(self, files: dict[tuple[str, str], str]) -> None:
+        """Stub `jj file show -r <revision> <path>` for the status probes."""
+        def fake_host_jj(repo, *args, snapshot=False):
+            return files.get((args[3], args[4])) if args[:3] == ("file", "show", "-r") else None
+        self.monkeypatch.setattr(broker, "host_jj", fake_host_jj)
+
+
+@pytest.fixture
+def host(tmp_path, monkeypatch) -> _JobHost:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "repo" / ".jj").mkdir(parents=True)
+    return _JobHost(tmp_path, monkeypatch, tmp_path / "repo")
+
+
+@pytest.fixture
+def execs(monkeypatch) -> list[list[str]]:
+    """The argv the broker would exec; the call returns, so a test can look past it."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(broker, "_exec", calls.append)
+    return calls
+
+
+def _denied_with(action, caller, argv: list[str], capsys) -> tuple[int, str]:
+    with pytest.raises(SystemExit) as excinfo:
+        action(caller, argv)
+    return _exit_code(excinfo), capsys.readouterr().err
+
+
+class TestJobStartArgv:
+    """The start argv is parsed into fields and the host command rebuilt from them: only what the
+    broker checked crosses, with the option arity listed, in both spellings."""
+
+    @pytest.fixture(autouse=True)
+    def nothing_runs(self, monkeypatch):
+        monkeypatch.setattr(broker, "_exec", lambda argv: pytest.fail(f"exec {argv}"))
+        monkeypatch.setattr(broker, "resolve_job_base", lambda *args: pytest.fail("base checked"))
+
+    @pytest.mark.parametrize("action,kind", [(broker.action_run, "run"), (broker.action_chain, "chain")])
+    @pytest.mark.parametrize(
+        "argv,message",
+        [(["@a", "--", "/etc/passwd"], "'--' is not accepted"),
+         (["@a", "-p", "--"], "'--' is not accepted"),
+         (["@a", "--shared-anchor"], "--shared-anchor is not allowed"),
+         (["@a", "--shared-anchor=1"], "--shared-anchor is not allowed"),
+         (["@a", "--no-detach"], "--no-detach is not allowed"),
+         (["@a", "--force"], "--force is not allowed"),
+         (["@a", "--parent=cld_other"], "--parent is not allowed"),
+         (["@a", "/etc/passwd"], "must be an @ref, not a path"),
+         (["@a", "rel/path.md"], "must be an @ref, not a path"),
+         (["@a", "-p", "@x", "/etc/passwd"], "must be an @ref, not a path"),
+         (["@a", "--name=x", "/etc/passwd"], "must be an @ref, not a path"),
+         (["@a", "@"], "must be an @ref, not a path"),
+         (["@a", "-n", "a b"], "must match"),
+         (["@a", "-n", "a/b"], "must match"),
+         (["@a", "--name=a.b"], "must match"),
+         (["@a", "-r"], "needs a value"),
+         (["@a", "--model"], "needs a value"),
+         (["@a", "-nfoo"], "option '-nfoo' is not accepted"),
+         (["@a", "--other"], "option '--other' is not accepted"),
+         (["@a", "-n", "x", "--name=y"], "given twice"),
+         (["@a"], "-r <revision> is required"),
+         (["@a", "-r", ""], "-r <revision> is required")],
+        ids=["dash-dash", "dash-dash-as-value", "shared-anchor", "shared-anchor-eq", "no-detach", "force",
+             "parent-eq", "abs-path", "rel-path", "path-after-option-value", "path-after-eq-option", "bare-at",
+             "name-space", "name-slash", "name-dot-eq", "revision-no-value", "model-no-value",
+             "attached-short-value", "unknown-option", "name-twice", "no-revision", "empty-revision"],
+    )
+    def test_denied(self, capsys, action, kind, argv, message):
+        argv = argv if kind == "run" else ["@chain", *argv]
+        code, err = _denied_with(action, TICKET, ["start", *argv], capsys)
+        assert code == 2
+        assert message in err
+
+    @pytest.mark.parametrize("first", ["@a/b", "@../x", "@", "a", "-n", "@a b"], ids=["slash", "dotdot", "bare-at", "bare-name", "option", "space"])
+    def test_chain_name_must_be_a_bare_at_name(self, capsys, first):
+        argv = ["start", first, "-r", "x"] if first != "-n" else ["start", "-n", "x", "-r", "x"]
+        code, err = _denied_with(broker.action_chain, TICKET, argv, capsys)
+        assert code == 2
+        assert "chain start needs @<name> first" in err
+
+    def test_chain_without_a_name_denied(self, capsys):
+        assert _denied_with(broker.action_chain, TICKET, ["start", "-r", "x"], capsys)[0] == 2
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["@a", "@b", "-n", "n1", "-m", "opus", "-p", "text", "-r", "R"],
+         ["@a", "@b", "--name", "n1", "--model", "opus", "--prompt", "text", "--revision", "R"],
+         ["@a", "@b", "--name=n1", "--model=opus", "--prompt=text", "--revision=R"],
+         ["-r", "R", "@a", "-p", "text", "@b", "-m", "opus", "-n", "n1"]],
+        ids=["short", "long-separate", "long-equals", "options-between-positionals"],
+    )
+    def test_every_spelling_parses_the_same(self, argv):
+        assert broker.parse_job_start("run", argv) == broker.JobArgs(["@a", "@b"], "n1", "opus", "text", "R")
+
+    def test_an_option_value_may_look_like_anything(self):
+        parsed = broker.parse_job_start("run", ["-p", "fix cld/cli.py", "-m", "-odd", "-r", "@-"])
+        assert (parsed.prompt, parsed.model, parsed.revision) == ("fix cld/cli.py", "-odd", "@-")
+
+    @pytest.mark.parametrize("argv,message", [([], "needs an op"), (["--repo", "lide"], "needs an op"),
+                                              (["wait", "x"], "bad run op 'wait'")])
+    def test_op_is_required_and_listed(self, capsys, argv, message):
+        code, err = _denied_with(broker.action_run, TICKET, argv, capsys)
+        assert code == 2
+        assert message in err
+
+
+class TestJobCallerAndRepo:
+    @pytest.mark.parametrize("action", [broker.action_run, broker.action_chain])
+    @pytest.mark.parametrize("caller", [broker.LabelCaller("cld_agent_x", "task-agent", "/r"),
+                                        broker.LabelCaller("cld_run_x", "run", "/r"),
+                                        broker.CliCaller("cld_cli", "/r", "@")], ids=["task-agent", "run", "cli"])
+    @pytest.mark.parametrize("op", ["start", "status", "cancel"])
+    def test_only_a_ticket_may_call(self, capsys, action, caller, op):
+        code, err = _denied_with(action, caller, [op, "@a", "-r", "x"], capsys)
+        assert code == 3
+        assert "only for ticket containers" in err
+
+    def test_unmounted_repo_denied(self, host, capsys):
+        code, err = _denied_with(broker.action_run, TICKET, ["--repo", "nope", "start", "@a", "-r", "x"], capsys)
+        assert code == 3
+        assert "not mounted" in err
+
+    def test_git_repo_denied(self, host, tmp_path, capsys):
+        git_repo = tmp_path / "gitrepo"
+        (git_repo / ".git").mkdir(parents=True)
+        host.mount(git_repo)
+        code, err = _denied_with(broker.action_chain, TICKET, ["start", "@a", "-r", "x"], capsys)
+        assert code == 3
+        assert "not jj-backed" in err
+
+    def test_repo_selector_picks_the_mounted_repo(self, host, execs, monkeypatch):
+        monkeypatch.setattr(broker, "resolve_job_base", lambda caller, repo, revision: "chg")
+        broker.action_run(TICKET, ["--repo=lide", "start", "@a", "-n", "x", "-r", "R"])
+        assert execs == [["cld", "run", "@a", "-n", "x", "-r", "chg"]]
+        assert os.getcwd() == str(host.repo)
+
+
+def _have_jj() -> bool:
+    found = re.search(r"(\d+)\.(\d+)", subprocess.run(["jj", "--version"], capture_output=True, text=True).stdout) \
+        if shutil.which("jj") else None
+    return bool(found) and (int(found[1]), int(found[2])) >= (0, 38)
+
+
+class _Tree(NamedTuple):
+    """Change ids in a real jj repo. base A has two children, the sibling and the scratch commit S
+    (bookmark cld_ticket_x); inside is S's child, and the working copy sits on top of inside."""
+
+    repo: Path
+    base: str
+    scratch: str
+    inside: str
+    sibling: str
+    unrelated: str
+    wc: str
+
+
+@pytest.fixture
+def tree(tmp_path, monkeypatch) -> _Tree:
+    if not _have_jj():
+        pytest.skip("needs jj 0.38+")
+    config = tmp_path / "jj-config.toml"
+    config.write_text('[user]\nname = "test"\nemail = "test@localhost"\n')
+    monkeypatch.setenv("JJ_CONFIG", str(config))
+    repo = tmp_path / "repo"
+
+    def jj(*args: str) -> str:
+        return subprocess.run(["jj", "-R", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def change(revset: str) -> str:
+        return jj("log", "--no-graph", "-r", revset, "-T", "change_id")
+
+    subprocess.run(["jj", "git", "init", str(repo)], capture_output=True, check=True)
+    for flag in ("--repo", "--workspace"):  # creates the config ids the broker insists on
+        jj("config", "set", flag, "ui.color", "never")
+    jj("commit", "-m", "base")
+    base = change("@-")
+    jj("new", base, "-m", "sibling")
+    sibling = change("@")
+    jj("new", "root()", "-m", "unrelated")
+    unrelated = change("@")
+    jj("new", base, "-m", "cld anchor: cld_ticket_x mode=isolated")
+    jj("bookmark", "create", "cld_ticket_x", "-r", "@")
+    scratch = change("@")
+    jj("new", "-m", "inside")
+    inside = change("@")
+    jj("new")
+    monkeypatch.chdir(tmp_path)
+    return _Tree(repo, base, scratch, inside, sibling, unrelated, change("@"))
+
+
+def _manifest(tree: _Tree, mode: str = "isolated") -> str:
+    return json.dumps({"v": 1, "ticket": "x", "repos": [
+        {"name": "lide", "path": str(tree.repo), "anchor_base": tree.base, "anchor_mode": mode, "rev_source": "arg"}]})
+
+
+@pytest.fixture
+def jj_host(tree, tmp_path, monkeypatch) -> _JobHost:
+    host = _JobHost(tmp_path, monkeypatch, tree.repo)
+    host.mount(tree.repo, _manifest(tree))
+    return host
+
+
+class TestJobBaseCheck:
+    """Design §5.3 against a real jj repo: one commit, inside the caller's effective anchor tree,
+    not a working copy; the host command gets the change id the broker checked."""
+
+    def _start(self, argv_tail: list[str]) -> None:
+        broker.action_run(TICKET, ["start", "@a", "-n", "x", "-r", *argv_tail])
+
+    @pytest.mark.parametrize("pick", ["inside", "scratch"])
+    def test_inside_the_isolated_tree_starts(self, tree, jj_host, execs, capsys, pick):
+        self._start([getattr(tree, pick)])
+        assert execs == [["cld", "run", "@a", "-n", "x", "-r", getattr(tree, pick)]]
+        assert capsys.readouterr().out == "started: run_x\n"
+
+    def test_a_revset_is_passed_on_as_its_change_id(self, tree, jj_host, execs):
+        self._start(["@-"])  # the parent of the working copy
+        assert execs == [["cld", "run", "@a", "-n", "x", "-r", tree.inside]]
+
+    def test_a_commit_id_is_accepted_too(self, tree, jj_host, execs):
+        commit = subprocess.run(["jj", "-R", str(tree.repo), "log", "--no-graph", "-r", tree.inside, "-T", "commit_id"],
+                                capture_output=True, text=True, check=True).stdout
+        self._start([commit])
+        assert execs[0][-1] == tree.inside
+
+    @pytest.mark.parametrize("pick", ["base", "sibling", "unrelated"])
+    def test_outside_the_isolated_tree_denied(self, tree, jj_host, execs, capsys, pick):
+        # The base itself is outside too: the isolated tree starts at the scratch commit above it.
+        code, err = _denied_with(lambda caller, argv: self._start(argv), TICKET, [getattr(tree, pick)], capsys)
+        assert code == 3
+        assert "outside the editable tree" in err
+        assert execs == []
+
+    @pytest.mark.parametrize("pick,allowed", [("base", True), ("sibling", True), ("scratch", True), ("inside", True),
+                                              ("unrelated", False)])
+    def test_the_shared_tree_is_everything_below_the_base(self, tree, jj_host, execs, capsys, pick, allowed):
+        jj_host.mount(tree.repo, _manifest(tree, "shared"))
+        if allowed:
+            self._start([getattr(tree, pick)])
+            assert execs[0][-1] == getattr(tree, pick)
+        else:
+            assert _denied_with(lambda caller, argv: self._start(argv), TICKET, [getattr(tree, pick)], capsys)[0] == 3
+            assert execs == []
+
+    def test_a_working_copy_is_denied_even_inside_the_tree(self, tree, jj_host, execs, capsys):
+        code, err = _denied_with(lambda caller, argv: self._start(argv), TICKET, [tree.wc], capsys)
+        assert code == 3
+        assert "working-copy commit" in err and "jj new" in err
+        assert execs == []
+
+    @pytest.mark.parametrize("revset", ["children(" + "{base}" + ")", "none()", "nosuchthing", "all()"],
+                             ids=["several", "none", "unresolvable", "everything"])
+    def test_not_exactly_one_commit_denied(self, tree, jj_host, execs, capsys, revset):
+        code, err = _denied_with(lambda caller, argv: self._start(argv), TICKET,
+                                 [revset.format(base=tree.base)], capsys)
+        assert code == 3
+        assert "exactly one commit" in err
+        assert execs == []
+
+    def test_a_bookmark_named_like_the_change_id_cannot_redirect_the_host(self, tree, jj_host, execs, capsys):
+        subprocess.run(["jj", "-R", str(tree.repo), "bookmark", "create", tree.inside, "-r", tree.sibling],
+                       capture_output=True, check=True)
+        code, err = _denied_with(lambda caller, argv: self._start(argv), TICKET, [f"change_id({tree.inside})"], capsys)
+        assert code == 3
+        assert "shadowed by a bookmark" in err
+        assert execs == []
+
+    def test_the_scratch_commit_missing_denied(self, tree, jj_host, execs, capsys):
+        subprocess.run(["jj", "-R", str(tree.repo), "bookmark", "delete", "cld_ticket_x"], capture_output=True, check=True)
+        code, err = _denied_with(lambda caller, argv: self._start(argv), TICKET, [tree.inside], capsys)
+        assert code == 3
+        assert "scratch commit" in err
+
+    @pytest.mark.parametrize("manifest", ["", "not json", '{"repos": []}', '{"repos": [{"path": "/elsewhere"}]}'],
+                             ids=["absent", "garbled", "no-repos", "other-repo"])
+    def test_an_unreadable_manifest_denied(self, tree, jj_host, execs, capsys, manifest):
+        jj_host.mount(tree.repo, manifest)
+        code, err = _denied_with(lambda caller, argv: self._start(argv), TICKET, [tree.inside], capsys)
+        assert code == 3
+        assert "launch manifest" in err
+
+    def test_the_effective_anchor_revset_matches_the_launcher(self):
+        """cld/docker.py:_effective_anchor is the contract: the broker cannot import it, so it repeats it."""
+        seen: list[list[str]] = []
+
+        class Vcs:
+            def run(self, args):
+                seen.append(args)
+                return subprocess.CompletedProcess(args, 0, "scratchid\n", "")
+
+        occupant = {"name": "cld_ticket_x", "session": "cld_ticket_x", "mode": "isolated", "anchor_base": "baseid"}
+        cld_docker._effective_anchor(Vcs(), occupant)
+        assert seen[0][seen[0].index("-r") + 1] == broker.effective_anchor_revset("cld_ticket_x")
+
+
+class TestJobStartCapAndRecords:
+    @pytest.fixture(autouse=True)
+    def base_ok(self, monkeypatch):
+        monkeypatch.setattr(broker, "resolve_job_base", lambda caller, repo, revision: "chg")
+
+    def _run(self, *tail: str) -> None:
+        broker.action_run(TICKET, ["start", "@a", "-r", "R", *tail])
+
+    def _record_names(self, caller=TICKET) -> set[str]:
+        return {path.name for path in broker._job_dir(caller).glob("*.json")}
+
+    def test_the_record_and_its_folder_are_private(self, host, execs):
+        self._run("-n", "x")
+        folder = broker._job_dir(TICKET)
+        assert _mode(folder) == 0o700
+        assert folder == host.repo.parent / "home" / ".cld" / "broker-jobs" / "cld_ticket_x"
+        record = json.loads((folder / "run-run_x.json").read_text())
+        assert record == {"kind": "run", "name": "run_x", "repo": str(host.repo), "base": "chg",
+                          "started_at": record["started_at"]}
+        assert abs(record["started_at"] - time.time()) < 60
+
+    def test_run_gets_a_random_session_name_without_n(self, host, execs, capsys):
+        self._run()
+        started = capsys.readouterr().out.strip()
+        assert re.fullmatch(r"started: run_[0-9a-f]{6}", started)
+        suffix = started.removeprefix("started: run_")
+        assert execs == [["cld", "run", "@a", "-n", suffix, "-r", "chg"]]
+
+    def test_run_host_command_with_every_option(self, host, execs):
+        self._run("-n", "x", "-m", "opus", "-p", "do it")
+        assert execs == [["cld", "run", "@a", "-n", "x", "-r", "chg", "-m", "opus", "-p", "do it"]]
+
+    def test_chain_host_command_and_name(self, host, execs, capsys):
+        broker.action_chain(TICKET, ["start", "@rdi", "@brief", "-n", "mine", "-r", "R", "-m", "opus", "-p", "t"])
+        assert execs == [["cld", "chain", "run", "@rdi", "@brief", "-n", "mine", "-r", "chg", "-m", "opus", "-p", "t"]]
+        assert capsys.readouterr().out == "started: mine\n"
+
+    def test_chain_without_n_is_named_after_its_ref(self, host, execs, capsys):
+        broker.action_chain(TICKET, ["start", "@rdi", "-r", "R"])
+        assert execs == [["cld", "chain", "run", "@rdi", "-n", "rdi", "-r", "chg"]]
+        assert capsys.readouterr().out == "started: rdi\n"
+
+    def test_the_host_command_runs_in_the_repo(self, host, execs):
+        self._run("-n", "x")
+        assert os.getcwd() == str(host.repo)
+
+    def test_a_third_live_job_is_denied_naming_the_live_ones(self, host, execs, capsys):
+        for name in ("run_a", "run_b"):
+            host.seed(name)
+            host.container(name, True)
+        code, err = _denied_with(broker.action_run, TICKET, ["start", "@a", "-r", "R"], capsys)
+        assert code == 3
+        assert "2 live jobs (run_a, run_b)" in err
+        assert execs == []
+
+    def test_runs_and_chains_share_the_cap(self, host, execs, capsys):
+        host.seed("run_a")
+        host.container("run_a", True)
+        host.seed("c1", kind="chain")
+        host.chain_state("c1")
+        assert _denied_with(broker.action_chain, TICKET, ["start", "@rdi", "-r", "R"], capsys)[0] == 3
+
+    def test_a_finished_job_frees_its_slot(self, host, execs):
+        host.seed("run_a")
+        host.container("run_a", True)
+        host.seed("run_b")
+        host.container("run_b", False)
+        self._run("-n", "c")
+        assert len(execs) == 1
+
+    def test_a_finished_chain_frees_its_slot(self, host, execs):
+        host.seed("run_a")
+        host.container("run_a", True)
+        host.seed("c1", kind="chain")
+        host.chain_state("c1", status="success")
+        self._run("-n", "c")
+        assert len(execs) == 1
+
+    def test_a_chain_whose_runner_died_frees_its_slot(self, host, execs):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        host.seed("run_a")
+        host.container("run_a", True)
+        host.seed("c1", kind="chain")
+        host.chain_state("c1", pid=dead.pid)
+        self._run("-n", "c")
+        assert len(execs) == 1
+
+    def test_a_failed_launch_costs_no_slot_once_it_is_not_launching(self, host, execs):
+        for name in ("run_a", "run_b"):
+            host.seed(name, age=_HOUR)  # a record with no container ever
+        self._run("-n", "c")
+        assert len(execs) == 1
+
+    def test_a_launching_job_counts_until_the_grace_ends(self, host, execs, capsys):
+        host.seed("run_a")
+        host.seed("run_b")  # no container yet, but just recorded
+        assert _denied_with(broker.action_run, TICKET, ["start", "@a", "-r", "R"], capsys)[0] == 3
+
+    def test_other_callers_jobs_do_not_count(self, host, execs):
+        for name in ("run_a", "run_b"):
+            host.seed(name, caller=OTHER_TICKET)
+            host.container(name, True)
+        self._run("-n", "c")
+        assert len(execs) == 1
+
+    @pytest.mark.parametrize("taken", ["record", "container"])
+    def test_a_taken_run_name_denied(self, host, execs, capsys, taken):
+        if taken == "record":
+            host.seed("run_x")
+        else:
+            host.container("run_x", False)
+        code, err = _denied_with(broker.action_run, TICKET, ["start", "@a", "-n", "x", "-r", "R"], capsys)
+        assert code == 3
+        assert "'run_x' already exists" in err
+
+    def test_a_live_chain_name_denied(self, host, execs, capsys):
+        host.chain_state("mine")
+        code, err = _denied_with(broker.action_chain, TICKET, ["start", "@rdi", "-n", "mine", "-r", "R"], capsys)
+        assert code == 3
+        assert "'mine' already exists" in err
+
+    def test_a_finished_records_name_can_be_used_again(self, host, execs):
+        host.seed("run_x", age=_HOUR)
+        self._run("-n", "x")
+        assert len(execs) == 1
+
+    def test_records_of_finished_jobs_older_than_seven_days_are_swept(self, host, execs):
+        host.seed("run_old", age=8 * 24 * _HOUR)
+        host.seed("run_kept", age=6 * 24 * _HOUR)
+        host.seed("run_busy", age=8 * 24 * _HOUR)
+        host.container("run_busy", True)
+        self._run("-n", "c")
+        assert self._record_names() == {"run-run_kept.json", "run-run_busy.json", "run-run_c.json"}
+
+    def test_the_sweep_runs_on_status_too(self, host):
+        host.seed("run_old", age=8 * 24 * _HOUR)
+        host.committed({})
+        broker.action_run(TICKET, ["status"])
+        assert self._record_names() == set()
+
+    def test_two_parallel_starts_cannot_both_pass_the_cap(self, host, monkeypatch):
+        """One live job, cap 2: with the lock exactly one of two simultaneous starts gets the last slot.
+        The probe of the live job sleeps, so both starts would count a single live job without it."""
+        host.seed("run_a")
+        host.container("run_a", True)
+        monkeypatch.setenv("FAKE_PROBE_SLEEP", "0.6")
+        launched: list[list[str]] = []
+        monkeypatch.setattr(broker, "_exec", launched.append)
+        monkeypatch.setattr(os, "chdir", lambda path: None)
+        outcomes: list[object] = []
+
+        def start() -> None:
+            try:
+                broker.action_run(TICKET, ["start", "@a", "-r", "R"])
+                outcomes.append("started")
+            except SystemExit as e:
+                outcomes.append(e.code)
+
+        threads = [threading.Thread(target=start) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert sorted(outcomes, key=str) == [3, "started"]
+        assert len(launched) == 1
+
+
+class TestJobStatus:
+    @pytest.fixture(autouse=True)
+    def repo_jj(self, host):
+        host.committed({})
+
+    def test_the_list_has_one_line_per_own_record_of_that_kind(self, host, capsys):
+        host.seed("run_a", age=2 * _HOUR, base="b1")
+        host.container("run_a", True)
+        host.seed("run_b", age=_HOUR, base="b2")
+        host.seed("c1", kind="chain", base="b3")
+        host.chain_state("c1", status="failed")
+        host.seed("run_theirs", caller=OTHER_TICKET)
+        host.committed({("run_b", "agent-output-run_b/summary.json"): '{"status": "no_changes"}'})
+        broker.action_run(TICKET, ["status"])
+        assert capsys.readouterr().out.splitlines() == ["run_a\trun\trunning\tb1", "run_b\trun\tno_changes\tb2"]
+        broker.action_chain(TICKET, ["status"])
+        assert capsys.readouterr().out.splitlines() == ["c1\tchain\tfailed\tb3"]
+
+    def test_an_empty_list_prints_nothing(self, host, capsys):
+        broker.action_run(TICKET, ["status"])
+        assert capsys.readouterr().out == ""
+
+    def test_the_repo_selector_narrows_the_list(self, host, tmp_path, capsys):
+        host.seed("run_a")
+        elsewhere = broker.Job("run", "run_e", "/elsewhere", "b", int(time.time()))
+        broker._job_write(TICKET, elsewhere)
+        broker.action_run(TICKET, ["--repo", "lide", "status"])
+        assert [line.split("\t")[0] for line in capsys.readouterr().out.splitlines()] == ["run_a"]
+
+    @pytest.mark.parametrize(
+        "container,summary,state",
+        [(True, None, "running"), (False, '{"status": "success"}', "success"), (False, '{"status": "failed"}', "failed"),
+         (False, '{"status": "anchor_violation"}', "anchor_violation"), (False, "garbage", "unknown"),
+         (False, '{"duration_seconds": 3}', "unknown"), (False, None, "gone")],
+        ids=["running", "success", "failed", "passed-through", "unreadable", "no-status", "gone"],
+    )
+    def test_run_state(self, host, capsys, container, summary, state):
+        host.seed("run_a", age=_HOUR)
+        if container:
+            host.container("run_a", True)
+        host.committed({} if summary is None else {("run_a", "agent-output-run_a/summary.json"): summary})
+        broker.action_run(TICKET, ["status", "run_a"])
+        assert capsys.readouterr().out.splitlines()[2] == f"state: {state}"
+
+    def test_run_detail_block(self, host, capsys):
+        host.seed("run_a", age=_HOUR, base="chg1")
+        host.committed({
+            ("run_a", "agent-output-run_a/summary.json"): '{"status": "failed", "duration_seconds": 125}',
+            ("run_a", "agent-output-run_a/result.json"): '{"cost_usd": 0.5}',
+            ("run_a", "agent-output-run_a/AGENT-FAILURE.md"): "first\n\nsecond\n" + "\n".join(f"l{n}" for n in range(9)),
+        })
+        broker.action_run(TICKET, ["status", "run_a"])
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[:9] == ["name: run_a", "kind: run", "state: failed", "bookmark: run_a", "base: chg1",
+                             "cost: 0.5000", "duration: 125s", "outputs: agent-output-run_a/", "failure: first"]
+        assert lines[9:] == ["  second", "  l0", "  l1", "  l2"]
+
+    def test_run_detail_while_nothing_is_committed_yet(self, host, capsys):
+        host.seed("run_a")
+        host.container("run_a", True)
+        broker.action_run(TICKET, ["status", "run_a"])
+        assert capsys.readouterr().out.splitlines() == ["name: run_a", "kind: run", "state: running",
+                                                        "bookmark: run_a", "base: baseid"]
+
+    def test_chain_states(self, host, capsys):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        for name, fields in (("alive", {}), ("dead", {"pid": dead.pid}), ("ok", {"status": "success"}),
+                             ("cut", {"status": "interrupted"}), ("none", None)):
+            host.seed(name, kind="chain", age=_HOUR)
+            if fields is not None:
+                host.chain_state(name, **fields)
+        broker.action_chain(TICKET, ["status"])
+        states = {line.split("\t")[0]: line.split("\t")[2] for line in capsys.readouterr().out.splitlines()}
+        assert states == {"alive": "running", "dead": "stale", "ok": "success", "cut": "interrupted", "none": "gone"}
+
+    def test_chain_detail_block(self, host, capsys):
+        host.seed("c1", kind="chain", base="chg1")
+        host.chain_state("c1", status="failed", finished_at="2026-10-27T10:02:05Z", total_cost_usd=1.25,
+                         failure_reason="step 'b' failed",
+                         completed_steps=[{"name": "a", "status": "success"}, {"name": "b", "status": "failed"}])
+        broker.action_chain(TICKET, ["status", "c1"])
+        assert capsys.readouterr().out.splitlines() == [
+            "name: c1", "kind: chain", "state: failed", "bookmark: chain_c1", "base: chg1", "cost: 1.2500",
+            "duration: 125s", "outputs: chain-outputs/c1/", "steps: a=success b=failed", "failure: step 'b' failed"]
+
+    def test_output_is_capped(self, host, capsys):
+        host.seed("c1", kind="chain")
+        host.chain_state("c1", status="failed", failure_reason="x" * 5000)
+        broker.action_chain(TICKET, ["status", "c1"])
+        assert max(len(line) for line in capsys.readouterr().out.splitlines()) < 300
+
+    @pytest.mark.parametrize("action,name", [(broker.action_run, "run_theirs"), (broker.action_run, "run_nope"),
+                                             (broker.action_chain, "run_a")], ids=["other-callers", "unknown", "other-kind"])
+    def test_only_own_records_of_that_kind(self, host, capsys, action, name):
+        host.seed("run_a")
+        host.seed("run_theirs", caller=OTHER_TICKET)
+        code, err = _denied_with(action, TICKET, ["status", name], capsys)
+        assert code == 3
+        assert "started through the broker" in err
+
+    def test_a_bad_name_or_extra_token_denied(self, host, capsys):
+        assert _denied_with(broker.action_run, TICKET, ["status", "../x"], capsys)[0] == 2
+        assert _denied_with(broker.action_run, TICKET, ["status", "a", "b"], capsys)[0] == 2
+
+
+class TestJobCancel:
+    def test_run_stops_its_container(self, host, execs):
+        host.seed("run_a")
+        host.container("run_a", True)
+        broker.action_run(TICKET, ["cancel", "run_a"])
+        assert execs == [["docker", "stop", "run_a"]]
+
+    @pytest.mark.parametrize("fields", [{}, {"pid": 0}], ids=["alive", "launching-pid-0"])
+    def test_chain_runs_the_host_cancel_in_its_repo(self, host, execs, fields):
+        host.seed("c1", kind="chain")
+        host.chain_state("c1", **fields)
+        broker.action_chain(TICKET, ["cancel", "c1"])
+        assert execs == [["cld", "chain", "cancel", "c1"]]
+        assert os.getcwd() == str(host.repo)
+
+    def test_a_chain_whose_runner_died_can_still_be_cancelled(self, host, execs):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        host.seed("c1", kind="chain", age=_HOUR)
+        host.chain_state("c1", pid=dead.pid)
+        broker.action_chain(TICKET, ["cancel", "c1"])
+        assert execs == [["cld", "chain", "cancel", "c1"]]
+
+    def test_a_finished_job_is_not_cancelled(self, host, execs, capsys):
+        host.seed("run_a", age=_HOUR)
+        host.container("run_a", False)
+        host.committed({("run_a", "agent-output-run_a/summary.json"): '{"status": "success"}'})
+        code, err = _denied_with(broker.action_run, TICKET, ["cancel", "run_a"], capsys)
+        assert code == 3
+        assert "not running (state: success)" in err
+        assert execs == []
+
+    @pytest.mark.parametrize("action,name", [(broker.action_run, "run_theirs"), (broker.action_run, "run_nope"),
+                                             (broker.action_chain, "run_theirs")])
+    def test_only_own_jobs(self, host, execs, capsys, action, name):
+        host.seed("run_theirs", caller=OTHER_TICKET)
+        host.container("run_theirs", True)
+        assert _denied_with(action, TICKET, ["cancel", name], capsys)[0] == 3
+        assert execs == []
+
+    def test_exactly_one_name(self, host, capsys):
+        assert _denied_with(broker.action_run, TICKET, ["cancel"], capsys)[0] == 2
+        assert _denied_with(broker.action_run, TICKET, ["cancel", "a", "b"], capsys)[0] == 2
+
+
+class TestJobDispatch:
+    """The ssh route end to end, the way the container client calls it: a real jj repo, fake docker and cld."""
+
+    def _dispatch(self, tmp_path: Path, action: str, argv: list[str]) -> subprocess.CompletedProcess:
+        payload = base64.b64encode(b"".join(a.encode() + b"\0" for a in argv)).decode()
+        env = dict(os.environ, CLD_BROKER_CONF="/nonexistent", SSH_ORIGINAL_COMMAND=f"{action} cld_ticket_x {payload}")
+        return subprocess.run([sys.executable, str(BROKER_PY)], capture_output=True, text=True, env=env, cwd=tmp_path)
+
+    def test_start_then_status(self, tree, jj_host, tmp_path):
+        result = self._dispatch(tmp_path, "run", ["--repo", "lide", "start", "@a", "-n", "x", "-r", tree.inside, "-p", "t"])
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "started: run_x", f"CWD {tree.repo}", "run", "@a", "-n", "x", "-r", tree.inside, "-p", "t"]
+        jj_host.container("run_x", True)
+        status = self._dispatch(tmp_path, "run", ["--repo", "lide", "status"])
+        assert status.stdout == f"run_x\trun\trunning\t{tree.inside}\n"
+
+    def test_chain_start(self, tree, jj_host, tmp_path):
+        result = self._dispatch(tmp_path, "chain", ["start", "@rdi", "@b", "-r", tree.inside])
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "started: rdi", f"CWD {tree.repo}", "chain", "run", "@rdi", "@b", "-n", "rdi", "-r", tree.inside]
+
+    def test_a_denied_start_prints_no_started_line(self, tree, jj_host, tmp_path):
+        result = self._dispatch(tmp_path, "run", ["start", "@a", "-r", tree.sibling])
+        assert result.returncode == 3
+        assert result.stdout == ""

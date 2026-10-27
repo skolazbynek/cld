@@ -188,7 +188,10 @@ just defining/removing the function.
 `list-containers` (read-only cld-container enumeration for the messenger /
 `cld task-agent status`), `list-repos` (read-only host registry for `cld repos`,
 marking which entries the caller mounts), `task-agent` (`<op>` -- the `cld
-task-agent` lifecycle verbs), and `graphql` (`<op> [args...]` -- start/stop/restart/status/
+task-agent` lifecycle verbs), `run` and `chain` (`start|status|cancel` -- ticket
+callers start `cld run` / `cld chain run` on a commit inside their own tree, at most 2
+live jobs at a time, and see or cancel only their own; see
+`../docs/design-broker-run-chain.md`), and `graphql` (`<op> [args...]` -- start/stop/restart/status/
 logs for the calling session's own GraphQL server, plus query/introspect/
 endpoints against it or a credentialed alias; see
 `../docs/impl-graphql-broker-plan.md` and `../docs/graphql-mcp.md`). The
