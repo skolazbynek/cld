@@ -27,6 +27,8 @@ CONTAINER_USER = "claude"
 CONTAINER_HOME = f"/home/{CONTAINER_USER}"
 WORKSPACE_BASE = "/workspace"
 MAILBOX_MOUNT = "/var/cld/mailboxes"
+# Notes folder of the ticket-notes plugin (ai-koutek), relative to $HOME.
+TICKET_NOTES_DIR = ".ticket-notes"
 
 # All RO $HOME mounts are staged under /tmp/host-config/<rel> and copied into
 # $HOME by the entrypoint (see copy_host_configs in container-init.sh).
@@ -730,6 +732,7 @@ def build_container_args(
         log.error(f"{local_claude_dir} not found -- Claude auth and session state unavailable")
         sys.exit(1)
     args += ["-v", f"{host_home}/.claude:{CONTAINER_HOME}/.claude:rw"]
+    args += stage_ticket_notes(home, host_home)
     args += stage_plugin_marketplaces(cfg, [repo_root])
 
     # RO $HOME mounts: all staged under /tmp/host-config/<rel>, then copied
@@ -893,6 +896,7 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
         log.error(f"{home}/.claude not found -- Claude auth and session state unavailable")
         sys.exit(1)
     args += ["-v", f"{host_home}/.claude:{CONTAINER_HOME}/.claude:rw"]
+    args += stage_ticket_notes(home, host_home)
     repo_paths = [Path(repo.path) for repo in manifest.repos]
     args += stage_plugin_marketplaces(cfg, repo_paths)
 
@@ -1451,6 +1455,16 @@ def stage_mailbox(cfg: Config) -> list[str]:
     return ["-v", f"{host_mailbox_root}:{MAILBOX_MOUNT}:rw"]
 
 
+def stage_ticket_notes(home: str, host_home: str) -> list[str]:
+    """Return the ``-v`` args mounting the ticket notes folder RW at the same $HOME-relative path.
+
+    Created first, as docker would otherwise create a missing source as root. Nested cld sees its
+    own mount of the folder here, so the folder already exists.
+    """
+    Path(home, TICKET_NOTES_DIR).mkdir(exist_ok=True)
+    return ["-v", f"{host_home}/{TICKET_NOTES_DIR}:{CONTAINER_HOME}/{TICKET_NOTES_DIR}:rw"]
+
+
 def stage_broker(cfg: Config) -> list[str]:
     """Return docker args wiring a container to the cld broker.
 
@@ -1680,7 +1694,7 @@ def stage_plugin_marketplaces(cfg: Config, repo_roots: list[Path]) -> list[str]:
         *repo_roots,
         *(Path(occupant["repo_root"]) for occupant in docker_occupant_list() if occupant["repo_root"]),
     ]
-    agent_dirs = [claude_dir, Path(cfg.mailbox_root).expanduser()]
+    agent_dirs = [claude_dir, Path.home() / TICKET_NOTES_DIR, Path(cfg.mailbox_root).expanduser()]
     seen: set[tuple[str, Path]] = set()
     mounts: dict[str, list[str]] = {}
     for kind, path, repo_settings in candidates:

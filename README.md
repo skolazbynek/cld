@@ -334,7 +334,9 @@ Host `~/.claude.json` is mounted read-only. The entrypoint builds a container-lo
 
 All RO `$HOME` mounts (claude/anthropic/jj configs, `~/.claude.json`, plus devcontainer-only `~/.gitconfig`, `~/.bashrc`, and the nvim dirs `~/.config/nvim` / `~/.local/state/nvim` / `~/.cache/nvim`) are staged read-only under `/tmp/host-config/<rel>` and copied into `$HOME` on startup by `copy_host_configs`. Changes made inside the container do not persist to the host. The agent image has no editor and skips the devcontainer-only entries.
 
-Plugin marketplaces with a `directory` or `file` source are mounted read-only at their host path, with `--mount`, only when they come from the host `~/.claude` settings or plugin registry and the folder passes these checks: it holds `.claude-plugin/marketplace.json`; it is outside `~/.claude`, the mailbox root and every repo, and is not `$HOME` or one of its parents; and its literal path equals its real path (no symlink in it). Marketplaces listed in a repo's own `.claude/settings.json` are never mounted. Each skipped entry logs `plugin marketplace: '<path>' skipped: <reason>` on every launch.
+`~/.ticket-notes`, the notes folder of the ai-koutek `ticket-notes` plugin, is mounted read-write at the same `$HOME`-relative path, like `~/.claude`. The launcher creates it on the host when it is missing.
+
+Plugin marketplaces with a `directory` or `file` source are mounted read-only at their host path, with `--mount`, only when they come from the host `~/.claude` settings or plugin registry and the folder passes these checks: it holds `.claude-plugin/marketplace.json`; it is outside `~/.claude`, `~/.ticket-notes`, the mailbox root and every repo, and is not `$HOME` or one of its parents; and its literal path equals its real path (no symlink in it). Marketplaces listed in a repo's own `.claude/settings.json` are never mounted. Each skipped entry logs `plugin marketplace: '<path>' skipped: <reason>` on every launch.
 
 ### No docker socket in containers
 

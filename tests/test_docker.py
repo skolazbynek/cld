@@ -561,13 +561,18 @@ class TestPluginMarketplaceFilter:
 
     @pytest.mark.parametrize(
         "where",
-        ["claude-dir", "mailbox-root", "custom-mailbox-root", "repo-git-dir", "other-container-repo", "registry-repo-git-dir"],
+        [
+            "claude-dir", "ticket-notes-dir", "mailbox-root", "custom-mailbox-root", "repo-git-dir",
+            "other-container-repo", "registry-repo-git-dir",
+        ],
     )
     def test_folder_an_agent_can_swap_is_skipped(self, home, repo, tmp_path, caplog, other_containers, where):
         cfg = Config(mailbox_root=str(home / ".cld/mailboxes"))
         match where:
             case "claude-dir":
                 mp, writable = home / ".claude/plugins/mp", f"{home}/.claude, which agent containers write"
+            case "ticket-notes-dir":
+                mp, writable = home / ".ticket-notes/mp", f"{home}/.ticket-notes, which agent containers write"
             case "mailbox-root":
                 mp, writable = home / ".cld/mailboxes/mp", f"{home}/.cld/mailboxes, which agent containers write"
             case "custom-mailbox-root":
@@ -931,6 +936,19 @@ class TestBuildContainerArgsPluginMarketplaces:
         repo.mkdir()
         args = build_container_args(repo, "cld_run_x", Config(mailbox_root=str(tmp_path / "mb")))
         assert _ro_mount(mp)[1] in _mount_values(args)
+
+
+@pytest.mark.usefixtures("stub_store_preflight")
+class TestBuildContainerArgsTicketNotes:
+    def test_created_and_mounted_rw(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        args = build_container_args(repo, "cld_run_x", Config(mailbox_root=str(tmp_path / "mb")))
+        assert (home / ".ticket-notes").is_dir()
+        assert f"{home}/.ticket-notes:/home/claude/.ticket-notes:rw" in args
 
 
 @pytest.mark.usefixtures("stub_store_preflight")
@@ -1597,6 +1615,12 @@ class TestBuildTicketContainerArgs:
         ))
         args = build_ticket_container_args(manifest, cfg)
         assert _ro_mount(mp)[1] in _mount_values(args)
+
+    def test_ticket_notes_created_and_mounted_rw(self, tmp_path, monkeypatch):
+        manifest, cfg = self._setup(tmp_path, monkeypatch)
+        args = build_ticket_container_args(manifest, cfg)
+        assert (tmp_path / "home/.ticket-notes").is_dir()
+        assert f"{tmp_path}/home/.ticket-notes:/home/claude/.ticket-notes:rw" in args
 
     def test_name_and_no_workdir(self, tmp_path, monkeypatch):
         manifest, cfg = self._setup(tmp_path, monkeypatch)
