@@ -17,6 +17,7 @@ from cld.chain_state import ChainState, StateWriter, write_state, _utcnow_iso
 from cld.config import Config, _user_config_path
 from cld.docker import (
     TaskAgentSpec,
+    _docker_status,
     allocate_task_agent_name,
     anchor_env_args,
     assert_task_agent_capacity,
@@ -34,6 +35,7 @@ from cld.docker import (
     run_extra_paths,
     stage_home_ro,
     stage_ssh_agent,
+    ticket_container_name,
     to_host_path,
 )
 from cld.agent_runtime import format_age
@@ -611,7 +613,7 @@ def start(
 
     With no arguments at all, targets the cwd's repo directly -- ad hoc,
     regardless of registration in `cld repos` -- under a ticket named after
-    the repo directory.
+    the repo directory, anchored on the repo's working copy (`@`).
     """
     require_docker()
     cfg = Config.from_env()
@@ -619,7 +621,10 @@ def start(
     if ticket is None:
         repo_root = find_target_repo(cfg)
         ticket = repo_root.name
-        repos = [str(repo_root)]
+        # `@` moves with host work, so an existing ticket is not re-resolved
+        # against it -- that would offer a recreate on every working-copy move.
+        if _docker_status(ticket_container_name(ticket)) == "absent":
+            repos = [f"{repo_root}@@"]
     start_ticket(cfg, ticket, repos or [], shared_anchor)
 
 

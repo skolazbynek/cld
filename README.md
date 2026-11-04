@@ -91,7 +91,7 @@ Each entry is a `[repos.<name>]` TOML table: `path`, optional `default_rev` (anc
 
 | Verb | Semantics |
 |---|---|
-| `cld start <ticket> [repo[@rev]...]` | Create-or-start. On a TTY with no repos: interactive picker over the registry. Each repo arg is a registry name or path, with an optional `@rev` anchor override. Against an existing ticket, a different repo set shows a diff, asks to confirm, and recreates the container. Bare `cld start` (no args at all) targets the cwd's repo directly -- ad hoc, regardless of registration -- under a ticket named after the repo directory. |
+| `cld start <ticket> [repo[@rev]...]` | Create-or-start. On a TTY with no repos: interactive picker over the registry. Each repo arg is a registry name or path, with an optional `@rev` anchor override. Against an existing ticket, a different repo set shows a diff, asks to confirm, and recreates the container. Bare `cld start` (no args at all) targets the cwd's repo directly -- ad hoc, regardless of registration -- under a ticket named after the repo directory, anchored on the repo's working copy (`@`). Against an existing ticket it only starts or reports, without re-resolving `@`. |
 | `cld claude [<ticket>] [-- args...]` | The daily verb: exec the harness at the ticket root. Everything after `--` passes to claude (`--model`, `--continue`, `--resume`, `-p`). One live session per container (POC): a second `cld claude` is refused, naming the holder. |
 | `cld shell [<ticket>]` | Escape hatch: interactive bash in the container, for debugging the sandbox itself. |
 | `cld stop [<ticket>]` | Pause (`docker stop`). Workspaces stay in place; `cld start` on a stopped ticket is a warm start. |
@@ -106,7 +106,7 @@ Resume: transcripts land on the host under the per-ticket cwd slug, so `cld clau
 
 ### Anchors per repo
 
-At first launch, each repo's anchor revision resolves as: explicit `@rev` from the launch args, else the registry `default_rev`, else `trunk()`. In isolated mode (default), a scratch commit is staged as a child of the anchor and the ticket may edit only its descendants; `--shared-anchor <repo>` (repeatable, per repo) widens the editable tree to every descendant of the anchor itself. The anchor is pinned by its jj change ID (a commit hash on git), so a host-side rebase of the anchor keeps it the same anchor; no container ever rewrites, moves or rebases it. The contract is policy, enforced by prompt and convention, not mechanism.
+At first launch, each repo's anchor revision resolves as: explicit `@rev` from the launch args, else the registry `default_rev`, else `trunk()`. Bare `cld start` passes `@` as that explicit rev. In isolated mode (default), a scratch commit is staged as a child of the anchor and the ticket may edit only its descendants; `--shared-anchor <repo>` (repeatable, per repo) widens the editable tree to every descendant of the anchor itself. The anchor is pinned by its jj change ID (a commit hash on git), so a host-side rebase of the anchor keeps it the same anchor; no container ever rewrites, moves or rebases it. The contract is policy, enforced by prompt and convention, not mechanism.
 
 When a new ticket's anchor lies inside another live ticket's editable tree in the same repo, cld **warns and proceeds** (stacked tickets are legitimate). Anchoring inside a headless container's tree (`task-agent`, `run`) still blocks, in both directions.
 
@@ -120,7 +120,7 @@ Commits, the op log, and the per-repo ticket bookmark live in each host repo's s
 
 Verified deliberate differences from the v1 roles:
 
-- **Default anchor is `default_rev` -> `trunk()`, not `@`.** A v2 launch happens from anywhere, so each repo's `@` is invisible and may be unrelated WIP. Stacked work uses an explicit `repo@rev`. (v1 kinds keep defaulting to `@`.)
+- **Default anchor is `default_rev` -> `trunk()`, not `@`.** A v2 launch happens from anywhere, so each repo's `@` is invisible and may be unrelated WIP. Stacked work uses an explicit `repo@rev`. (v1 kinds and bare `cld start`, which launches from inside the repo, keep defaulting to `@`.)
 - **Host-side `cld msg` prefers a single running ticket.** Identity resolution is: explicit `--ticket` flag or `CLD_TICKET` env, else the one running ticket container if exactly one exists, else the cwd repo's own host identity (the mailbox the v1 master used to own). cwd is deliberately not mapped to tickets -- several tickets can mount one repo.
 - **Parallel same-base siblings need no placeholder commits.** The overlap check now derives each occupant's *effective* anchor (the scratch commit in isolated mode) from the jj store at check time, for v1 headless kinds too, so two isolated containers anchored on the same base no longer over-block each other.
 - **A kept repo whose anchor changed on a repo-set change reattaches at its old bookmark.** `cld start <ticket> <new set>` recreates the container, but a kept repo's bookmark survives, and the boot's reattach branch wins over the new `anchor_base` -- the new anchor takes effect only after `cld shutdown` forgets the bookmark.

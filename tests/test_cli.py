@@ -166,20 +166,30 @@ class TestTicketVerbs:
         assert result.exit_code == 0, result.output
         assert mocks["start_ticket"].call_args.args[2] == []
 
-    def test_start_with_no_args_targets_cwd_repo_ad_hoc(self):
+    @pytest.mark.parametrize(
+        ("status", "specs"),
+        [
+            ("absent", ["/home/z/diskuze-api@@"]),
+            ("stopped", []),
+            ("running", []),
+        ],
+        ids=["absent-anchors-on-working-copy", "stopped-keeps-anchors", "running-keeps-anchors"],
+    )
+    def test_start_with_no_args_targets_cwd_repo_ad_hoc(self, status, specs):
         """Bare `cld start`: cwd's repo root, ad hoc (not by registry name),
-        ticket named after the repo directory."""
+        ticket named after the repo directory, anchored on `@` only at creation."""
         with ExitStack() as stack:
             stack.enter_context(patch("cld.cli.require_docker"))
             stack.enter_context(
                 patch("cld.cli.find_target_repo", return_value=Path("/home/z/diskuze-api"))
             )
+            stack.enter_context(patch("cld.cli._docker_status", return_value=status))
             start_ticket = stack.enter_context(patch("cld.cli.start_ticket"))
             result = runner.invoke(app, ["start"])
         assert result.exit_code == 0, result.output
         args = start_ticket.call_args.args
         assert args[1] == "diskuze-api"
-        assert args[2] == ["/home/z/diskuze-api"]
+        assert args[2] == specs
         assert args[3] == []
 
     def test_claude_passes_everything_after_dashdash_through(self):

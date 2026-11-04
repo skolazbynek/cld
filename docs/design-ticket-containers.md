@@ -393,10 +393,13 @@ dependency.
 - **Zero-arg shortcut** (`cld start` with no ticket and no repos): skips the
   registry and the picker entirely. Resolves the cwd's repo root the same
   way `find_target_repo` does for task-agents, uses it as an ad-hoc path
-  spec, and names the ticket after the repo directory (`repo_root.name`).
-  Re-running it in the same repo hits the normal create-or-start path for
-  that ticket name (warm start / already-running report), same as typing
-  the ticket name explicitly.
+  spec anchored on `@` (the launch happens from inside the repo, so its
+  working copy is the intended base), and names the ticket after the repo
+  directory (`repo_root.name`). Re-running it in the same repo hits the
+  normal create-or-start path for that ticket name (warm start /
+  already-running report), same as typing the ticket name explicitly: the
+  spec is passed only when the ticket is absent, so a moved `@` never
+  offers a recreate.
 
 ## 6. Repo-qualified interfaces (spec §10)
 
