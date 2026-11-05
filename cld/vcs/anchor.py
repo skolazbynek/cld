@@ -58,8 +58,8 @@ def assert_descendant(vcs: VcsBackend, anchor_hash: str, candidate: str) -> None
 
 
 def find_anchor_commit(vcs: VcsBackend, session: str) -> str:
-    """Find the change id of a ticket's own scratch commit S: the ancestor of the *session*
-    bookmark carrying its own ``cld anchor: <session> mode=<mode>`` staging
+    """Find the change id of a ticket's own scratch commit S: the commit at or below the
+    *session* bookmark (which sits on the anchor) carrying its own ``cld anchor: <session> mode=<mode>`` staging
     description (the same revset ``cld_recover_anchor`` and ``_effective_anchor``
     use to find it -- see ``imgs/claude-devcontainer/vcs-lib.sh`` and
     ``cld/docker.py``). jj-only.
@@ -68,7 +68,7 @@ def find_anchor_commit(vcs: VcsBackend, session: str) -> str:
     means the caller cannot safely identify which commit is S.
     """
     revset = (
-        f"heads(ancestors({session}) & description(glob:'cld anchor: {session} *'))"
+        f"heads(descendants({session}) & description(glob:'cld anchor: {session} *'))"
     )
     result = vcs.run(["log", "-r", revset, "--no-graph", "-T", 'change_id ++ "\\n"'])
     hashes = (
@@ -135,10 +135,10 @@ def move_anchor_commit(
     - shared: ``jj rebase -r S -A target`` -- S is inserted after target;
       target's old children move onto the rebased S.
 
-    Then the bookmark rule: if the session bookmark ends up outside ``S'::``,
-    it is force-moved to S' (``--allow-backwards``) -- without this the
-    bookmark follows the old work to the old-base side and a reattach can no
-    longer find S.
+    Then the bookmark rule: the session bookmark must sit on the new anchor --
+    S' when isolated, *target* when shared. It follows S' by itself when
+    isolated; otherwise it is force-moved there (``--allow-backwards``), as
+    without this a reattach can no longer find S.
 
     Already-in-place rule: if S's current parent already is *target*, no
     jj command runs at all (this is what makes undo idempotent).
@@ -172,16 +172,17 @@ def move_anchor_commit(
     if new_conflicts:
         _fail(f"reanchor introduced new conflicts: {', '.join(sorted(new_conflicts))}")
 
+    new_anchor = target if mode == "shared" else anchor
     in_place = vcs.run(
-        ["log", "-r", f"{session} & {anchor}::", "--no-graph", "-T", "commit_id", "-n", "1"],
+        ["log", "-r", f"{session} & {new_anchor}", "--no-graph", "-T", "commit_id", "-n", "1"],
     )
     if in_place.returncode != 0:
         _fail(f"could not check the session bookmark's position: {(in_place.stderr or '').strip()}")
     if not in_place.stdout.strip():
         op_before = _op_log_head(vcs)
-        bm_result = vcs.run(["bookmark", "set", session, "-r", anchor, "--allow-backwards"])
+        bm_result = vcs.run(["bookmark", "set", session, "-r", new_anchor, "--allow-backwards"])
         ops = _ops_since(vcs, op_before) + ops
         if bm_result.returncode != 0:
-            _fail(f"jj bookmark set {session} -r {anchor} failed: {(bm_result.stderr or '').strip()}")
+            _fail(f"jj bookmark set {session} -r {new_anchor} failed: {(bm_result.stderr or '').strip()}")
 
     return ops

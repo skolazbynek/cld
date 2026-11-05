@@ -250,7 +250,7 @@ For each manifest entry, in manifest order:
    v2 tickets have no brief, so the envelope wire is dead weight for them; B's
    shape (payload file + `cld anchor: <session> mode=<mode>` description) is
    unchanged, per the §8 ruling.
-4. Set the bookmark; enable watchman fsmonitor + snapshot trigger per
+4. Set the bookmark on the anchor (static, see the per-repo identities paragraph in PRODUCT_DESIGN.md); enable watchman fsmonitor + snapshot trigger per
    workspace (v1 `:130-134`).
 5. ~~Per-repo workspace-file symlinks~~ — removed with the store-only mounts
    (§12); origin holds no working-tree file to link.

@@ -1193,9 +1193,9 @@ def _effective_anchor(vcs, occupant: dict) -> str:
     in-container as a child of the labeled base A *after* launch -- labels are
     immutable, so B is derived from the jj store at check time using the same
     revset the entrypoint's restart recovery uses (cld_recover_anchor,
-    imgs/claude-devcontainer/vcs-lib.sh): searched among the session
-    bookmark's ancestors, not A's children, because the host may rebase B
-    off A. An empty result is the transient window between ``docker run``
+    imgs/claude-devcontainer/vcs-lib.sh): searched from the session bookmark,
+    which sits on B in isolated mode, not among A's children, because the
+    host may rebase B off A. An empty result is the transient window between ``docker run``
     and staging; falling back to A only ever over-blocks, since A's reach is
     a superset of B's. Shared mode edits descendants of A itself, so A *is*
     the effective anchor there.
@@ -1203,7 +1203,7 @@ def _effective_anchor(vcs, occupant: dict) -> str:
     if occupant["mode"] != "isolated":
         return occupant["anchor_base"]
     revset = (
-        f"heads(ancestors(bookmarks(exact:\"{occupant['session']}\")) & "
+        f"heads(descendants(bookmarks(exact:\"{occupant['session']}\")) & "
         # The trailing space before the wildcard is load-bearing: every staged
         # description is 'cld anchor: <session> mode=<mode>' (stage_in_workspace),
         # and without it session cld_ticket_x-1 would also match cld_ticket_x-12.

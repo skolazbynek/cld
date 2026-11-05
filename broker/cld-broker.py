@@ -737,11 +737,9 @@ class LabelCaller:
                 if key.startswith("org.cld.repo.")}
 
     # "<session>@" is the *workspace* tip, not the session bookmark. The bookmark
-    # is set once at first container launch
-    # (imgs/claude-devcontainer/entrypoint-claude-devcontainer.sh) and never moved
-    # again, so it freezes at the container's first `jj commit` -- the normal state
-    # once an agent starts working, which left this resolving one change behind
-    # the code the caller just wrote. Workspace name == bookmark name == container
+    # is static: it sits on the anchor and never follows the work, so it would
+    # resolve to the anchor instead of the code the caller just wrote.
+    # Workspace name == bookmark name == container
     # name == session (verified via `jj workspace list`), and `<session>@` is
     # the same workspace-scoped-`@` idiom `cld/vcs/detect.py` already uses.
     # --ignore-working-copy matters here too: without it, `jj -R <repo> log`

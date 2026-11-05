@@ -1211,7 +1211,7 @@ class TestEffectiveAnchorDerivation:
 
     def _staged(self, jj_repo):
         """base A, its staged scratch child B (session-marked), and B's child,
-        bookmarked at the session as the entrypoint leaves it."""
+        with the session bookmark on B as the entrypoint leaves it."""
         base = resolve_anchor(jj_repo, "@-")
         jj_repo.run(["new", base])
         (jj_repo.repo_root / ".cld-run").mkdir()
@@ -1221,7 +1221,7 @@ class TestEffectiveAnchorDerivation:
         (jj_repo.repo_root / "work.txt").write_text("work\n")
         jj_repo.run(["commit", "-m", "live agent work"])
         inside_b = resolve_anchor(jj_repo, "@-")
-        jj_repo.run(["bookmark", "create", self.SESSION, "-r", inside_b])
+        jj_repo.run(["bookmark", "create", self.SESSION, "-r", scratch])
         return base, scratch, inside_b
 
     def _fleet(self, tmp_path, jj_repo, base, kind="task-agent"):

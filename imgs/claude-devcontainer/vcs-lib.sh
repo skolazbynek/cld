@@ -55,8 +55,9 @@ cld_add_workspace() {
 
 cld_recover_anchor() {
     # Recover AGENT_ANCHOR_HASH on a warm restart or bookmark reattach: find
-    # the ancestor of $bookmark carrying our own 'cld anchor: <session>
-    # mode=<mode>' description (glob-matched -- `jj commit -m` appends a
+    # the scratch commit at or below $bookmark (which always sits on the anchor:
+    # the scratch commit itself when isolated, its parent when shared) carrying
+    # our own 'cld anchor: <session> mode=<mode>' description (glob-matched -- `jj commit -m` appends a
     # trailing newline to single-line descriptions, so an exact match against
     # the bare text never hits; the space before the wildcard keeps session
     # x-1 from matching x-12's scratch), then read that scratch commit's own
@@ -67,7 +68,7 @@ cld_recover_anchor() {
     # Args: $1=bookmark $2=session. cwd must be inside the jj store.
     local bookmark="$1" session="$2" scratch_hash desc
     scratch_hash=$(cld_store_jj . log --no-graph -n 1 \
-        -r "heads(ancestors(${bookmark}) & description(glob:'cld anchor: ${session} *'))" \
+        -r "heads(descendants(${bookmark}) & description(glob:'cld anchor: ${session} *'))" \
         -T change_id 2>/dev/null || true)
     [ -n "$scratch_hash" ] || return 0
     desc=$(cld_store_jj . log --no-graph -n 1 -r "$scratch_hash" -T description 2>/dev/null || true)
@@ -101,9 +102,11 @@ cld_recover_anchor() {
 #          (`--default-payload`, ticket kind -- design 4.2).
 #
 # Invariant: bookmark $3 exists in the origin store <=> a live or
-# restart-paused lifecycle owns this session. Restart preserves the bookmark
-# (reattach at its tip); shutdown forgets it so the next launch is a fresh
-# lifecycle honoring the requested revision.
+# restart-paused lifecycle owns this session. The bookmark is static: it sits
+# on the effective anchor (CLD_BOOT_ANCHOR) and only a reanchor moves it, never
+# the work. Restart preserves it (reattach resumes at the old workspace tip);
+# shutdown forgets it so the next launch is a fresh lifecycle honoring the
+# requested revision.
 cld_boot_workspace() {
     local origin="$1" workspace="$2" bookmark="$3" base_rev="$4" mode="$5" scratch_source="$6"
     CLD_BOOT_ANCHOR=""
@@ -128,12 +131,16 @@ cld_boot_workspace() {
     # prior shutdown forgets the bookmark but NOT the workspace, so on a fresh
     # first-launch the stale registration would make `jj workspace add --name`
     # fail with "Workspace named X already exists" and leave the workspace dir
-    # empty. No-op when absent (first-ever launch).
+    # empty. No-op when absent (first-ever launch). The workspace tip is read
+    # first: the bookmark marks the anchor, so the work to resume is only found
+    # through the workspace being forgotten.
+    local tip
+    tip=$(cld_store_jj "$origin" log --no-graph -n 1 -r "${bookmark}@" -T commit_id 2>/dev/null || true)
     cld_store_jj "$origin" workspace forget "$bookmark" 2>&1 || true
 
     if cld_store_jj "$origin" bookmark list -T 'name ++ "\n"' | grep -qx "$bookmark"; then
         echo "[cld] reattaching workspace '$bookmark'"
-        if ! cld_add_workspace "$origin" "$bookmark" "$bookmark" "$workspace"; then
+        if ! cld_add_workspace "$origin" "$bookmark" "${tip:-$bookmark}" "$workspace"; then
             echo "Error: jj workspace add failed (reattach)" >&2
             return 1
         fi
@@ -181,7 +188,7 @@ cld_boot_workspace() {
         CLD_BOOT_ANCHOR="$b_hash"
     fi
     echo "[cld] anchor=${CLD_BOOT_ANCHOR:0:12} (mode=$mode, base=${a_hash:0:12}, scratch=${b_hash:0:12})"
-    (cd "$workspace" && jj bookmark set "$bookmark" -r @ --allow-backwards)
+    (cd "$workspace" && jj bookmark set "$bookmark" -r "$CLD_BOOT_ANCHOR" --allow-backwards)
     return 0
 }
 

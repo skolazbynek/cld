@@ -274,6 +274,8 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         assert result.returncode == 0, result.stderr
         assert "first=1" in result.stdout
         assert (workspace / "README.md").read_text() == "seed\n"
+        anchor = self._jj(env, jj_origin, "log", "--no-graph", "-r", self.BOOKMARK, "-T", "change_id")
+        assert f"anchor={anchor} " in result.stdout
         assert self.BOOKMARK in self._jj(env, jj_origin, "workspace", "list", "-T", 'name ++ "\\n"').split()
         assert self._protected_state(jj_origin) == before
         assert not [op for op in self._ops(env, jj_origin)[: -len(ops_before)] if "snapshot" in op]
@@ -290,6 +292,18 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         assert (workspace / "README.md").read_text() == "seed\n"
         assert result.stdout.splitlines()[-1] == first.stdout.splitlines()[-1].replace("first=1", "first=0")
         assert self._protected_state(jj_origin) == before
+
+    def test_reattach_resumes_at_the_workspace_tip_and_keeps_the_bookmark(self, tmp_path, env, jj_origin):
+        workspace = tmp_path / "ws"
+        assert self._first_launch(env, jj_origin, workspace).returncode == 0
+        bookmark_before = self._jj(env, jj_origin, "log", "--no-graph", "-r", self.BOOKMARK, "-T", "commit_id")
+        (workspace / "work.txt").write_text("work\n")
+        subprocess.run(["jj", "-R", str(workspace), "commit", "-m", "work"], env=env, capture_output=True, check=True)
+        shutil.rmtree(workspace)
+        result = self._first_launch(env, jj_origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert (workspace / "work.txt").read_text() == "work\n"
+        assert self._jj(env, jj_origin, "log", "--no-graph", "-r", self.BOOKMARK, "-T", "commit_id") == bookmark_before
 
     def test_jj_boot_needs_nothing_but_the_store(self, tmp_path, env, jj_origin):
         """The container's origin is the .jj and .git dirs of the host repo and

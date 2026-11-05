@@ -81,7 +81,9 @@ subtree.
 workspace and one bookmark, both named `cld_ticket_<slug>` (same
 quadruple-identity scheme as v1: container = workspace = bookmark = mailbox).
 The v1 invariant carries over per repo: the bookmark exists iff a live or
-restart-paused ticket lifecycle owns it.
+restart-paused ticket lifecycle owns it. The bookmark is static and always
+sits on the active anchor (the scratch commit when isolated, the shared
+commit when shared); it never follows the work, and only a reanchor moves it.
 
 **Sessions.** Harness sessions are ordinary Claude Code sessions whose cwd is
 the ticket root; transcripts land on the host under the per-ticket slug.

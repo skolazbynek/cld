@@ -168,7 +168,8 @@ These three helpers form the entire shared contract. There is no separate
    /workspace/current -- the container entrypoint creates its own
    ephemeral workspace at /workspace/current on top of B (jj store lives
    in /workspace/origin/.jj/repo via the writable store mount rows) and sets a
-   bookmark <session> tracking @.
+   bookmark <session> on the anchor (B when isolated, A when shared). The
+   bookmark is static: it never follows the work, and only a reanchor moves it.
 5. on each subsequent advance of the persistent branch:
        assert_descendant(B, new_tip)
 6. exit report prints B's hash and uses B..tip for inspect commands
@@ -178,7 +179,8 @@ These three helpers form the entire shared contract. There is no separate
 Restart of a persistent container (`cld master restart` / `cld agent
 restart`) skips steps 1--3: the container entrypoint sees the existing
 bookmark `<session>` in the origin store and reattaches by pointing a
-fresh workspace at the bookmark's last tip. Watchman-driven autosnapshots
+fresh workspace at the old workspace's tip (read before that workspace is
+forgotten); the bookmark itself only locates the anchor. Watchman-driven autosnapshots
 during the previous session's runtime guarantee that uncommitted edits
 made just before shutdown are visible on reattach.
 

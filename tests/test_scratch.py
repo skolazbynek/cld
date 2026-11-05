@@ -153,8 +153,8 @@ class TestRecoverAnchorSessionGlob:
 
     def _staged_sibling(self, jj_repo, tmp_path) -> str:
         """Scratch commit of session cld_ticket_x-12, with a work commit on
-        top carrying bookmark cld_ticket_x-1 -- the sibling's scratch is an
-        ancestor of the probed bookmark. Returns the scratch commit id."""
+        top, carrying bookmark cld_ticket_x-1 -- the sibling's scratch is at
+        the probed bookmark. Returns the scratch commit id."""
         anchor = _add_second_commit(jj_repo.repo_root)
         peer = _make_peer_workspace(jj_repo, anchor, tmp_path)
         scratch = stage_in_workspace(peer, "cld_ticket_x-12", {"session": b"cld_ticket_x-12\n"})
@@ -163,7 +163,7 @@ class TestRecoverAnchorSessionGlob:
             ["jj", "commit", "-m", "work"], cwd=peer, check=True, capture_output=True,
         )
         subprocess.run(
-            ["jj", "bookmark", "create", "cld_ticket_x-1", "-r", "@-"],
+            ["jj", "bookmark", "create", "cld_ticket_x-1", "-r", scratch],
             cwd=peer, check=True, capture_output=True,
         )
         return scratch
@@ -289,13 +289,14 @@ def _new_commit(path: Path, filename: str, content: str, message: str) -> None:
 
 
 def _stage_and_work(jj_repo, tmp_path, session, mode="isolated", base=None):
-    """Stage S (as the container entrypoint would) and add one work commit C
-    on top, bookmarked at *session* -- the shape ``move_anchor_commit``
-    operates on. Returns (base, s_hash, c_hash)."""
+    """Stage S (as the container entrypoint would), bookmark *session* on the
+    anchor (S when isolated, the base when shared) and add one work commit C
+    on top -- the shape ``move_anchor_commit`` operates on. Returns (base,
+    s_hash, c_hash)."""
     base = base if base is not None else _add_second_commit(jj_repo.repo_root)
     peer = _make_peer_workspace(jj_repo, base, tmp_path)
     s_hash = stage_in_workspace(peer, session, {"session": f"{session}\n".encode()}, mode=mode)
-    subprocess.run(["jj", "bookmark", "create", session, "-r", "@"],
+    subprocess.run(["jj", "bookmark", "create", session, "-r", base if mode == "shared" else s_hash],
                     cwd=peer, check=True, capture_output=True)
     (peer / "work.txt").write_text("work\n")
     subprocess.run(["jj", "commit", "-m", "C"], cwd=peer, check=True, capture_output=True)
@@ -312,12 +313,17 @@ class TestFindAnchorCommit:
         _base, s_hash, _c = _stage_and_work(jj_repo, tmp_path, session)
         assert find_anchor_commit(jj_repo, session) == s_hash
 
+    def test_finds_the_scratch_commit_below_a_shared_bookmark(self, jj_repo, tmp_path):
+        session = "cld_ticket_find_shared"
+        _base, s_hash, _c = _stage_and_work(jj_repo, tmp_path, session, mode="shared")
+        assert find_anchor_commit(jj_repo, session) == s_hash
+
     def test_no_match_raises(self, jj_repo, tmp_path):
         with pytest.raises(RuntimeError, match="found 0"):
             find_anchor_commit(jj_repo, "cld_ticket_nonexistent")
 
     def test_several_matches_raises(self, jj_repo, tmp_path):
-        """Two unrelated scratch commits both ancestors of a merge commit that
+        """Two unrelated scratch commits both descendants of the commit that
         carries the bookmark -- heads() returns both, which is unsafe to pick
         from automatically."""
         session = "cld_ticket_dup"
@@ -332,8 +338,7 @@ class TestFindAnchorCommit:
         subprocess.run(["jj", "commit", "-m", f"cld anchor: {session} mode=isolated"],
                         cwd=jj_repo.repo_root, check=True, capture_output=True)
         second = _rev(jj_repo, "@-")
-        jj_repo.run(["new", first, second, "-m", "merge"])
-        subprocess.run(["jj", "bookmark", "create", session, "-r", "@"],
+        subprocess.run(["jj", "bookmark", "create", session, "-r", base],
                         cwd=jj_repo.repo_root, check=True, capture_output=True)
         with pytest.raises(RuntimeError, match="found 2"):
             find_anchor_commit(jj_repo, session)
@@ -395,12 +400,11 @@ class TestMoveAnchorCommit:
         new_c = _rev(jj_repo, 'description(exact:"C\n")')
         assert _rev(jj_repo, f"parents({new_s})") == new_c
 
-    def test_bookmark_rule_moves_bookmark_left_behind(self, jj_repo, tmp_path):
-        """After an isolated move, the bookmark (still on C, which is left
-        behind) must be force-moved onto S'."""
+    def test_isolated_bookmark_follows_the_scratch_commit(self, jj_repo, tmp_path):
+        """The bookmark sits on S and jj moves it along with the rebase."""
         session = "cld_ticket_bm"
         base, s_hash, c_hash = _stage_and_work(jj_repo, tmp_path, session)
-        assert _rev(jj_repo, session) == c_hash  # sanity: bookmark starts on C
+        assert _rev(jj_repo, session) == _rev(jj_repo, s_hash)  # sanity: bookmark starts on S
         jj_repo.run(["new", "root()", "-m", "T"])
         target = _rev(jj_repo, "@")
 
@@ -409,22 +413,18 @@ class TestMoveAnchorCommit:
         new_s = _rev(jj_repo, "description(glob:'cld anchor: " + session + " *')")
         assert _rev(jj_repo, session) == new_s
 
-    def test_bookmark_already_in_place_is_left_alone(self, jj_repo, tmp_path):
-        """shared move: the bookmark (on the working copy above S) already
-        descends from S' -- no bookmark op should run."""
-        session = "cld_ticket_bmok"
-        base, s_hash, c_hash = _stage_and_work(jj_repo, tmp_path, session, mode="shared")
+    def test_shared_bookmark_moves_to_the_target(self, jj_repo, tmp_path):
+        """The bookmark sits on the shared commit; it is not rewritten by the
+        rebase, so it must be force-moved onto the target."""
+        session = "cld_ticket_bmshared"
+        base, s_hash, _c = _stage_and_work(jj_repo, tmp_path, session, mode="shared")
+        assert _rev(jj_repo, session) == base  # sanity: bookmark starts on the shared commit
         jj_repo.run(["new", "root()", "-m", "T"])
         target = _rev(jj_repo, "@")
-        before_bookmark = _rev(jj_repo, session)
 
         move_anchor_commit(jj_repo, s_hash, target, "shared", session)
 
-        # The bookmark's own commit was rewritten by the shared rebase (it
-        # descends from S), but it must still be inside S'::, and jj's normal
-        # bookmark-follows-rewrite behavior must be the only thing that moved it.
-        new_s = _rev(jj_repo, "description(glob:'cld anchor: " + session + " *')")
-        assert _rev(jj_repo, f"{session} & {new_s}::") == _rev(jj_repo, session)
+        assert _rev(jj_repo, session) == target
 
     def test_already_in_place_makes_no_new_op(self, jj_repo, tmp_path):
         session = "cld_ticket_noop"
@@ -468,5 +468,5 @@ class TestRevertOps:
 
         revert_ops(jj_repo, ops)
         assert _rev(jj_repo, f"parents({s_hash})") == base
-        # The bookmark should have followed the revert back onto C.
-        assert _rev(jj_repo, session) != ""
+        # The bookmark should have followed the revert back onto S.
+        assert _rev(jj_repo, session) == _rev(jj_repo, s_hash)

@@ -60,7 +60,7 @@ else
 fi
 export AGENT_ANCHOR_HASH
 echo "[cld] anchor=${AGENT_ANCHOR_HASH:0:12} (mode=$AGENT_ANCHOR_MODE, base=${A_HASH:0:12}, scratch=${B_HASH:0:12})"
-(cd /workspace/current && jj bookmark set "$BOOKMARK" -r @ --allow-backwards)
+(cd /workspace/current && jj bookmark set "$BOOKMARK" -r "$AGENT_ANCHOR_HASH" --allow-backwards)
 
 : > "$CLD_ANCHORS_FILE"
 if ! cld_guard_anchor current /workspace/current "$AGENT_ANCHOR_HASH" \
