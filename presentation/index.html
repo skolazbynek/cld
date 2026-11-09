@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cld Workflow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<style>
+:root {
+  --bg: #f6f7fb;
+  --surface: #ffffff;
+  --ink: #141726;
+  --muted: #5c6378;
+  --faint: #9aa0b4;
+  --line: #e3e5ee;
+  --arch: #5b5bf6;
+  --arch-soft: #ededff;
+  --sec: #0e9f8e;
+  --sec-soft: #def5f0;
+  --feat: #f0623a;
+  --feat-soft: #ffeee6;
+  --past: #e0407b;
+  --past-soft: #ffe6ef;
+  --rw: #e69a00;
+  --rw-soft: #fff1d3;
+  --ro: #5b5bf6;
+  --ro-soft: #ededff;
+  --bad: #e5484d;
+  --bad-soft: #ffe4e4;
+  --shadow: 0 1px 2px rgba(20, 23, 38, .04), 0 10px 28px rgba(20, 23, 38, .07);
+  --shadow-lift: 0 2px 4px rgba(20, 23, 38, .05), 0 20px 44px rgba(20, 23, 38, .13);
+  --accent: var(--arch);
+  --accent-soft: var(--arch-soft);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--ink); min-height: 100vh;
+  font: 18px/1.45 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+code, .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+code { font-size: .88em; background: var(--accent-soft); padding: .08em .4em; border-radius: 7px; }
+button { font: inherit; color: inherit; cursor: pointer; }
+h3, h4 { margin: 0; letter-spacing: -.02em; }
+[data-theme="history"] { --accent: var(--sec); --accent-soft: var(--sec-soft); }
+[data-theme="tools"] { --accent: var(--arch); --accent-soft: var(--arch-soft); }
+[data-theme="feat"] { --accent: var(--feat); --accent-soft: var(--feat-soft); }
+[data-theme="past"] { --accent: var(--past); --accent-soft: var(--past-soft); }
+
+/* ---------- icons ---------- */
+.ic {
+  flex: none; width: 56px; height: 56px; border-radius: 17px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+}
+.ic svg { width: 28px; height: 28px; stroke-width: 2; }
+.ic.lg { width: 76px; height: 76px; border-radius: 22px; }
+.ic.lg svg { width: 38px; height: 38px; }
+.ic.sm { width: 40px; height: 40px; border-radius: 12px; }
+.ic.sm svg { width: 21px; height: 21px; }
+.ic.solid { background: var(--accent); color: #fff; }
+.ic.bad { background: var(--bad-soft); color: var(--bad); }
+.ic.dark { background: var(--ink); color: #fff; }
+.inline-ic svg { width: 1.05em; height: 1.05em; vertical-align: -.16em; stroke-width: 2.2; }
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 20; height: 64px;
+  display: flex; align-items: center; gap: 16px; padding: 0 clamp(16px, 4vw, 48px);
+  background: rgba(246, 247, 251, .86); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: -.02em; text-decoration: none; color: inherit; }
+.brand-mark {
+  width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; color: #fff; font-size: 12px;
+  background: conic-gradient(from 210deg, var(--arch), var(--sec), var(--feat), var(--arch));
+}
+.crumbs { color: var(--muted); font-size: 15px; }
+.crumbs b { color: var(--ink); }
+.nav { margin-left: auto; display: flex; gap: 6px; }
+.nav a { display: inline-flex; align-items: center; gap: 7px; text-decoration: none; font-size: 15px; font-weight: 500; padding: 7px 14px; border-radius: 999px; color: var(--muted); }
+.nav a svg { width: 17px; height: 17px; }
+.nav a:hover { background: var(--surface); color: var(--ink); }
+.nav a.on { background: var(--ink); color: #fff; }
+@media (max-width: 680px) { .nav { display: none; } }
+
+main { max-width: 1320px; margin: 0 auto; padding: 0 clamp(16px, 4vw, 48px); }
+.view { display: none; }
+.view.on { display: block; }
+
+/* ---------- home ---------- */
+.home { min-height: calc(100vh - 64px); display: flex; flex-direction: column; justify-content: center; padding: 48px 0; position: relative; }
+.blob { position: absolute; border-radius: 50%; filter: blur(70px); opacity: .45; z-index: -1; pointer-events: none; }
+.blob.a { width: 420px; height: 420px; background: #c8c8ff; top: 0; right: 6%; }
+.blob.b { width: 320px; height: 320px; background: #bff0e6; top: 220px; right: 34%; }
+.blob.c { width: 280px; height: 280px; background: #ffd9cb; top: 60px; left: -80px; }
+.home h1 { font-size: clamp(48px, 7.5vw, 96px); line-height: 1; letter-spacing: -.045em; margin: 0 0 18px; font-weight: 800; }
+.home h1 span { background: linear-gradient(100deg, var(--arch), var(--sec) 55%, var(--feat)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.home .lead { font-size: clamp(20px, 2.2vw, 25px); color: var(--muted); margin: 0; max-width: 720px; }
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 22px; margin-top: 60px; }
+@media (max-width: 1100px) { .tiles { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 640px) { .tiles { grid-template-columns: 1fr; } }
+.tile {
+  position: relative; overflow: hidden; text-decoration: none; color: inherit; display: flex; flex-direction: column; gap: 14px;
+  min-height: 300px; padding: 32px; border-radius: 28px; background: var(--surface); border: 1px solid var(--line);
+  box-shadow: var(--shadow); transition: transform .25s ease, box-shadow .25s ease;
+}
+.tile::before { content: ""; position: absolute; inset: 0; background: radial-gradient(120% 70% at 100% 0%, var(--accent-soft), transparent 60%); }
+.tile > * { position: relative; }
+.tile:hover, .tile:focus-visible { transform: translateY(-6px); box-shadow: var(--shadow-lift); outline: none; }
+.tile .num { position: absolute; top: 34px; right: 32px; font-size: 14px; font-weight: 700; color: var(--accent); letter-spacing: .1em; }
+.tile h2 { font-size: 40px; letter-spacing: -.035em; margin: auto 0 0; }
+.tile p { margin: 0; color: var(--muted); font-size: 19px; }
+.tile .go { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; color: var(--accent); }
+.tile .go svg { width: 20px; height: 20px; transition: transform .2s; }
+.tile:hover .go svg { transform: translateX(5px); }
+.kbd-hint { color: var(--faint); font-size: 14px; margin-top: 40px; }
+kbd { font-family: "JetBrains Mono", monospace; font-size: 12px; padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 6px; background: var(--surface); }
+
+/* ---------- slides ---------- */
+.slide { display: none; min-height: calc(100vh - 64px - 84px); padding: 40px 0 28px; flex-direction: column; }
+.slide.on { display: flex; animation: enter .45s cubic-bezier(.2, .7, .2, 1); }
+@keyframes enter { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+.slide-head { display: flex; align-items: center; gap: 22px; }
+.eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: 13px; font-weight: 700; color: var(--accent); }
+.slide h2 { font-size: clamp(36px, 5vw, 60px); line-height: 1.04; letter-spacing: -.04em; margin: 4px 0 0; }
+.slide .sub { font-size: clamp(19px, 2vw, 23px); color: var(--muted); margin: 14px 0 0; max-width: 860px; }
+.stage { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-top: 36px; gap: 28px; }
+
+.pager {
+  position: sticky; bottom: 0; height: 84px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: linear-gradient(transparent, var(--bg) 30%);
+}
+.dots { display: flex; gap: 8px; }
+.dots button { width: 12px; height: 12px; padding: 0; border-radius: 99px; border: 0; background: #d5d8e4; transition: all .25s; }
+.dots button.on { width: 34px; background: var(--accent); }
+.pager .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--line); background: var(--surface); padding: 10px 18px; border-radius: 14px; font-weight: 600; font-size: 15px; min-width: 130px; }
+.pager .btn:disabled { opacity: .35; cursor: default; }
+.pager .btn.next { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* ---------- building blocks ---------- */
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); padding: 26px; }
+.card h3 { font-size: 24px; }
+.card p { margin: 6px 0 0; color: var(--muted); font-size: 17px; }
+.banner {
+  display: flex; align-items: center; gap: 16px; padding: 18px 22px; border-radius: 20px;
+  background: var(--accent-soft); font-size: 20px; font-weight: 600; letter-spacing: -.01em; align-self: center;
+}
+.banner .ic { background: var(--surface); }
+.banner.no { background: var(--bad-soft); color: #b4232a; }
+.banners { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; }
+.arrow-ic { color: var(--accent); display: grid; place-items: center; }
+.arrow-ic svg { width: 34px; height: 34px; stroke-width: 2.4; }
+pre.cmd { margin: 0; padding: 20px 24px; border-radius: 18px; background: var(--ink); color: #e9ebff; overflow-x: auto; font-size: 17px; line-height: 1.6; }
+pre.cmd code { background: none; color: inherit; padding: 0; font-size: 1em; }
+pre.cmd .c { color: #8b91ad; }
+pre.cmd .k { color: #ffb59c; }
+pre.cmd .t { color: #9ee6d6; }
+.code-title { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin-bottom: 10px; }
+.code-title svg { width: 18px; height: 18px; }
+
+/* icon flow: big circles joined by a line */
+.iflow { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; position: relative; }
+.iflow::before { content: ""; position: absolute; top: 48px; left: 12%; right: 12%; height: 4px; border-radius: 4px; background: var(--line); }
+.iflow.live::after {
+  content: ""; position: absolute; top: 46px; height: 8px; width: 9%; border-radius: 8px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: travel 2.8s linear infinite;
+}
+@keyframes travel { from { left: 10%; } to { left: 81%; } }
+.istep { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 14px; position: relative; z-index: 1; padding: 0 8px; }
+.istep .ring { width: 100px; height: 100px; border-radius: 50%; display: grid; place-items: center; background: var(--surface); border: 3px solid var(--accent); color: var(--accent); box-shadow: var(--shadow); }
+.istep .ring svg { width: 42px; height: 42px; }
+.istep.end .ring { background: var(--accent); color: #fff; }
+.istep h3 { font-size: 22px; }
+.istep p { margin: -6px 0 0; color: var(--muted); font-size: 16px; }
+@media (max-width: 760px) { .iflow { grid-auto-flow: row; gap: 22px; } .iflow::before, .iflow.live::after { display: none; } }
+
+/* ---------- problem pages ---------- */
+.want { display: grid; grid-template-columns: 1fr 170px 1fr; align-items: center; gap: 8px; max-width: 1060px; margin: 0 auto; width: 100%; }
+@media (max-width: 820px) { .want { grid-template-columns: 1fr; gap: 16px; } }
+.want-side { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; padding: 32px 24px; border-radius: 28px; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.want-side h3 { font-size: 27px; }
+.want-side p { margin: 0; font-size: 17px; color: var(--muted); }
+.want-side.out { background: #fafafc; border-style: dashed; box-shadow: none; }
+.want-side.out h3 { color: var(--faint); }
+.want-cut { position: relative; display: grid; place-items: center; }
+.want-cut::before { content: ""; position: absolute; left: -8px; right: -8px; top: 40px; height: 4px; border-radius: 4px; background: repeating-linear-gradient(90deg, #edb9bb 0 8px, transparent 8px 16px); }
+@media (max-width: 820px) { .want-cut::before { left: auto; right: auto; top: -8px; bottom: -8px; width: 4px; height: auto; background: repeating-linear-gradient(180deg, #edb9bb 0 8px, transparent 8px 16px); } }
+.want-cut .ic { position: relative; z-index: 1; }
+.chips { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+.chip { display: inline-flex; align-items: center; gap: 8px; padding: 9px 16px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 16px; font-weight: 600; box-shadow: var(--shadow); }
+.chip svg { width: 18px; height: 18px; color: var(--accent); }
+
+/* ---------- mounts ---------- */
+.mounts { display: grid; grid-template-columns: minmax(0, 1fr) 190px minmax(0, 1fr); gap: 12px 0; align-items: center; max-width: 1100px; margin: 0 auto; width: 100%; }
+.mounts .side-h { display: flex; align-items: center; gap: 12px; font-size: 22px; font-weight: 800; letter-spacing: -.02em; padding: 0 4px 6px; }
+.mounts .end { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); font-family: "JetBrains Mono", monospace; font-size: 16px; font-weight: 600; min-width: 0; }
+.mounts .end span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mounts .wire { position: relative; height: 4px; margin: 0 10px; border-radius: 4px; }
+.mounts .wire::after { content: ""; position: absolute; right: -4px; top: 50%; width: 12px; height: 12px; border-top: 4px solid currentColor; border-right: 4px solid currentColor; transform: translateY(-50%) rotate(45deg); border-radius: 2px; }
+.mounts .wire .pill { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+.wire.rw { background: var(--rw); color: var(--rw); }
+.wire.ro { background: repeating-linear-gradient(90deg, var(--ro) 0 10px, transparent 10px 16px); color: var(--ro); }
+.wire.fwd { background: repeating-linear-gradient(90deg, #7a8299 0 4px, transparent 4px 9px); color: #7a8299; }
+.wire.no { background: var(--bad-soft); color: var(--bad); }
+.wire.no::after { display: none; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; padding: 5px 12px; border-radius: 999px; white-space: nowrap; }
+.pill svg { width: 15px; height: 15px; }
+.pill.rw { background: var(--rw-soft); color: #8a5a00; }
+.pill.ro { background: var(--ro-soft); color: #3b3bc4; }
+.pill.fwd { background: #e7ecf5; color: #44506b; }
+.pill.no { background: var(--bad-soft); color: #b4232a; }
+.mounts .end.never { background: #fafafc; color: var(--faint); text-decoration: line-through; box-shadow: none; }
+.mounts .end.never .ic { background: var(--bad-soft); color: var(--bad); }
+.mounts .gapline { grid-column: 1 / -1; height: 10px; }
+@media (max-width: 820px) { .mounts { grid-template-columns: 1fr; } .mounts .wire { height: 34px; background: none !important; margin: 0; } .mounts .wire::after { display: none; } .mounts .side-h:nth-child(3) { display: none; } }
+
+/* ---------- broker (missing tools) ---------- */
+.broker { display: grid; grid-template-columns: 1fr auto 1.35fr auto 1fr; align-items: center; gap: 0; }
+@media (max-width: 960px) { .broker { grid-template-columns: 1fr; gap: 14px; } .broker .hop { transform: rotate(90deg); } }
+.broker .hop { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 0 14px; font-size: 14px; font-weight: 700; color: var(--muted); text-align: center; }
+.broker .side { display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; }
+.broker .core { border: 3px solid var(--accent); display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.act { display: inline-flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 600; padding: 7px 13px; border-radius: 12px; background: var(--accent-soft); }
+.act svg { width: 17px; height: 17px; color: var(--accent); }
+.broker .stack { display: grid; gap: 14px; }
+.broker .stack .card { display: flex; align-items: center; gap: 14px; padding: 18px; }
+.broker .stack h3 { font-size: 20px; }
+
+.lbl { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.lbl svg { width: 18px; height: 18px; }
+
+/* ---------- anchor graph ---------- */
+.rule { display: flex; align-items: center; justify-content: center; gap: 16px; text-align: center; font-size: clamp(24px, 2.8vw, 34px); font-weight: 800; letter-spacing: -.025em; margin: 0; }
+.rule em { font-style: normal; color: var(--accent); }
+.toggle { display: inline-flex; padding: 5px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); align-self: center; box-shadow: var(--shadow); }
+.toggle button { display: inline-flex; align-items: center; gap: 8px; border: 0; background: none; padding: 9px 22px; border-radius: 999px; font-size: 17px; font-weight: 700; color: var(--muted); }
+.toggle button svg { width: 18px; height: 18px; }
+.toggle button.on { background: var(--accent); color: #fff; }
+.graph { padding: 18px 26px; }
+.graph svg { width: 100%; height: auto; display: block; }
+.graph svg text { font-family: Inter, sans-serif; font-size: 16px; font-weight: 600; fill: var(--ink); }
+.graph svg .sub { font-size: 14px; font-weight: 500; fill: var(--muted); }
+.graph svg .zr { transition: all .45s cubic-bezier(.2, .7, .2, 1); }
+.graph svg .fade { transition: opacity .35s; }
+.anchor-note { text-align: center; font-size: 20px; color: var(--muted); margin: 0; }
+.anchor-note b { color: var(--ink); }
+
+/* ---------- revision tree (problem) ---------- */
+.tree-card { padding: 10px 20px 18px; }
+.tree svg { width: 100%; height: auto; display: block; font-family: Inter, sans-serif; }
+.tree svg text { font-size: 15px; font-weight: 600; fill: var(--ink); }
+.tree svg .sub { font-size: 13px; font-weight: 500; fill: var(--muted); }
+.tree svg .tree-t { font-size: 13px; font-weight: 800; letter-spacing: .12em; fill: var(--muted); }
+.tree svg .mono { font-family: "JetBrains Mono", monospace; font-size: 13px; font-weight: 600; }
+.tree svg .link { stroke: #c7cad8; stroke-width: 4; fill: none; }
+.tree svg .link.mine { stroke: #141726; }
+.tree svg .ghost-node { fill: #fff; stroke: #edb9bb; stroke-width: 3; stroke-dasharray: 6 5; }
+.tree svg .gone { fill: #b9bece; }
+.tree svg .accent-node { fill: var(--accent); }
+.tree svg .bm { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+.tree svg .moved { stroke: #b4232a; stroke-width: 3; stroke-dasharray: 6 5; fill: none; }
+.tree svg .moved-head { fill: #b4232a; }
+.tree svg .mine-ring { fill: #fff; stroke: #141726; stroke-width: 4; }
+.tree svg .mine-node { fill: #141726; }
+.tree svg .flag { font-family: Inter, sans-serif; font-size: 13px; font-weight: 700; fill: #b4232a; }
+.tree svg .blink { animation: blink 2.4s ease-in-out infinite; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+.lg-item { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; color: var(--muted); padding: 7px 14px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); }
+.lg-item .dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+.lg-item .dot.solid { background: #c7cad8; }
+.lg-item .dot.mine { background: #141726; }
+.lg-item .dot.ghost { background: #fff; border: 2px dashed #b4232a; }
+
+/* ---------- launch steps ---------- */
+.steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; position: relative; }
+@media (max-width: 960px) { .steps { grid-template-columns: 1fr 1fr; } }
+.steps .card { display: flex; flex-direction: column; gap: 16px; padding: 28px; position: relative; }
+.steps .card .n { position: absolute; top: 22px; right: 24px; font-size: 44px; font-weight: 800; color: var(--accent-soft); line-height: 1; }
+.steps .card h3 { font-size: 28px; }
+.steps .card p { margin: 0; font-size: 17px; }
+
+/* ---------- guards ---------- */
+.scen { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+.scen button { display: inline-flex; align-items: center; gap: 8px; border: 1.5px solid var(--line); background: var(--surface); padding: 10px 18px; border-radius: 999px; font-size: 16px; font-weight: 600; box-shadow: var(--shadow); }
+.scen button svg { width: 17px; height: 17px; color: var(--accent); }
+.scen button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+.scen button.on svg { color: #fff; }
+.guards { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 0; align-items: stretch; }
+@media (max-width: 900px) { .guards { grid-template-columns: 1fr; gap: 12px; } .guards .arrow-ic { transform: rotate(90deg); } }
+.guards .arrow-ic { padding: 0 8px; color: var(--faint); }
+.guard { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 14px; padding: 30px 22px; transition: all .25s; position: relative; border: 2px solid var(--line); }
+.guard .when { font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.guard h3 { font-size: 26px; }
+.guard .verdict { opacity: 0; transform: scale(.9); transition: all .2s; font-size: 15px; padding: 7px 14px; }
+.guards.focus .guard { opacity: .35; }
+.guards.focus .guard.hit { opacity: 1; border-color: var(--accent); box-shadow: 0 0 0 5px var(--accent-soft), var(--shadow-lift); transform: translateY(-4px); }
+.guards.focus .guard.hit .verdict { opacity: 1; transform: none; }
+
+/* ---------- barrier ---------- */
+.barrier { display: grid; grid-template-columns: 1fr 170px 1fr; align-items: stretch; }
+@media (max-width: 900px) { .barrier { grid-template-columns: 1fr; gap: 14px; } .barrier .wall { min-height: 90px; } }
+.barrier .side { display: flex; flex-direction: column; gap: 16px; }
+.barrier .side-title { display: flex; align-items: center; gap: 14px; }
+.barrier .row { display: flex; align-items: center; gap: 14px; font-size: 20px; font-weight: 700; letter-spacing: -.01em; }
+.barrier .wall { position: relative; display: grid; place-items: center; }
+.barrier .wall::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 14px; transform: translateX(-50%); border-radius: 7px; background: repeating-linear-gradient(180deg, #c9ccdb 0 18px, transparent 18px 26px); }
+.barrier .gate { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; background: var(--accent); color: #fff; font-weight: 800; font-size: 16px; padding: 16px 14px; border-radius: 20px; text-align: center; box-shadow: var(--shadow-lift); }
+.barrier .gate svg { width: 30px; height: 30px; }
+.barrier .gate small { font-weight: 600; opacity: .85; font-size: 13px; }
+.tiles4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+@media (max-width: 960px) { .tiles4 { grid-template-columns: 1fr 1fr; } }
+.tiles4 .card, .layers .card { display: flex; flex-direction: column; gap: 14px; }
+.tiles4 h3 { font-size: 22px; }
+.tiles4 p, .layers p { margin: 0; font-size: 16px; }
+.layers { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px; }
+.layers { align-items: start; }
+.layers .card { padding: 28px; text-align: left; position: relative; transition: all .25s; }
+.layers .card::after { content: "+"; position: absolute; top: 22px; right: 24px; font-size: 26px; font-weight: 600; color: var(--faint); transition: transform .25s; }
+.layers .card:hover { border-color: var(--accent); }
+.layers .card.open { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow-lift); }
+.layers .card.open::after { transform: rotate(45deg); color: var(--accent); }
+.layers h3 { font-size: 23px; }
+.layers .more { display: block; max-height: 0; overflow: hidden; opacity: 0; font-size: 16px; line-height: 1.5; color: var(--ink); margin-top: -14px; transition: max-height .35s ease, opacity .25s, margin .25s; }
+.layers .card.open .more { max-height: 320px; opacity: 1; margin-top: 0; }
+
+/* ---------- chain ---------- */
+.chain { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }
+.chain .par { display: grid; gap: 12px; padding: 16px; border-radius: 24px; border: 2px dashed #f5b6a2; background: var(--feat-soft); }
+.chain .par > .lbl { justify-content: center; color: var(--accent); }
+.chain .step { display: flex; align-items: center; gap: 14px; padding: 16px 20px; min-width: 220px; }
+.chain .step h3 { font-size: 21px; }
+.chain .step.end { background: var(--accent); color: #fff; border-color: var(--accent); }
+.chain .step.end .ic { background: rgba(255, 255, 255, .2); color: #fff; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+@media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+/* ---------- the past ---------- */
+.timeline { display: grid; grid-template-columns: repeat(5, 1fr); position: relative; }
+.timeline::before { content: ""; position: absolute; top: 88px; left: 10%; right: 10%; height: 4px; border-radius: 4px; background: linear-gradient(90deg, #f3c1d4, var(--accent)); }
+.tl { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 14px; text-decoration: none; color: inherit; position: relative; padding: 0 8px; }
+.tl .date { font-size: 14px; font-weight: 800; letter-spacing: .06em; color: var(--accent); background: var(--surface); border: 1px solid var(--line); padding: 4px 12px; border-radius: 999px; }
+.tl .ring { width: 100px; height: 100px; border-radius: 50%; display: grid; place-items: center; background: var(--surface); border: 3px solid var(--accent); color: var(--accent); box-shadow: var(--shadow); transition: transform .2s; }
+.tl .ring svg { width: 42px; height: 42px; }
+.tl:hover .ring { transform: scale(1.08); }
+.tl.today .ring { background: var(--accent); color: #fff; }
+.tl h3 { font-size: 21px; }
+@media (max-width: 860px) { .timeline { grid-template-columns: 1fr; gap: 22px; } .timeline::before { display: none; } }
+.era { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }
+.ent { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; min-width: 210px; position: relative; }
+.ent h3 { font-size: 22px; }
+.ent .pill { margin-top: 2px; }
+.ent.ghost { border: 2px dashed #e3a5bd; box-shadow: none; background: #fffafc; }
+.hop { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 0 16px; font-size: 14px; font-weight: 700; color: var(--muted); text-align: center; }
+.hop.both .arrow-ic svg { width: 40px; }
+.mini { display: flex; align-items: center; gap: 8px; }
+.mini .card { padding: 14px; border-radius: 18px; }
+.mini .arrow-ic svg { width: 24px; height: 24px; }
+.group { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px 22px; border-radius: 26px; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.group > .lbl { color: var(--accent); }
+.fan { display: grid; gap: 12px; }
+.fan .card { display: flex; align-items: center; gap: 14px; padding: 14px 18px; }
+.fan .card h3 { font-size: 19px; }
+.pzone { display: flex; flex-direction: column; gap: 14px; padding: 18px; border-radius: 26px; border: 2px dashed var(--accent); background: var(--accent-soft); }
+.pzone > .lbl { color: var(--ink); }
+.pzone .row { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+.pzone .ent { min-width: 150px; padding: 18px; }
+.pill.past { background: var(--accent-soft); color: var(--accent); }
+.cmd-wrap { max-width: 980px; width: 100%; align-self: center; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="#/"><span class="brand-mark">cld</span>Workflow</a>
+  <span class="crumbs" id="crumbs"></span>
+  <nav class="nav" id="nav">
+    <a href="#/history"><i data-lucide="git-fork"></i>Shared History</a>
+    <a href="#/tools"><i data-lucide="key-round"></i>Missing Tools</a>
+    <a href="#/features"><i data-lucide="rocket"></i>Features</a>
+    <a href="#/past"><i data-lucide="history"></i>The Past</a>
+  </nav>
+</header>
+
+<main>
+
+<!-- ================= HOME ================= -->
+<section class="view" id="view-home">
+  <div class="home">
+    <div class="blob a"></div><div class="blob b"></div><div class="blob c"></div>
+    <h1>Working with <span>cld</span></h1>
+    <p class="lead">Claude Code in a sandbox container per ticket, driven from my host terminal. Two problems it raised, and what I built for them.</p>
+    <div class="tiles">
+      <a class="tile" href="#/history" data-theme="history">
+        <span class="ic lg solid"><i data-lucide="git-fork"></i></span><span class="num">01</span>
+        <h2>Shared History</h2><p>Agents must not rewrite what others build on.</p>
+        <span class="go">Open <i data-lucide="arrow-right"></i></span>
+      </a>
+      <a class="tile" href="#/tools" data-theme="tools">
+        <span class="ic lg solid"><i data-lucide="key-round"></i></span><span class="num">02</span>
+        <h2>Missing Tools</h2><p>No Docker, no secrets. The broker fills both.</p>
+        <span class="go">Open <i data-lucide="arrow-right"></i></span>
+      </a>
+      <a class="tile" href="#/features" data-theme="feat">
+        <span class="ic lg solid"><i data-lucide="rocket"></i></span><span class="num">03</span>
+        <h2>Features</h2><p>Headless runs and chains.</p>
+        <span class="go">Open <i data-lucide="arrow-right"></i></span>
+      </a>
+      <a class="tile" href="#/past" data-theme="past">
+        <span class="ic lg solid"><i data-lucide="history"></i></span><span class="num">04</span>
+        <h2>The Past</h2><p>How cld got here.</p>
+        <span class="go">Open <i data-lucide="arrow-right"></i></span>
+      </a>
+    </div>
+    <p class="kbd-hint"><kbd>1</kbd>&ndash;<kbd>4</kbd> open a topic &middot; <kbd>&larr;</kbd> <kbd>&rarr;</kbd> slides &middot; <kbd>Esc</kbd> home</p>
+  </div>
+</section>
+
+<!-- ================= SHARED HISTORY ================= -->
+<section class="view" id="view-history" data-theme="history">
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="refresh-cw"></i></span><div><div class="eyebrow">Shared History &middot; The setup</div><h2>Store sync</h2></div></div>
+    <p class="sub">Workspaces live inside the container. Every edit lands in the shared host history within seconds.</p>
+    <div class="stage">
+      <div class="iflow live">
+        <div class="istep"><span class="ring"><i data-lucide="pencil-line"></i></span><h3>Edit</h3><p>in the container</p></div>
+        <div class="istep"><span class="ring"><i data-lucide="eye"></i></span><h3>watchman</h3><p>sees the change</p></div>
+        <div class="istep"><span class="ring"><i data-lucide="camera"></i></span><h3>jj snapshot</h3><p>into the commit</p></div>
+        <div class="istep end"><span class="ring"><i data-lucide="database"></i></span><h3>Host store</h3><p>visible at once</p></div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="folder-x"></i></span>No host checkout needed</div>
+        <div class="banner"><span class="ic"><i data-lucide="history"></i></span>Commits outlive the container</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg bad"><i data-lucide="git-fork"></i></span><div><div class="eyebrow">Shared History &middot; Problem</div><h2>Two agents, one branch</h2></div></div>
+    <p class="sub">Both started from the same commit. Agent 1 rewrites it. Agent 2 keeps committing on top of it.</p>
+    <div class="stage">
+      <div class="card tree-card tree">
+        <svg viewBox="0 0 900 300">
+          <text class="tree-t" x="20" y="28">AGENT 1 &middot; FORCE-PUSHED</text>
+          <text class="tree-t" x="20" y="255">AGENT 2 &middot; STILL WORKING</text>
+
+          <path class="link" d="M40 96 H140"/>
+          <path class="link" d="M140 96 H250"/>
+          <path class="link" d="M140 96 C 170 96, 205 250, 250 250"/>
+
+          <circle class="gone" cx="40" cy="96" r="11"/>
+          <circle class="gone" cx="140" cy="96" r="11"/>
+          <circle class="accent-node" cx="250" cy="96" r="16"/>
+          <rect class="bm" x="278" y="84" width="72" height="24" rx="12"/>
+          <text class="mono" x="314" y="101" text-anchor="middle">main</text>
+
+          <path class="moved" d="M240 230 C 246 200, 240 160, 240 122"/>
+          <path class="moved-head" d="M240 104 l -8 16 h 16 z"/>
+
+          <circle class="ghost-node" cx="250" cy="250" r="16"/>
+
+          <path class="link mine" d="M266 250 H700"/>
+
+          <circle class="mine-node" cx="420" cy="250" r="16"/>
+          <text x="420" y="224" text-anchor="middle">parse the config</text>
+
+          <circle class="mine-node" cx="560" cy="250" r="16"/>
+          <text x="560" y="224" text-anchor="middle">fix the import</text>
+
+          <circle class="mine-ring" cx="700" cy="250" r="16"/>
+          <text class="sub" x="700" y="292" text-anchor="middle">agent 2</text>
+        </svg>
+      </div>
+      <div class="legend">
+        <span class="lg-item"><span class="dot solid"></span>commit on the branch</span>
+        <span class="lg-item"><span class="dot mine"></span>agent 2's commits</span>
+        <span class="lg-item"><span class="dot ghost"></span>dropped from the branch</span>
+      </div>
+      <div class="banners">
+        <div class="banner no"><span class="ic"><i data-lucide="git-fork"></i></span>A forced push replaces commits the other agent is still building on</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="anchor"></i></span><div><div class="eyebrow">Shared History &middot; The answer</div><h2>The anchor contract</h2></div></div>
+    <div class="stage">
+      <p class="rule">Edit only <em>descendants</em> of the anchor. Never rewrite it.</p>
+      <div class="toggle" id="anchor-toggle">
+        <button class="on" data-mode="isolated"><i data-lucide="git-branch"></i>Isolated</button>
+        <button data-mode="shared"><i data-lucide="git-fork"></i>Shared</button>
+      </div>
+      <div class="card graph">
+        <svg viewBox="0 0 800 220">
+          <rect class="zr" id="az" x="290" y="22" width="472" height="116" rx="24" fill="#def5f0" stroke="#0e9f8e" stroke-width="2" stroke-dasharray="8 7"/>
+          <text x="740" y="54" text-anchor="end" fill="#0e9f8e">editable</text>
+          <line x1="40" y1="92" x2="220" y2="92" stroke="#c7cad8" stroke-width="4"/>
+          <line x1="220" y1="92" x2="690" y2="92" stroke="#0e9f8e" stroke-width="4"/>
+          <path d="M220 92 C 262 92, 262 178, 322 178 L 446 178" stroke="#c7cad8" stroke-width="4" fill="none"/>
+          <circle cx="40" cy="92" r="11" fill="#c7cad8"/><text x="40" y="130" text-anchor="middle" class="sub">trunk</text>
+          <circle cx="130" cy="92" r="11" fill="#c7cad8"/>
+          <rect x="204" y="76" width="32" height="32" rx="5" transform="rotate(45 220 92)" fill="#141726"/>
+          <text x="220" y="50" text-anchor="middle" font-size="18">A &middot; anchor</text>
+          <g class="fade" id="node-b">
+            <circle cx="345" cy="92" r="15" fill="#fff" stroke="#0e9f8e" stroke-width="4"/>
+            <text x="345" y="132" text-anchor="middle" class="sub">B &middot; scratch</text>
+          </g>
+          <circle cx="465" cy="92" r="14" fill="#0e9f8e"/><text x="465" y="132" text-anchor="middle" class="sub">my work</text>
+          <circle cx="580" cy="92" r="14" fill="#0e9f8e"/><text x="580" y="132" text-anchor="middle" class="sub">my work</text>
+          <circle cx="690" cy="92" r="14" fill="#fff" stroke="#0e9f8e" stroke-width="4"/><text x="690" y="132" text-anchor="middle" class="sub">@</text>
+          <circle cx="446" cy="178" r="14" fill="#c7cad8" id="sib" style="transition:fill .35s"/><text x="472" y="183" class="sub">other work on A</text>
+        </svg>
+      </div>
+      <p class="anchor-note" id="anchor-note"></p>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="rocket"></i></span><div><div class="eyebrow">Shared History &middot; The answer</div><h2>Applied at launch</h2></div></div>
+    <p class="sub">Set up per repo on every container boot, before Claude starts.</p>
+    <div class="stage">
+      <div class="steps">
+        <div class="card"><span class="n">1</span><span class="ic lg"><i data-lucide="search"></i></span><h3>Resolve</h3><p><code>repo@rev</code>, default, or <code>trunk()</code></p></div>
+        <div class="card"><span class="n">2</span><span class="ic lg"><i data-lucide="git-commit-horizontal"></i></span><h3>Stage</h3><p>scratch commit B on the anchor</p></div>
+        <div class="card"><span class="n">3</span><span class="ic lg"><i data-lucide="lock"></i></span><h3>Lock</h3><p>outside the tree is immutable</p></div>
+        <div class="card"><span class="n">4</span><span class="ic lg"><i data-lucide="file-text"></i></span><h3>Tell</h3><p>CLAUDE.md states the rule</p></div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="monitor"></i></span>Only the host moves an anchor</div>
+        <div class="banner"><span class="ic"><i data-lucide="triangle-alert"></i></span>Overlapping tickets get a warning</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="shield-check"></i></span><div><div class="eyebrow">Shared History &middot; The answer</div><h2>Enforced on every tool call</h2></div></div>
+    <p class="sub">Pick an attempt to see which guard stops it.</p>
+    <div class="stage">
+      <div class="scen" id="scen"></div>
+      <div class="guards" id="guards">
+        <div class="card guard" data-g="pre"><div class="when">Before the call</div><span class="ic lg"><i data-lucide="shield"></i></span><h3>PreToolUse hook</h3><span class="pill no verdict"><i data-lucide="shield-ban"></i>blocked</span></div>
+        <span class="arrow-ic"><i data-lucide="arrow-right"></i></span>
+        <div class="card guard" data-g="jj"><div class="when">Inside jj</div><span class="ic lg"><i data-lucide="lock"></i></span><h3>Immutability</h3><span class="pill no verdict"><i data-lucide="shield-ban"></i>blocked</span></div>
+        <span class="arrow-ic"><i data-lucide="arrow-right"></i></span>
+        <div class="card guard" data-g="post"><div class="when">After the call</div><span class="ic lg"><i data-lucide="scan-eye"></i></span><h3>PostToolUse hook</h3><span class="pill rw verdict"><i data-lucide="triangle-alert"></i>reported</span></div>
+      </div>
+      <div class="banner"><span class="ic"><i data-lucide="lock"></i></span>Always on, even with permission prompts off</div>
+    </div>
+  </div>
+
+</section>
+
+<!-- ================= MISSING TOOLS ================= -->
+<section class="view" id="view-tools" data-theme="tools">
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="cable"></i></span><div><div class="eyebrow">Missing Tools &middot; The setup</div><h2>What is mounted</h2></div></div>
+    <p class="sub">A fixed list. The docker socket and the untracked files are on it as "never".</p>
+    <div class="stage">
+      <div class="mounts">
+        <div class="side-h"><span class="ic sm"><i data-lucide="monitor"></i></span>Host</div><div></div><div class="side-h"><span class="ic sm"><i data-lucide="container"></i></span>Ticket container</div>
+
+        <div class="end"><span class="ic sm"><i data-lucide="database"></i></span><span>&lt;repo&gt;/.jj .git</span></div>
+        <div class="wire rw"><span class="pill rw"><i data-lucide="pencil"></i>read-write</span></div>
+        <div class="end"><span>/workspace/origin/&lt;repo&gt;</span></div>
+
+        <div class="end"><span class="ic sm"><i data-lucide="bot"></i></span><span>~/.claude</span></div>
+        <div class="wire rw"><span class="pill rw"><i data-lucide="pencil"></i>read-write</span></div>
+        <div class="end"><span>~/.claude</span></div>
+
+        <div class="end"><span class="ic sm"><i data-lucide="settings"></i></span><span>configs, plugins</span></div>
+        <div class="wire ro"><span class="pill ro"><i data-lucide="eye"></i>read-only</span></div>
+        <div class="end"><span>copied at boot</span></div>
+
+        <div class="end"><span class="ic sm"><i data-lucide="key-round"></i></span><span>broker key</span></div>
+        <div class="wire ro"><span class="pill ro"><i data-lucide="eye"></i>read-only</span></div>
+        <div class="end"><span>cld broker</span></div>
+
+        <div class="end"><span class="ic sm"><i data-lucide="fingerprint"></i></span><span>SSH agent</span></div>
+        <div class="wire fwd"><span class="pill fwd"><i data-lucide="share-2"></i>forwarded</span></div>
+        <div class="end"><span>git push</span></div>
+
+        <div class="gapline"></div>
+
+        <div class="end never"><span class="ic sm"><i data-lucide="folder-x"></i></span><span>checkout, .env</span></div>
+        <div class="wire no"><span class="pill no"><i data-lucide="ban"></i>never</span></div>
+        <div class="end never"><span>&mdash;</span></div>
+
+        <div class="end never"><span class="ic sm"><i data-lucide="unplug"></i></span><span>docker socket</span></div>
+        <div class="wire no"><span class="pill no"><i data-lucide="ban"></i>never</span></div>
+        <div class="end never"><span>&mdash;</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg bad"><i data-lucide="container"></i></span><div><div class="eyebrow">Missing Tools &middot; Problem</div><h2>No Docker inside</h2></div></div>
+    <p class="sub">Half of my work is containers. Claude has to run them to see whether its own change works.</p>
+    <div class="stage">
+      <div class="want">
+        <div class="want-side"><span class="ic lg"><i data-lucide="play"></i></span><h3>The work needs it</h3><p>Build an image, start it, call it, read the log.</p></div>
+        <div class="want-cut"><span class="ic lg bad"><i data-lucide="unplug"></i></span></div>
+        <div class="want-side out"><span class="ic lg bad"><i data-lucide="ban"></i></span><h3>The container has none</h3><p>No docker socket, no daemon, no sibling containers.</p></div>
+      </div>
+      <div class="banners">
+        <div class="banner no"><span class="ic"><i data-lucide="unplug"></i></span>A shared socket would let one container control every other one</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg bad"><i data-lucide="file-key"></i></span><div><div class="eyebrow">Missing Tools &middot; Problem</div><h2>No secrets either</h2></div></div>
+    <p class="sub">Tokens, passwords and <code>.env</code> files stay on the host. Testing and logging in both need them.</p>
+    <div class="stage">
+      <div class="want">
+        <div class="want-side"><span class="ic lg"><i data-lucide="key-round"></i></span><h3>The work needs it</h3><p>A token for the API, a password for the database, a real environment to run against.</p></div>
+        <div class="want-cut"><span class="ic lg bad"><i data-lucide="file-x"></i></span></div>
+        <div class="want-side out"><span class="ic lg bad"><i data-lucide="ban"></i></span><h3>The container has none</h3><p>No <code>.env</code>, no keys, no host checkout.</p></div>
+      </div>
+      <div class="banners">
+        <div class="banner no"><span class="ic"><i data-lucide="message-square-warning"></i></span>A pasted token ends up in the transcript</div>
+        <div class="banner no"><span class="ic"><i data-lucide="folder-x"></i></span>A mounted <code>.env</code> reaches every agent</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="key-round"></i></span><div><div class="eyebrow">Missing Tools &middot; The answer</div><h2>The broker</h2></div></div>
+    <p class="sub">One SSH door to the host. It runs containers and hands out secrets, on its own terms.</p>
+    <div class="stage">
+      <div class="broker">
+        <div class="card side"><span class="ic lg"><i data-lucide="container"></i></span><h3>Ticket container</h3><code>cld broker &hellip;</code></div>
+        <div class="hop"><span class="arrow-ic"><i data-lucide="arrow-right"></i></span>SSH</div>
+        <div class="card core"><span class="ic lg solid"><i data-lucide="key-round"></i></span><h3>Broker</h3>
+          <div class="actions">
+            <span class="act"><i data-lucide="flask-conical"></i>run-tests</span>
+            <span class="act"><i data-lucide="braces"></i>graphql</span>
+            <span class="act"><i data-lucide="play"></i>run</span>
+            <span class="act"><i data-lucide="workflow"></i>chain</span>
+            <span class="act"><i data-lucide="list"></i>list-containers</span>
+          </div>
+        </div>
+        <div class="hop"><span class="arrow-ic"><i data-lucide="arrow-right"></i></span>docker run</div>
+        <div class="stack">
+          <div class="card"><span class="ic"><i data-lucide="workflow"></i></span><h3>Run / chain</h3></div>
+          <div class="card"><span class="ic"><i data-lucide="braces"></i></span><h3>GraphQL server</h3></div>
+        </div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="hard-drive"></i></span>Spawned containers get the same store-only mounts</div>
+        <div class="banner"><span class="ic"><i data-lucide="eye-off"></i></span>Secrets go in, never come back out</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="brick-wall"></i></span><div><div class="eyebrow">Missing Tools &middot; The answer</div><h2>The broker as a barrier</h2></div></div>
+    <p class="sub">The container can only ask. The host decides.</p>
+    <div class="stage">
+      <div class="barrier">
+        <div class="card side">
+          <div class="side-title"><span class="ic"><i data-lucide="container"></i></span><h3>Container</h3></div>
+          <div class="row"><span class="ic sm bad"><i data-lucide="unplug"></i></span>No docker socket</div>
+          <div class="row"><span class="ic sm bad"><i data-lucide="file-key"></i></span>No secrets</div>
+          <div class="row"><span class="ic sm bad"><i data-lucide="folder-x"></i></span>No host checkout</div>
+        </div>
+        <div class="wall"><div class="gate"><i data-lucide="key-round"></i>SSH<small>restricted key</small></div></div>
+        <div class="card side">
+          <div class="side-title"><span class="ic solid"><i data-lucide="key-round"></i></span><h3>Broker</h3></div>
+          <div class="row"><span class="ic sm"><i data-lucide="list-checks"></i></span>Fixed action list</div>
+          <div class="row"><span class="ic sm"><i data-lucide="route"></i></span>Picks repo and revision</div>
+          <div class="row"><span class="ic sm"><i data-lucide="copy"></i></span>Copies secrets privately</div>
+        </div>
+      </div>
+      <div class="tiles4">
+        <div class="card"><span class="ic"><i data-lucide="fingerprint"></i></span><h3>Identity</h3><p>from container labels</p></div>
+        <div class="card"><span class="ic"><i data-lucide="target"></i></span><h3>Targets</h3><p>only mounted repos</p></div>
+        <div class="card"><span class="ic"><i data-lucide="eye-off"></i></span><h3>Secrets</h3><p>Claude sees output only</p></div>
+        <div class="card"><span class="ic"><i data-lucide="gauge"></i></span><h3>Jobs</h3><p>my tree, two at most</p></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="layers"></i></span><div><div class="eyebrow">Missing Tools &middot; The answer</div><h2>Other layers</h2></div></div>
+    <div class="stage">
+      <div class="layers" id="layers">
+        <button class="card"><span class="ic lg"><i data-lucide="cpu"></i></span><h3>Hardened container</h3><p>my user, no capabilities, limits</p>
+          <span class="more">The container runs as my own user, never as root. All Linux capabilities are dropped and privilege escalation is blocked, so nothing inside can remount files or gain new rights. CPU and memory are capped.</span></button>
+        <button class="card"><span class="ic lg"><i data-lucide="hard-drive"></i></span><h3>Store-only mounts</h3><p>untracked files never enter</p>
+          <span class="more">A repo enters the container only as its version-control store, through a fixed allowlist of mounts. Untracked files such as <code>.env</code> stay on the host. Anything not on the list stays out by default.</span></button>
+        <button class="card"><span class="ic lg"><i data-lucide="file-lock"></i></span><h3>Read-only trust</h3><p>git hooks, config, jj IDs</p>
+          <span class="more">The host trusts some files inside the store: git config and hooks, jj config IDs. A planted change there could run code on the host at the next push, or redefine <code>trunk()</code>. These files are mounted read-only.</span></button>
+        <button class="card"><span class="ic lg"><i data-lucide="list-checks"></i></span><h3>Host preflight</h3><p>stores checked before launch</p>
+          <span class="more">Before any container starts, the host checks each repo store: the jj version, its config, symlinks, and where its git data points. An unsafe store is refused with a clear reason, and no container starts.</span></button>
+        <button class="card"><span class="ic lg"><i data-lucide="copy"></i></span><h3>Copied configs</h3><p>changes never flow back</p>
+          <span class="more">Host configs such as Claude and jj settings are mounted read-only and copied into the container at boot. The container works on its own copy, so nothing it changes reaches the host.</span></button>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+<!-- ================= FEATURES ================= -->
+<section class="view" id="view-features" data-theme="feat">
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="play"></i></span><div><div class="eyebrow">Features</div><h2>cld run</h2></div></div>
+    <p class="sub">One headless Claude, one task. It commits the result and removes itself.</p>
+    <div class="stage">
+      <pre class="cmd cmd-wrap"><code><span class="k">cld run</span> task.md -p <span class="t">"Focus on the database layer"</span> -r main</code></pre>
+      <div class="iflow live">
+        <div class="istep"><span class="ring"><i data-lucide="anchor"></i></span><h3>Anchor</h3><p>-r revision</p></div>
+        <div class="istep"><span class="ring"><i data-lucide="git-commit-horizontal"></i></span><h3>Scratch commit</h3><p>carries the brief</p></div>
+        <div class="istep"><span class="ring"><i data-lucide="bot"></i></span><h3>Headless Claude</h3><p>claude-run</p></div>
+        <div class="istep end"><span class="ring"><i data-lucide="bookmark"></i></span><h3>run_&lt;name&gt;</h3><p>result bookmark</p></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="workflow"></i></span><div><div class="eyebrow">Features</div><h2>cld chain</h2></div></div>
+    <p class="sub">Several runs in a row, declared in YAML. Each step builds on the one before.</p>
+    <div class="stage">
+      <div class="chain">
+        <div class="par">
+          <div class="lbl"><i data-lucide="split"></i>parallel</div>
+          <div class="card step"><span class="ic"><i data-lucide="scan-eye"></i></span><h3>generic</h3></div>
+          <div class="card step"><span class="ic"><i data-lucide="shield"></i></span><h3>security</h3></div>
+        </div>
+        <span class="arrow-ic"><i data-lucide="arrow-right"></i></span>
+        <div class="card step"><span class="ic"><i data-lucide="combine"></i></span><h3>synthesise</h3></div>
+        <span class="arrow-ic"><i data-lucide="arrow-right"></i></span>
+        <div class="card step end"><span class="ic"><i data-lucide="bookmark"></i></span><h3>chain_&lt;name&gt;</h3></div>
+      </div>
+      <div class="two">
+        <div><div class="code-title"><i data-lucide="file-code"></i>parallel-review.yaml</div>
+<pre class="cmd"><code><span class="k">steps:</span>
+  - <span class="k">parallel:</span>
+      - name: <span class="t">generic</span>
+      - name: <span class="t">security</span>
+  - name: <span class="t">synthesise</span></code></pre></div>
+        <div><div class="code-title"><i data-lucide="square-terminal"></i>commands</div>
+<pre class="cmd"><code><span class="k">cld chain list</span>
+<span class="k">cld chain dry-run</span> @parallel-review
+<span class="k">cld chain run</span> @parallel-review task.md</code></pre></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="container"></i></span><div><div class="eyebrow">Features</div><h2>From inside a ticket</h2></div></div>
+    <p class="sub">Claude starts runs and chains on its own committed work, through the broker.</p>
+    <div class="stage">
+      <pre class="cmd cmd-wrap"><code><span class="k">cld run start</span> @personas/implementer -r @- -p <span class="t">"Add the tests"</span>
+<span class="k">cld chain start</span> @review-implement -r @-
+<span class="k">cld run status</span> | <span class="k">wait</span> &lt;name&gt; | <span class="k">cancel</span> &lt;name&gt;</code></pre>
+      <div class="iflow live">
+        <div class="istep"><span class="ring"><i data-lucide="git-branch"></i></span><h3>My tree</h3><p>a committed change</p></div>
+        <div class="istep"><span class="ring"><i data-lucide="key-round"></i></span><h3>Broker</h3><p>two jobs at most</p></div>
+        <div class="istep"><span class="ring"><i data-lucide="server"></i></span><h3>Job on the host</h3><p>run or chain</p></div>
+        <div class="istep end"><span class="ring"><i data-lucide="git-merge"></i></span><h3>I integrate</h3><p>plain jj</p></div>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+<!-- ================= THE PAST ================= -->
+<section class="view" id="view-past" data-theme="past">
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="history"></i></span><div><div class="eyebrow">The Past</div><h2>How cld got here</h2></div></div>
+    <p class="sub">Ten months, five shapes. Click a stop.</p>
+    <div class="stage">
+      <div class="timeline">
+        <a class="tl" href="#/past/2"><span class="date">JAN 2026</span><span class="ring"><i data-lucide="container"></i></span><h3>Ephemeral devcontainer</h3></a>
+        <a class="tl" href="#/past/3"><span class="date">FEB&ndash;MAY</span><span class="ring"><i data-lucide="workflow"></i></span><h3>Run and chain</h3></a>
+        <a class="tl" href="#/past/4"><span class="date">JUL 2026</span><span class="ring"><i data-lucide="mail"></i></span><h3>Master, agents, messenger</h3></a>
+        <a class="tl" href="#/past/5"><span class="date">AUG 2026</span><span class="ring"><i data-lucide="bot"></i></span><h3>Task-agents</h3></a>
+        <a class="tl today" href="#/past/6"><span class="date">SEP 2026</span><span class="ring"><i data-lucide="ticket"></i></span><h3>Ticket containers</h3></a>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="container"></i></span><div><div class="eyebrow">The Past &middot; January 2026</div><h2>Ephemeral devcontainer</h2></div></div>
+    <p class="sub">One container per repo, thrown away on exit.</p>
+    <div class="stage">
+      <div class="era">
+        <div class="card ent"><span class="ic lg"><i data-lucide="folder"></i></span><h3>Current folder</h3></div>
+        <div class="hop"><span class="arrow-ic"><i data-lucide="arrow-right"></i></span>mounted whole</div>
+        <div class="card ent ghost"><span class="ic lg"><i data-lucide="bot"></i></span><h3>Claude Code</h3><span class="pill no"><i data-lucide="trash-2"></i>removed on exit</span></div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="folder"></i></span>One repo at a time</div>
+        <div class="banner"><span class="ic"><i data-lucide="trash-2"></i></span>Nothing kept after exit</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="workflow"></i></span><div><div class="eyebrow">The Past &middot; February to May 2026</div><h2>Run and chain</h2></div></div>
+    <p class="sub">Headless agents next to the interactive one.</p>
+    <div class="stage">
+      <div class="era" style="gap:28px">
+        <div class="group"><div class="lbl"><i data-lucide="play"></i>February &middot; one-shot agent</div>
+          <div class="mini"><div class="card"><span class="ic"><i data-lucide="bot"></i></span></div><span class="arrow-ic"><i data-lucide="arrow-right"></i></span><div class="card"><span class="ic solid"><i data-lucide="git-branch"></i></span></div></div>
+        </div>
+        <div class="group"><div class="lbl"><i data-lucide="workflow"></i>May &middot; chain</div>
+          <div class="mini"><div class="card"><span class="ic"><i data-lucide="bot"></i></span></div><span class="arrow-ic"><i data-lucide="arrow-right"></i></span><div class="card"><span class="ic"><i data-lucide="bot"></i></span></div><span class="arrow-ic"><i data-lucide="arrow-right"></i></span><div class="card"><span class="ic"><i data-lucide="bot"></i></span></div><span class="arrow-ic"><i data-lucide="arrow-right"></i></span><div class="card"><span class="ic solid"><i data-lucide="git-branch"></i></span></div></div>
+        </div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="tag"></i></span>Started as <code>cld agent</code>, renamed <code>run</code> in July</div>
+        <div class="banner"><span class="ic"><i data-lucide="circle-check"></i></span>Still here today</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="mail"></i></span><div><div class="eyebrow">The Past &middot; July 2026</div><h2>Master, agents, messenger</h2></div></div>
+    <p class="sub">Long-lived containers per repo, talking through mailboxes.</p>
+    <div class="stage">
+      <div class="era">
+        <div class="card ent"><span class="ic lg solid"><i data-lucide="crown"></i></span><h3>Master</h3><span class="pill past"><i data-lucide="folder"></i>repo A</span></div>
+        <div class="hop both"><span class="arrow-ic"><i data-lucide="arrow-left-right"></i></span>messages</div>
+        <div class="card ent"><span class="ic lg"><i data-lucide="mail"></i></span><h3>Mailboxes</h3></div>
+        <div class="hop both"><span class="arrow-ic"><i data-lucide="arrow-left-right"></i></span>messages</div>
+        <div class="card ent"><span class="ic lg"><i data-lucide="bot"></i></span><h3>Standing agent</h3><span class="pill past"><i data-lucide="folder"></i>repo B</span></div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="repeat"></i></span>Cross-repo work went through relays</div>
+        <div class="banner"><span class="ic"><i data-lucide="shuffle"></i></span>All transcripts mixed together</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="bot"></i></span><div><div class="eyebrow">The Past &middot; August 2026</div><h2>Task-agents</h2></div></div>
+    <p class="sub">Agents spawned for one task, reaped when it is done.</p>
+    <div class="stage">
+      <div class="era">
+        <div class="card ent"><span class="ic lg solid"><i data-lucide="crown"></i></span><h3>Master</h3></div>
+        <div class="hop"><span class="arrow-ic"><i data-lucide="arrow-right"></i></span>spawn</div>
+        <div class="fan">
+          <div class="card"><span class="ic"><i data-lucide="bot"></i></span><h3>add-oauth</h3></div>
+          <div class="card"><span class="ic"><i data-lucide="bot"></i></span><h3>fix-tests</h3></div>
+          <div class="card"><span class="ic"><i data-lucide="bot"></i></span><h3>review</h3></div>
+        </div>
+        <div class="hop"><span class="arrow-ic"><i data-lucide="arrow-right"></i></span>reap</div>
+        <div class="card ent ghost"><span class="ic lg bad"><i data-lucide="trash-2"></i></span><h3>Gone</h3></div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="split"></i></span>Bounded work in parallel</div>
+        <div class="banner"><span class="ic"><i data-lucide="folder"></i></span>Still one repo per container</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="slide">
+    <div class="slide-head"><span class="ic lg"><i data-lucide="ticket"></i></span><div><div class="eyebrow">The Past &middot; September 2026 &rarr; today</div><h2>Ticket containers</h2></div></div>
+    <p class="sub">One container per ticket, any number of repos.</p>
+    <div class="stage">
+      <div class="era">
+        <div class="card ent"><span class="ic lg"><i data-lucide="square-terminal"></i></span><h3>My terminal</h3></div>
+        <div class="hop"><span class="arrow-ic"><i data-lucide="arrow-right"></i></span>cld claude</div>
+        <div class="pzone">
+          <div class="lbl"><i data-lucide="ticket"></i>Ticket container</div>
+          <div class="row">
+            <div class="card ent"><span class="ic"><i data-lucide="folder-git-2"></i></span><h3>repo A</h3></div>
+            <div class="card ent"><span class="ic"><i data-lucide="folder-git-2"></i></span><h3>repo B</h3></div>
+            <div class="card ent"><span class="ic"><i data-lucide="folder-git-2"></i></span><h3>repo C</h3></div>
+          </div>
+        </div>
+      </div>
+      <div class="banners">
+        <div class="banner"><span class="ic"><i data-lucide="trash-2"></i></span>Master, standing agent, devcontainer: removed</div>
+        <div class="banner"><span class="ic"><i data-lucide="circle-check"></i></span>Run, chain, task-agents: kept</div>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+<div class="pager" id="pager" hidden>
+  <button class="btn" id="prev"></button>
+  <div class="dots" id="dots"></div>
+  <button class="btn next" id="next"></button>
+</div>
+
+</main>
+
+<script>
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const icons = () => window.lucide?.createIcons();
+const TOPICS = ["history", "tools", "features", "past"];
+const TITLES = { history: "Shared History", tools: "Missing Tools", features: "Features", past: "The Past" };
+
+/* ================= router ================= */
+let topic = null, index = 0;
+function parse() {
+  const [, name, n] = location.hash.match(/^#\/(\w+)(?:\/(\d+))?/) || [];
+  return TOPICS.includes(name) ? [name, Math.max(0, (+n || 1) - 1)] : [null, 0];
+}
+function go(name, i) { location.hash = name ? `#/${name}/${i + 1}` : "#/"; }
+function route() {
+  [topic, index] = parse();
+  $$(".view").forEach((v) => v.classList.toggle("on", v.id === `view-${topic || "home"}`));
+  $$("#nav a").forEach((a) => a.classList.toggle("on", a.getAttribute("href") === `#/${topic}`));
+  $("#crumbs").innerHTML = topic ? `/ <b>${TITLES[topic]}</b>` : "";
+  $("#pager").hidden = !topic;
+  if (!topic) return;
+  const slides = $$(`#view-${topic} .slide`);
+  index = Math.min(index, slides.length - 1);
+  slides.forEach((s, i) => s.classList.toggle("on", i === index));
+  $("#pager").dataset.theme = $(`#view-${topic}`).dataset.theme;
+  $("#dots").innerHTML = slides.map((_, i) => `<button class="${i === index ? "on" : ""}" aria-label="Slide ${i + 1}"></button>`).join("");
+  $$("#dots button").forEach((b, i) => (b.onclick = () => go(topic, i)));
+  const last = index === slides.length - 1;
+  $("#prev").innerHTML = `<i data-lucide="arrow-left"></i>${index === 0 ? "Overview" : "Back"}`;
+  $("#next").innerHTML = last ? `Overview<i data-lucide="house"></i>` : `Next<i data-lucide="arrow-right"></i>`;
+  icons();
+  window.scrollTo({ top: 0 });
+}
+function step(d) {
+  [topic, index] = parse();
+  if (!topic) return;
+  const count = $$(`#view-${topic} .slide`).length;
+  if (index + d >= count || index + d < 0) return go(null);
+  go(topic, index + d);
+}
+$("#prev").onclick = () => step(-1);
+$("#next").onclick = () => step(1);
+window.addEventListener("hashchange", route);
+document.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "Escape") go(null);
+  if (["1", "2", "3", "4"].includes(e.key)) go(TOPICS[+e.key - 1], 0);
+  if (e.key === "ArrowRight" || e.key === "PageDown" || e.key === " ") { e.preventDefault(); topic ? step(1) : go(TOPICS[0], 0); }
+  if (e.key === "ArrowLeft" || e.key === "PageUp") { e.preventDefault(); step(-1); }
+});
+
+/* ================= shared history: anchor graph ================= */
+function setAnchorMode(mode) {
+  const iso = mode === "isolated";
+  $$("#anchor-toggle button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  const z = $("#az");
+  z.setAttribute("x", iso ? 290 : 174);
+  z.setAttribute("width", iso ? 472 : 588);
+  z.setAttribute("height", iso ? 116 : 190);
+  $("#node-b").style.opacity = iso ? 1 : 0;
+  $("#sib").setAttribute("fill", iso ? "#c7cad8" : "#0e9f8e");
+  $("#anchor-note").innerHTML = iso
+    ? "Default. Only what grows on scratch commit <b>B</b> is editable."
+    : "Opt-in. Everything on top of <b>A</b> is editable, for reworking a stack.";
+}
+$$("#anchor-toggle button").forEach((b) => (b.onclick = () => setAnchorMode(b.dataset.mode)));
+setAnchorMode("isolated");
+
+/* ================= shared history: guard scenarios ================= */
+const SCENARIOS = [
+  ["pencil", "Rewrite the anchor", "jj"],
+  ["git-fork", "Edit another ticket", "jj"],
+  ["git-commit-horizontal", "Commit outside", "pre"],
+  ["move-right", "Move my work out", "pre"],
+  ["flag", "--ignore-immutable", "pre"],
+  ["file-pen", "Write while @ is outside", "pre"],
+  ["file-code", "Script moves @ out", "post"],
+];
+$("#scen").innerHTML = SCENARIOS.map(([icon, name]) => `<button><i data-lucide="${icon}"></i>${name}</button>`).join("");
+$$("#scen button").forEach((b, i) => (b.onclick = () => {
+  const on = !b.classList.contains("on");
+  $$("#scen button").forEach((x) => x.classList.toggle("on", on && x === b));
+  $("#guards").classList.toggle("focus", on);
+  $$(".guard").forEach((g) => g.classList.toggle("hit", on && g.dataset.g === SCENARIOS[i][2]));
+}));
+
+/* ================= missing tools: other layers ================= */
+$$("#layers .card").forEach((c) => (c.onclick = () => {
+  const open = !c.classList.contains("open");
+  $$("#layers .card").forEach((x) => x.classList.toggle("open", open && x === c));
+}));
+
+icons();
+route();
+
+/* Live reload: only active when served by serve.py. The hash keeps the current slide. */
+(() => {
+  let last = null;
+  setInterval(async () => {
+    try {
+      const v = await (await fetch("/__mtime", { cache: "no-store" })).text();
+      if (last && v !== last) location.reload();
+      last = v;
+    } catch {}
+  }, 1000);
+})();
+</script>
+</body>
+</html>
