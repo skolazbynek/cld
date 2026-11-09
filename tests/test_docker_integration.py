@@ -83,7 +83,7 @@ class TestBuildContainerArgs:
     def test_task_agent_mode_mounts_mailbox_and_labels(self, jj_repo, tmp_path):
         cfg = Config(mailbox_root=str(tmp_path / "mailboxes"))
         args = build_container_args(
-            jj_repo.repo_root, "cld_agent_x_t", cfg, task_agent=TaskAgentSpec(slug="t"),
+            jj_repo.repo_root, "a.x.t", cfg, task_agent=TaskAgentSpec(slug="t"),
         )
         volume_args = [args[i+1] for i in range(len(args)-1) if args[i] == "-v"]
         env_pairs = [args[i+1] for i in range(len(args)-1) if args[i] == "-e"]
@@ -96,7 +96,7 @@ class TestBuildContainerArgs:
         """Both went with the master role: nothing produces them any more."""
         cfg = Config(mailbox_root=str(tmp_path / "mailboxes"))
         args = build_container_args(
-            jj_repo.repo_root, "cld_agent_x_t", cfg, task_agent=TaskAgentSpec(slug="t"),
+            jj_repo.repo_root, "a.x.t", cfg, task_agent=TaskAgentSpec(slug="t"),
         )
         env_pairs = [args[i+1] for i in range(len(args)-1) if args[i] == "-e"]
         assert "HUB_MODE=1" not in env_pairs
@@ -122,7 +122,7 @@ class TestBuildContainerArgs:
         assert not Path(mailbox_path).exists()
         with patch("cld.docker.subprocess.run") as run_mock:
             args = build_container_args(
-                jj_repo.repo_root, "cld_agent_x_t", cfg, task_agent=TaskAgentSpec(slug="t"),
+                jj_repo.repo_root, "a.x.t", cfg, task_agent=TaskAgentSpec(slug="t"),
             )
         assert not run_mock.called
         assert not Path(mailbox_path).exists()
@@ -134,7 +134,7 @@ class TestBuildContainerArgs:
 @skip_no_docker
 class TestDockerTaskAgentHelpers:
     def test_status_absent_for_unknown_name(self):
-        assert docker_task_agent_status("cld_agent_definitely_not_running_xyz") == "absent"
+        assert docker_task_agent_status("a.definitely.not_running_xyz") == "absent"
 
     def test_list_returns_list(self):
         # No real task-agent containers running in this environment; just verify

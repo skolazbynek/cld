@@ -96,6 +96,10 @@ When the master tells you to wrap up:
 3. Reply with what you did: the branch name, what landed on it, the push URL if you
    pushed, and anything you deliberately left out.
 
+Any other bookmark you create is named `${CONTAINER_NAME}.<word>` (lowercase letters,
+digits and dashes). Never move or delete the bookmark `${CONTAINER_NAME}` itself, and
+never use the `internal.` prefix.
+
 Then stop and wait. Teardown is the master's move, not yours.
 
 # VCS rules

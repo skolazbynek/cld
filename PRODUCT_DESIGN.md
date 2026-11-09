@@ -45,7 +45,7 @@ re-examined in section 11, but all decisions there are deferred.
 
 ## 3. Concepts and identity
 
-**Ticket container.** Named `cld_ticket_<slug>` where `<slug>` is the
+**Ticket container.** Named `t.<slug>` where `<slug>` is the
 sanitized ticket name. One per ticket, enforced by the deterministic name.
 Ticket names are free-form; by convention the YouTrack id (which also pairs the
 container 1:1 with the `~/.claude/ego/tickets/<id>/` notes folder).
@@ -78,8 +78,9 @@ session orients itself; each repo's own `CLAUDE.md` loads when working in its
 subtree.
 
 **Per-repo identities.** In each mounted repo's store, the ticket owns one jj
-workspace and one bookmark, both named `cld_ticket_<slug>` (same
-quadruple-identity scheme as v1: container = workspace = bookmark = mailbox).
+workspace and one bookmark, both named `t.<slug>` (same
+quadruple-identity scheme as v1: container = workspace = bookmark = mailbox;
+see `docs/design-bookmark-naming.md`).
 The v1 invariant carries over per repo: the bookmark exists iff a live or
 restart-paused ticket lifecycle owns it. The bookmark is static and always
 sits on the active anchor (the scratch commit when isolated, the shared
@@ -265,7 +266,7 @@ in v2. Product-level requirements only:
 - **Labels**: `org.cld.repo-root` (singular) is replaced by the launch
   manifest; anchor labels become per-repo and record the effective anchor.
 - **Messenger**: one mailbox per ticket container, identity
-  `cld_ticket_<slug>`; the host-side `cld msg` identity resolution ("the cwd
+  `t.<slug>`; the host-side `cld msg` identity resolution ("the cwd
   repo's master") needs a ticket-aware replacement.
 - **In-container config discovery**: the cwd-walk from the ticket root finds
   no repo config — per-repo lookups become explicit by design.

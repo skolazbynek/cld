@@ -39,8 +39,8 @@ that resolver.
 A second, smaller gap compounds it: `status`/`logs`/`shutdown` go through the
 exact same `<target> <op>` broker argv and so are *also* gated by
 `validate_target` (`action_task_agent`, `cld-broker.py:540-548`) — even
-though none of them need a repo at all. A task-agent's identity already
-carries its repo (`cld_agent_<repo>_<slug>`); ownership for these ops is
+though none of them need a repo at all. A task-agent's identity no longer
+carries its repo (`a.<ticket>.<slug>`); ownership for these ops is
 `--parent` + the reap-readiness checks already in `cld/cli.py`
 (`_assert_reap_ready`, `:417-465`), not a repo match. Fixing bug 1 without
 noticing this would just make every read/reap op silently depend on an

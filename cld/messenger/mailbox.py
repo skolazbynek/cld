@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cld.log import get_logger
+from cld.names import ticket_id
 
 log = get_logger(__name__)
 
@@ -722,7 +723,7 @@ def resolve_recipient(to: str, containers: list[dict] | None = None, root: Path 
 
     ticket_matches = [
         c for c in all_containers
-        if c["kind"] == "ticket" and c["name"] == f"cld_ticket_{to}"
+        if c["kind"] == "ticket" and c["name"] == ticket_id(to)
     ]
     matches = [
         c for c in all_containers

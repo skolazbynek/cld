@@ -17,6 +17,8 @@ Prefers jujutsu; falls back to git.
 
 **Config:** defaults → `~/.config/cld/config.toml` → repo `.cld/config.toml` → `.env` → `CLD_*` env vars. Key: `mailbox_root`, `agent_max_turns`, `max_task_agents`, `broker_*`.
 
+**Naming:** every spawned object has one dotted identifier (container, jj workspace, session bookmark, mailbox, broker caller id): ticket `t.<ticket>`, task-agent `a.<ticket>.<agent>` (`a._host.<agent>` without a ticket), run `run.<run>`, chain `chain.<chain>` (`-n` required), chain step `chain.<chain>.<step>`. Agent MR default `<agent id>.mr`. Built in `cld/names.py`. See `docs/design-bookmark-naming.md`.
+
 ## Anchor Modes
 
 - **Isolated (default):** Edit one branch only. No touching siblings.

@@ -96,6 +96,7 @@ if [ -n "${TICKET_MODE:-}" ]; then
             echo "Error: repo '${REPO_NAME}': anchor guard setup failed" >&2
             exit 1
         fi
+        cld_set_push_bookmark_template "$REPO_WORKSPACE" "$REPO_BACKEND"
         TICKET_ROWS="${TICKET_ROWS}| ${REPO_NAME} | ${REPO_ANCHOR:0:12} | ${REPO_MODE} | ${REPO_BACKEND} |
 "
         # Sessions start at the ticket root, above every repo, where claude
@@ -167,6 +168,7 @@ if ! cld_guard_anchor current /workspace/current "$AGENT_ANCHOR_HASH" \
     echo "Error: anchor guard setup failed" >&2
     exit 1
 fi
+cld_set_push_bookmark_template /workspace/current jj
 
 cld_enable_watchman /workspace/current
 

@@ -110,8 +110,8 @@ class TestResolveSelf:
         return {"name": name, "kind": "ticket", "repo": "", "status": status}
 
     def test_in_container_session_name_wins(self, monkeypatch):
-        monkeypatch.setenv("SESSION_NAME", "cld_ticket_lide-1")
-        assert resolve_self() == ("cld_ticket_lide-1", Path("/var/cld/mailboxes"))
+        monkeypatch.setenv("SESSION_NAME", "t.lide-1")
+        assert resolve_self() == ("t.lide-1", Path("/var/cld/mailboxes"))
 
     def _known(self, monkeypatch, *tickets):
         monkeypatch.setattr(
@@ -121,56 +121,56 @@ class TestResolveSelf:
         )
 
     def test_explicit_ticket_argument(self, monkeypatch):
-        self._known(monkeypatch, "cld_ticket_lide-2600")
-        assert resolve_self("LIDE-2600") == ("cld_ticket_lide-2600", self.mailbox_root)
+        self._known(monkeypatch, "t.lide-2600")
+        assert resolve_self("LIDE-2600") == ("t.lide-2600", self.mailbox_root)
 
-    def test_cld_ticket_env(self, monkeypatch):
+    def test_ticket_env(self, monkeypatch):
         monkeypatch.setenv("CLD_TICKET", "LIDE-2600")
-        self._known(monkeypatch, "cld_ticket_lide-2600")
-        assert resolve_self() == ("cld_ticket_lide-2600", self.mailbox_root)
+        self._known(monkeypatch, "t.lide-2600")
+        assert resolve_self() == ("t.lide-2600", self.mailbox_root)
 
     def test_argument_beats_env(self, monkeypatch):
         monkeypatch.setenv("CLD_TICKET", "LIDE-1")
-        self._known(monkeypatch, "cld_ticket_lide-1", "cld_ticket_lide-2")
-        assert resolve_self("LIDE-2")[0] == "cld_ticket_lide-2"
+        self._known(monkeypatch, "t.lide-1", "t.lide-2")
+        assert resolve_self("LIDE-2")[0] == "t.lide-2"
 
     def test_explicit_stopped_ticket_is_valid(self, monkeypatch):
         """Existence, not liveness, validates an explicit ticket: a stopped
         container still owns its mailbox."""
-        self._known(monkeypatch, ("cld_ticket_lide-1", "stopped"))
-        assert resolve_self("LIDE-1") == ("cld_ticket_lide-1", self.mailbox_root)
+        self._known(monkeypatch, ("t.lide-1", "stopped"))
+        assert resolve_self("LIDE-1") == ("t.lide-1", self.mailbox_root)
 
     def test_unknown_explicit_ticket_errors_naming_existing(self, monkeypatch):
         """A typo'd --ticket must not silently attribute sends to a mailbox
         nothing reads."""
-        self._known(monkeypatch, "cld_ticket_lide-1")
+        self._known(monkeypatch, "t.lide-1")
         with pytest.raises(RuntimeError) as exc:
             resolve_self("ghost")
-        assert "cld_ticket_ghost" in str(exc.value)
-        assert "cld_ticket_lide-1" in str(exc.value)
+        assert "t.ghost" in str(exc.value)
+        assert "t.lide-1" in str(exc.value)
 
-    def test_unknown_cld_ticket_env_errors(self, monkeypatch):
+    def test_unknown_ticket_env_errors(self, monkeypatch):
         monkeypatch.setenv("CLD_TICKET", "ghost")
         self._known(monkeypatch)
-        with pytest.raises(RuntimeError, match="no ticket container 'cld_ticket_ghost'") as exc:
+        with pytest.raises(RuntimeError, match="no ticket container 't.ghost'") as exc:
             resolve_self()
         assert "none" in str(exc.value)
 
     def test_single_running_ticket_is_self(self, monkeypatch):
         monkeypatch.setattr(
             identity_mod, "list_cld_containers",
-            lambda kind: [self._ticket("cld_ticket_lide-9")],
+            lambda kind: [self._ticket("t.lide-9")],
         )
-        assert resolve_self() == ("cld_ticket_lide-9", self.mailbox_root)
+        assert resolve_self() == ("t.lide-9", self.mailbox_root)
 
     def test_stopped_tickets_do_not_count(self, monkeypatch):
         """One stopped + one running = exactly one RUNNING ticket -- it is self."""
         monkeypatch.setattr(
             identity_mod, "list_cld_containers",
-            lambda kind: [self._ticket("cld_ticket_a", status="stopped"),
-                          self._ticket("cld_ticket_b")],
+            lambda kind: [self._ticket("t.a", status="stopped"),
+                          self._ticket("t.b")],
         )
-        assert resolve_self() == ("cld_ticket_b", self.mailbox_root)
+        assert resolve_self() == ("t.b", self.mailbox_root)
 
     def test_no_tickets_falls_back_to_cwd_host_identity(self, monkeypatch, tmp_path):
         monkeypatch.setattr(identity_mod, "list_cld_containers", lambda kind: [])
@@ -184,13 +184,13 @@ class TestResolveSelf:
     def test_ambiguous_tickets_outside_a_repo_error_lists_them(self, monkeypatch):
         monkeypatch.setattr(
             identity_mod, "list_cld_containers",
-            lambda kind: [self._ticket("cld_ticket_a"), self._ticket("cld_ticket_b")],
+            lambda kind: [self._ticket("t.a"), self._ticket("t.b")],
         )
         def _no_repo():
             raise RuntimeError("not a repo")
         monkeypatch.setattr(identity_mod, "get_backend", _no_repo)
         with pytest.raises(RuntimeError) as exc:
             resolve_self()
-        assert "cld_ticket_a" in str(exc.value)
-        assert "cld_ticket_b" in str(exc.value)
+        assert "t.a" in str(exc.value)
+        assert "t.b" in str(exc.value)
         assert "CLD_TICKET" in str(exc.value)

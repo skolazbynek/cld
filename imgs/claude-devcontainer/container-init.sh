@@ -71,6 +71,16 @@ widens the editable tree to every descendant of the anchor; isolated mode
 /workspace/origin/<repo> holds only the shared jj/git store. Run jj and edit files in your workspace.
 
 Each repo's own CLAUDE.md governs work in its subtree.
+
+## Bookmark names
+
+Every bookmark you create starts with this ticket's identifier \`t.${ticket}\`.
+
+- \`t.${ticket}\` is the session bookmark: never move or delete it.
+- Merge request branches: \`t.${ticket}.mr\`, or \`t.${ticket}.mr-<word>\` for
+  several (\`<word>\`: lowercase letters, digits, dashes).
+- Any other bookmark: \`t.${ticket}.<word>\` (more dotted words may follow).
+- Never use \`internal.\`: it belongs to host automation.
 EOF
     if cld_broker_wired; then
         cat >> "$ticket_root/CLAUDE.md" <<'EOF'

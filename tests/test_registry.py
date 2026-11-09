@@ -238,11 +238,11 @@ class TestTicketRepoMounts:
 
     def test_collects_repo_labels_per_ticket(self):
         results = [
-            self._result(stdout="cld_ticket_lide-1\n"),
+            self._result(stdout="t.lide-1\n"),
             self._result(stdout='{"org.cld.kind": "ticket", "org.cld.repo.lide-api": "/host/lide-api"}\n'),
         ]
         with patch("cld.registry.subprocess.run", side_effect=results):
-            assert ticket_repo_mounts() == {"cld_ticket_lide-1": {"lide-api": "/host/lide-api"}}
+            assert ticket_repo_mounts() == {"t.lide-1": {"lide-api": "/host/lide-api"}}
 
     def test_docker_failure_reads_as_no_tickets(self):
         with patch("cld.registry.subprocess.run", return_value=self._result(returncode=1)):
@@ -250,11 +250,11 @@ class TestTicketRepoMounts:
 
     def test_tickets_referencing_matches_name_and_path(self):
         mounts = {
-            "cld_ticket_one": {"lide-api": str(Path("~/p/lide-api").expanduser())},
-            "cld_ticket_two": {"lide-api": "/elsewhere/lide-api"},
+            "t.one": {"lide-api": str(Path("~/p/lide-api").expanduser())},
+            "t.two": {"lide-api": "/elsewhere/lide-api"},
         }
         with patch("cld.registry.ticket_repo_mounts", return_value=mounts):
-            assert tickets_referencing("lide-api", "~/p/lide-api") == ["cld_ticket_one"]
+            assert tickets_referencing("lide-api", "~/p/lide-api") == ["t.one"]
 
 
 class TestReposCli:
@@ -289,12 +289,12 @@ class TestReposCli:
     def test_list_names_mounting_tickets(self, config_path, tmp_path):
         repo = tmp_path / "my-api"
         repo.mkdir()
-        mounts = {"cld_ticket_lide-1": {"my-api": str(repo)}}
+        mounts = {"t.lide-1": {"my-api": str(repo)}}
         with patch("cld.cli.ticket_repo_mounts", return_value=mounts):
             self._invoke(config_path, "add", "my-api", str(repo))
             result = self._invoke(config_path)
         assert result.exit_code == 0, result.output
-        assert "cld_ticket_lide-1" in result.output
+        assert "t.lide-1" in result.output
 
     def test_rm_removes(self, config_path, tmp_path):
         repo = tmp_path / "my-api"
@@ -308,11 +308,11 @@ class TestReposCli:
     def test_rm_refused_while_a_ticket_mounts_it(self, config_path, tmp_path):
         repo = tmp_path / "my-api"
         repo.mkdir()
-        with patch("cld.cli.tickets_referencing", return_value=["cld_ticket_lide-1"]):
+        with patch("cld.cli.tickets_referencing", return_value=["t.lide-1"]):
             self._invoke(config_path, "add", "my-api", str(repo))
             result = self._invoke(config_path, "rm", "my-api")
         assert result.exit_code == 1
-        assert "cld_ticket_lide-1" in result.output
+        assert "t.lide-1" in result.output
         assert "my-api" in tomllib.loads(config_path.read_text())["repos"]
 
     def test_rm_unknown_name_errors(self, config_path):

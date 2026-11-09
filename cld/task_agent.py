@@ -14,9 +14,7 @@ from cld.config import Config
 from cld.docker import (
     docker_task_agent_list,
     docker_task_agent_status,
-    find_target_repo,
     in_master_container,
-    task_agent_container_name,
 )
 from cld.log import get_logger
 from cld.messenger import mailbox
@@ -62,43 +60,30 @@ def known_task_agent_names(cfg: Config) -> set[str]:
     return names | {m["name"] for m in mailbox.list_fleet(mailbox_root(cfg))}
 
 
-def _cwd_repo_task_agent_name(cfg: Config, slug: str) -> str:
-    """The name a task-agent for *slug* would have in the cwd's repo, or "" if that can't be known."""
-    try:
-        return task_agent_container_name(find_target_repo(cfg), slug)
-    except (RuntimeError, ValueError):
-        return ""
-
-
 def resolve_task_agent(cfg: Config, name: str) -> str:
-    """Resolve a bare task slug -- or a full container name -- to a full container name.
+    """Resolve a bare task slug -- or a full identifier -- to a full identifier.
 
-    A CLI affordance only (D26): mailbox addressing is always by full name, so a
-    human never has to type `cld_agent_myrepo_add-oauth`. The slug can't contain
-    '_' (see task_agent_container_name), so it is always the segment after the last
-    one, whatever the repo is called. Archived mailboxes resolve too, so
-    `transcript` keeps working after a reap.
+    A CLI affordance only (D26): mailbox addressing is always by full name. A
+    bare slug matches every identifier whose last dot part equals it (the slug
+    never contains a dot), so `add-oauth` finds `a.lide-1.add-oauth`; several
+    tickets using one slug is an ambiguity. Archived mailboxes resolve by full
+    name, so `transcript` keeps working after a reap.
     """
     live = known_task_agent_names(cfg)
     if name in live:
         return name
 
-    matches = sorted(c for c in live if c.rsplit("_", 1)[-1] == name)
+    matches = sorted(c for c in live if c.rsplit(".", 1)[-1] == name)
     if len(matches) == 1:
         return matches[0]
     if matches:
-        expected = _cwd_repo_task_agent_name(cfg, name)
-        if expected in matches:
-            return expected
         raise RuntimeError(
             f"'{name}' is ambiguous -- it matches {', '.join(matches)}. Use the full "
-            "container name, or run this from the repo you mean."
+            "identifier."
         )
 
-    root = mailbox_root(cfg)
-    for candidate in (name, _cwd_repo_task_agent_name(cfg, name)):
-        if candidate and mailbox.resolve_mailbox_dir(root, candidate) is not None:
-            return candidate
+    if mailbox.resolve_mailbox_dir(mailbox_root(cfg), name) is not None:
+        return name
     raise RuntimeError(
         f"no task-agent named '{name}' (neither live nor archived). "
         "See `cld task-agent status`."

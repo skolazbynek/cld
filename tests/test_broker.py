@@ -18,7 +18,7 @@ def _cp(returncode=0, stdout="", stderr=""):
 def configured(monkeypatch):
     """A container with an endpoint and a mounted key -- i.e. the broker is reachable."""
     monkeypatch.setenv("CLD_BROKER_ENDPOINT", "host.docker.internal:2222")
-    monkeypatch.setenv("SESSION_NAME", "cld_agent_cld")
+    monkeypatch.setenv("SESSION_NAME", "a.t1.cld")
     with patch("cld.broker.Path.exists", return_value=True):
         yield
 
@@ -31,27 +31,27 @@ def _argv_of(run_mock) -> list[str]:
 
 class TestListCldContainers:
     def test_host_uses_local_docker(self):
-        ps = _cp(stdout="cld_agent_a\tUp 1 min\n")
+        ps = _cp(stdout="a.t1.a\tUp 1 min\n")
         inspect = _cp(stdout="agent|/repo/a\n")
         with patch("cld.broker.in_master_container", return_value=False), \
              patch("cld.broker.subprocess.run", side_effect=[ps, inspect]):
             out = broker.list_cld_containers()
-        assert out == [{"name": "cld_agent_a", "kind": "agent", "repo": "/repo/a", "status": "running"}]
+        assert out == [{"name": "a.t1.a", "kind": "agent", "repo": "/repo/a", "status": "running"}]
 
     def test_hub_flag_uses_broker_and_parses_lines(self, configured):
         lines = _cp(stdout=(
-            "cld_agent_a\tagent\t/repo/a\tUp 3 hours\n"
-            "cld_ticket_lide-2600\tticket\t/repo/b\tExited (0) 2 hours ago\n"
+            "a.t1.a\tagent\t/repo/a\tUp 3 hours\n"
+            "t.lide-2600\tticket\t/repo/b\tExited (0) 2 hours ago\n"
         ))
         with patch("cld.broker.in_master_container", return_value=True), \
              patch("cld.broker.subprocess.run", return_value=lines) as run:
             out = broker.list_cld_containers("agent")
         assert run.call_args[0][0][0] == "ssh"
         assert _argv_of(run) == ["agent"]                      # the kind filter
-        assert run.call_args[0][0][-1].startswith("list-containers cld_agent_cld ")
+        assert run.call_args[0][0][-1].startswith("list-containers a.t1.cld ")
         assert out == [
-            {"name": "cld_agent_a", "kind": "agent", "repo": "/repo/a", "status": "running"},
-            {"name": "cld_ticket_lide-2600", "kind": "ticket", "repo": "/repo/b", "status": "stopped"},
+            {"name": "a.t1.a", "kind": "agent", "repo": "/repo/a", "status": "running"},
+            {"name": "t.lide-2600", "kind": "ticket", "repo": "/repo/b", "status": "stopped"},
         ]
 
     def test_broker_failure_returns_empty(self, configured):
@@ -183,7 +183,7 @@ class TestGraphqlOp:
         with patch("cld.broker.subprocess.run", return_value=_cp(returncode=0, stdout="ok")) as run:
             result = broker.graphql_op("status")
         assert result.stdout == "ok"
-        assert run.call_args[0][0][-1].startswith("graphql cld_agent_cld ")
+        assert run.call_args[0][0][-1].startswith("graphql a.t1.cld ")
         assert _argv_of(run) == ["status"]
         assert run.call_args.kwargs["capture_output"] is True
 
@@ -217,11 +217,11 @@ class TestGraphqlOp:
 class TestBrokerTaskAgentOp:
     def test_uses_its_own_action_and_forwards_argv(self, configured):
         """Its own broker action, with its own op set and argv rules."""
-        argv = ["@implementer", "-n", "add-oauth", "-p", "do it", "--peer", "cld_agent_x_y:3"]
+        argv = ["@implementer", "-n", "add-oauth", "-p", "do it", "--peer", "a.x.y:3"]
         with patch("cld.broker.subprocess.run", return_value=_cp(returncode=0)) as run:
             rc = broker.broker_task_agent_op("start", argv)
         assert rc == 0
-        assert run.call_args[0][0][-1].startswith("task-agent cld_agent_cld ")
+        assert run.call_args[0][0][-1].startswith("task-agent a.t1.cld ")
         assert _argv_of(run) == ["start", *argv]
         assert run.call_args.kwargs["capture_output"] is False
 
@@ -239,7 +239,7 @@ class TestBrokerJobOps:
     def test_uses_its_own_action(self, configured, helper, action):
         with patch("cld.broker.subprocess.run", return_value=_cp()) as run:
             helper("start", "@x", "-r", "abc")
-        assert run.call_args[0][0][-1].startswith(f"{action} cld_agent_cld ")
+        assert run.call_args[0][0][-1].startswith(f"{action} a.t1.cld ")
         assert _argv_of(run) == ["start", "@x", "-r", "abc"]
 
     def test_repo_leads_the_op(self, configured):
@@ -265,7 +265,7 @@ class TestListRegisteredRepos:
         out = "lide-api\t/h/lide-api\tyes\ndeps\t/h/deps\tno\n"
         with patch("cld.broker.subprocess.run", return_value=_cp(returncode=0, stdout=out)) as run:
             assert broker.list_registered_repos() == [("lide-api", "/h/lide-api", True), ("deps", "/h/deps", False)]
-        assert run.call_args[0][0][-1].startswith("list-repos cld_agent_cld ")
+        assert run.call_args[0][0][-1].startswith("list-repos a.t1.cld ")
 
     def test_failure_is_empty(self, configured):
         with patch("cld.broker.subprocess.run", return_value=_cp(returncode=3, stderr="boom")):

@@ -263,6 +263,19 @@ cld_guard_anchor() {
     fi
 }
 
+cld_set_push_bookmark_template() {
+    # A bare `jj git push --change` would create `push-<id>`; name it
+    # `<session>.mr-<id>` instead (docs/design-bookmark-naming.md). jj only; run
+    # containers do not use this library. The value is a TOML literal string:
+    # jj would not parse a bare one that starts with a quote.
+    # Args: $1=workspace $2=backend
+    local workspace="$1" backend="$2"
+    [ "$backend" = "jj" ] || return 0
+    (cd "$workspace" && \
+        jj config set --workspace templates.git_push_bookmark \
+            "'\"${SESSION_NAME}.mr-\" ++ change_id.short()'")
+}
+
 # --- Committing --------------------------------------------------------------
 
 vcs_commit() {

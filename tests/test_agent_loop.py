@@ -47,9 +47,9 @@ def supervisor(tmp_path, persona_path, monkeypatch):
     monkeypatch.setenv("STUB_ARGV_LOG", str(argv_log))
     monkeypatch.setenv("STUB_PROMPT_LOG", str(prompt_log))
     monkeypatch.setenv("STUB_MAILBOX_ROOT", str(mailbox_root))
-    monkeypatch.setenv("STUB_SESSION_NAME", "cld_agent_repoA")
+    monkeypatch.setenv("STUB_SESSION_NAME", "a.t1.repoA")
     sup = AgentSupervisor(
-        session_name="cld_agent_repoA",
+        session_name="a.t1.repoA",
         repo_root=repo_root,
         mailbox_root=mailbox_root,
         persona_path=persona_path,
@@ -98,7 +98,7 @@ class TestKickoff:
         prompt = _read_prompt_log(supervisor._prompt_log)[0]
         assert "repo" in prompt  # REPO_BASENAME
         assert "turns=7" in prompt
-        assert "container=cld_agent_repoA" in prompt
+        assert "container=a.t1.repoA" in prompt
 
     def test_frontmatter_stripped_from_persona(self, supervisor, persona_path):
         persona_path.write_text("---\ndescription: meta\n---\n\n# Role\n\nbody\n")
@@ -128,7 +128,7 @@ class TestSpentEdgeStopsTheFallback:
         "peers": {},
     }
 
-    _PEER = "cld_agent_repoA_peer"
+    _PEER = "a.repoA.peer"
 
     def _exchange(self, supervisor, limit):
         """Run the real flow up to an inbound peer message: we open the edge, the peer replies.
@@ -355,14 +355,14 @@ class TestForgetSessionBookmark:
         monkeypatch.setattr("cld.messenger.agent_loop.subprocess.run", fake_run)
         supervisor._forget_session_bookmark()
         assert calls == [
-            (["jj", "--ignore-working-copy", "bookmark", "forget", "cld_agent_repoA"], str(origin)),
+            (["jj", "--ignore-working-copy", "bookmark", "forget", "a.t1.repoA"], str(origin)),
         ]
 
     def test_a_failed_forget_warns(self, supervisor, monkeypatch, caplog):
         failed = subprocess.CompletedProcess([], 1, stdout="", stderr="no such bookmark")
         monkeypatch.setattr("cld.messenger.agent_loop.subprocess.run", lambda *a, **k: failed)
         supervisor._forget_session_bookmark()
-        assert "jj bookmark forget cld_agent_repoA failed (rc=1): no such bookmark" in caplog.text
+        assert "jj bookmark forget a.t1.repoA failed (rc=1): no such bookmark" in caplog.text
 
 
 # --- task mode ---------------------------------------------------------------
@@ -391,7 +391,7 @@ def _task_mode(task_files, **overrides):
         "slug": "add-oauth",
         "parent_master": "cld_master_repoA_ab12",
         "deliverable_branch": "add-oauth-login",
-        "peers": {"cld_agent_repoA_contract": 15},
+        "peers": {"a.repoA.contract": 15},
         "persona_name": "implementer",
         "preamble_path": preamble,
         "task_text": "Wire up OAuth login.",
@@ -449,7 +449,7 @@ class TestTurnCapIsNotFatal:
 class TestComposeKickoff:
     def _compose(self, task, tmp_path):
         return compose_kickoff(
-            task, session_name="cld_agent_repoA_add-oauth",
+            task, session_name="a.repoA.add-oauth",
             repo_root=tmp_path / "repo", max_turns=7, root_ask_limit=3,
         )
 
@@ -459,7 +459,7 @@ class TestComposeKickoff:
 
     def test_substitutes_in_both_layers(self, task_files, tmp_path):
         prompt = self._compose(_task_mode(task_files), tmp_path)
-        assert "container=cld_agent_repoA_add-oauth" in prompt
+        assert "container=a.repoA.add-oauth" in prompt
         assert "slug=add-oauth" in prompt
         assert "branch=add-oauth-login" in prompt
         assert "master=cld_master_repoA_ab12" in prompt
@@ -482,13 +482,13 @@ class TestComposeKickoff:
 
     def test_peers_rendered(self, task_files, tmp_path):
         prompt = self._compose(_task_mode(task_files), tmp_path)
-        assert "- `cld_agent_repoA_contract` (hop budget: 15)" in prompt
+        assert "- `a.repoA.contract` (hop budget: 15)" in prompt
 
     def test_two_peers_both_listed(self, task_files, tmp_path):
-        task = _task_mode(task_files, peers={"cld_agent_r_a": 3, "cld_agent_r_b": 9})
+        task = _task_mode(task_files, peers={"a.r.a": 3, "a.r.b": 9})
         prompt = self._compose(task, tmp_path)
-        assert "- `cld_agent_r_a` (hop budget: 3)" in prompt
-        assert "- `cld_agent_r_b` (hop budget: 9)" in prompt
+        assert "- `a.r.a` (hop budget: 3)" in prompt
+        assert "- `a.r.b` (hop budget: 9)" in prompt
 
     def test_no_peers_says_master_only(self, task_files, tmp_path):
         prompt = self._compose(_task_mode(task_files, peers={}), tmp_path)
@@ -509,7 +509,7 @@ class TestShippedPreamble:
         _, persona = task_files
         task = _task_mode(task_files, preamble_path=_CLD_PROMPTS / "task-agent.md")
         prompt = compose_kickoff(
-            task, session_name="cld_agent_repoA_add-oauth",
+            task, session_name="a.repoA.add-oauth",
             repo_root=tmp_path / "repo", max_turns=7, root_ask_limit=3,
         )
         # A mistyped ${VAR} in the shipped preamble would otherwise reach the agent
@@ -531,7 +531,7 @@ class TestTaskModeFromEnv:
         monkeypatch.setenv("AGENT_DELIVERABLE_BRANCH", "add-oauth-login")
         monkeypatch.setenv("AGENT_PERSONA", "implementer")
         monkeypatch.setenv("AGENT_PARENT_MASTER", "cld_master_repoA_ab12")
-        monkeypatch.setenv("AGENT_PEERS", "cld_agent_repoA_contract:15")
+        monkeypatch.setenv("AGENT_PEERS", "a.repoA.contract:15")
         monkeypatch.setenv("AGENT_ANCHOR_HASH", "abc123")
 
     def test_reads_all_fields(self, task_files):
@@ -539,7 +539,7 @@ class TestTaskModeFromEnv:
         assert task.slug == "add-oauth"
         assert task.parent_master == "cld_master_repoA_ab12"
         assert task.deliverable_branch == "add-oauth-login"
-        assert task.peers == {"cld_agent_repoA_contract": 15}
+        assert task.peers == {"a.repoA.contract": 15}
         assert task.persona_name == "implementer"
         assert task.anchor == "abc123"
         assert task.task_text == "Wire up OAuth login."
@@ -603,10 +603,10 @@ class TestSupervisorTaskMode:
         prompt_log = tmp_path / "prompt.log"
         monkeypatch.setenv("STUB_PROMPT_LOG", str(prompt_log))
         monkeypatch.setenv("STUB_MAILBOX_ROOT", str(mailbox_root))
-        monkeypatch.setenv("STUB_SESSION_NAME", "cld_agent_repoA_add-oauth")
+        monkeypatch.setenv("STUB_SESSION_NAME", "a.repoA.add-oauth")
         task = _task_mode(task_files)
         sup = AgentSupervisor(
-            session_name="cld_agent_repoA_add-oauth",
+            session_name="a.repoA.add-oauth",
             repo_root=repo_root,
             mailbox_root=mailbox_root,
             persona_path=None,
@@ -624,7 +624,7 @@ class TestSupervisorTaskMode:
         assert meta["persona"] == "implementer"
         assert meta["deliverable_branch"] == "add-oauth-login"
         assert meta["anchor"] == "abc123def456"
-        assert meta["peers"] == {"cld_agent_repoA_contract": 15}
+        assert meta["peers"] == {"a.repoA.contract": 15}
         assert "created_at" in meta
 
     def test_meta_is_write_once_across_restart(self, task_supervisor, task_files, tmp_path):

@@ -44,7 +44,7 @@ _SPAWN = {
     "persona": "implementer",
     "deliverable_branch": "add-oauth-login",
     "anchor": "abc123",
-    "peers": {"cld_agent_repoA_contract": 15},
+    "peers": {"a.repoA.contract": 15},
 }
 
 
@@ -55,8 +55,8 @@ def _outbox_lines(root, name) -> list[dict]:
 
 class TestEnsureMailbox:
     def test_creates_subdirs(self, tmp_path):
-        ensure_mailbox(tmp_path, "cld_agent_repoA")
-        base = mailbox_dir(tmp_path, "cld_agent_repoA")
+        ensure_mailbox(tmp_path, "a.t1.repoA")
+        base = mailbox_dir(tmp_path, "a.t1.repoA")
         assert (base / "tmp").is_dir()
         assert (base / "inbox").is_dir()
         assert (base / "archive").is_dir()
@@ -216,7 +216,7 @@ class TestMeta:
     def test_round_trip_including_peer_budgets(self, tmp_path):
         written = ensure_meta(tmp_path, "agent1", **_SPAWN)
         assert read_meta(tmp_path, "agent1") == written
-        assert written["peers"] == {"cld_agent_repoA_contract": 15}
+        assert written["peers"] == {"a.repoA.contract": 15}
         assert "created_at" in written
 
     def test_second_call_keeps_original(self, tmp_path):
@@ -226,8 +226,8 @@ class TestMeta:
         assert read_meta(tmp_path, "agent1")["task"] == "add oauth login"
 
     def test_missing_returns_none(self, tmp_path):
-        ensure_mailbox(tmp_path, "cld_agent_repoA")
-        assert read_meta(tmp_path, "cld_agent_repoA") is None
+        ensure_mailbox(tmp_path, "a.t1.repoA")
+        assert read_meta(tmp_path, "a.t1.repoA") is None
 
 
 class TestListFleet:
@@ -239,7 +239,7 @@ class TestListFleet:
 
     def test_excludes_mailboxes_without_meta(self, tmp_path):
         ensure_meta(tmp_path, "agent1", **_SPAWN)
-        ensure_mailbox(tmp_path, "cld_agent_repoA")          # legacy repo-agent mailbox
+        ensure_mailbox(tmp_path, "a.t1.repoA")          # legacy repo-agent mailbox
         ensure_mailbox(tmp_path, "cld_master_repoA_abcd1234")  # master
         assert [m["name"] for m in list_fleet(tmp_path)] == ["agent1"]
 
@@ -851,7 +851,7 @@ class TestListContainers:
     def test_parses_docker_output(self, tmp_path):
         ps_result = type("R", (), {
             "returncode": 0,
-            "stdout": "cld_agent_repoA\tUp 2 hours\ncld_ticket_lide-2600\tExited (0) 1 hour ago\n",
+            "stdout": "a.t1.repoA\tUp 2 hours\nt.lide-2600\tExited (0) 1 hour ago\n",
             "stderr": "",
         })()
         inspect_results = [
@@ -862,8 +862,8 @@ class TestListContainers:
              patch("cld.broker.subprocess.run", side_effect=[ps_result, *inspect_results]):
             containers = list_containers()
         assert containers == [
-            {"name": "cld_agent_repoA", "kind": "agent", "repo": "/home/u/repoA", "status": "running"},
-            {"name": "cld_ticket_lide-2600", "kind": "ticket", "repo": "/home/u/repoB", "status": "stopped"},
+            {"name": "a.t1.repoA", "kind": "agent", "repo": "/home/u/repoA", "status": "running"},
+            {"name": "t.lide-2600", "kind": "ticket", "repo": "/home/u/repoB", "status": "stopped"},
         ]
 
     def test_docker_failure_returns_empty(self, tmp_path):
@@ -875,26 +875,26 @@ class TestListContainers:
 
 class TestResolveRecipient:
     _CONTAINERS = [
-        {"name": "cld_agent_repoA", "kind": "agent", "repo": "/home/u/repoA", "status": "running"},
-        {"name": "cld_agent_repoA_add-oauth", "kind": "task-agent", "repo": "/home/u/repoA", "status": "running"},
-        {"name": "cld_agent_repoB_fix-tests", "kind": "task-agent", "repo": "/x/repoB", "status": "running"},
+        {"name": "a.t1.repoA", "kind": "agent", "repo": "/home/u/repoA", "status": "running"},
+        {"name": "a.repoA.add-oauth", "kind": "task-agent", "repo": "/home/u/repoA", "status": "running"},
+        {"name": "a.repoB.fix-tests", "kind": "task-agent", "repo": "/x/repoB", "status": "running"},
     ]
 
     def test_full_name_used_verbatim(self):
-        assert resolve_recipient("cld_agent_repoB_fix-tests", self._CONTAINERS) == "cld_agent_repoB_fix-tests"
+        assert resolve_recipient("a.repoB.fix-tests", self._CONTAINERS) == "a.repoB.fix-tests"
 
     def test_existing_mailbox_short_circuits_without_enumeration(self, tmp_path):
         # Reply path: `to` names an existing mailbox dir -> return verbatim and
         # never call list_containers (so agents can reply with no host channel).
-        (tmp_path / "cld_agent_repoA").mkdir()
+        (tmp_path / "a.t1.repoA").mkdir()
         with patch("cld.messenger.mailbox.list_containers", side_effect=AssertionError("enumerated")):
-            assert resolve_recipient("cld_agent_repoA", root=tmp_path) == "cld_agent_repoA"
+            assert resolve_recipient("a.t1.repoA", root=tmp_path) == "a.t1.repoA"
 
     def test_shortname_prefers_the_standing_agent(self):
-        assert resolve_recipient("repoA", self._CONTAINERS) == "cld_agent_repoA"
+        assert resolve_recipient("repoA", self._CONTAINERS) == "a.t1.repoA"
 
     def test_shortname_resolves_to_only_match(self):
-        assert resolve_recipient("repoB", self._CONTAINERS) == "cld_agent_repoB_fix-tests"
+        assert resolve_recipient("repoB", self._CONTAINERS) == "a.repoB.fix-tests"
 
     def test_unknown_shortname_raises(self):
         with pytest.raises(ValueError, match="No container found"):
@@ -902,14 +902,14 @@ class TestResolveRecipient:
 
     def test_ambiguous_shortname_raises(self):
         containers = self._CONTAINERS + [
-            {"name": "cld_agent_repoA2_zz", "kind": "task-agent", "repo": "/other/repoA", "status": "running"},
+            {"name": "a.repoA2.zz", "kind": "task-agent", "repo": "/other/repoA", "status": "running"},
         ]
         with pytest.raises(ValueError, match="Ambiguous shortname"):
             resolve_recipient("repoA", containers)
 
     _TASK_AGENTS = [
-        {"name": "cld_agent_repoC_add-oauth", "kind": "task-agent", "repo": "/home/u/repoC", "status": "running"},
-        {"name": "cld_agent_repoC_fix-tests", "kind": "task-agent", "repo": "/home/u/repoC", "status": "running"},
+        {"name": "a.repoC.add-oauth", "kind": "task-agent", "repo": "/home/u/repoC", "status": "running"},
+        {"name": "a.repoC.fix-tests", "kind": "task-agent", "repo": "/home/u/repoC", "status": "running"},
     ]
 
     def test_shortname_matching_several_task_agents_raises(self):
@@ -919,37 +919,37 @@ class TestResolveRecipient:
 
     def test_repo_agent_still_wins_over_task_agents(self):
         containers = self._TASK_AGENTS + [
-            {"name": "cld_agent_repoC", "kind": "agent", "repo": "/home/u/repoC", "status": "running"},
+            {"name": "a.t1.repoC", "kind": "agent", "repo": "/home/u/repoC", "status": "running"},
         ]
-        assert resolve_recipient("repoC", containers) == "cld_agent_repoC"
+        assert resolve_recipient("repoC", containers) == "a.t1.repoC"
 
     def test_single_task_agent_shortname_still_resolves(self):
-        assert resolve_recipient("repoC", self._TASK_AGENTS[:1]) == "cld_agent_repoC_add-oauth"
+        assert resolve_recipient("repoC", self._TASK_AGENTS[:1]) == "a.repoC.add-oauth"
 
     # Ticket containers (v2): the slug is a shortname too, resolved after the
     # exact container name and before repo basenames; a collision between a
     # slug and a basename is an ambiguity error naming both
     # (design-ticket-containers.md section 6.5).
     _TICKETS = [
-        {"name": "cld_ticket_lide-2600", "kind": "ticket", "repo": "", "status": "running"},
+        {"name": "t.lide-2600", "kind": "ticket", "repo": "", "status": "running"},
     ]
 
     def test_ticket_slug_resolves_to_the_ticket_container(self):
         assert resolve_recipient("lide-2600", self._CONTAINERS + self._TICKETS) \
-            == "cld_ticket_lide-2600"
+            == "t.lide-2600"
 
     def test_ticket_full_name_still_used_verbatim(self):
-        assert resolve_recipient("cld_ticket_lide-2600", self._TICKETS) \
-            == "cld_ticket_lide-2600"
+        assert resolve_recipient("t.lide-2600", self._TICKETS) \
+            == "t.lide-2600"
 
     def test_slug_equal_to_repo_basename_is_ambiguous_naming_both(self):
         containers = self._CONTAINERS + [
-            {"name": "cld_ticket_repoA", "kind": "ticket", "repo": "", "status": "running"},
+            {"name": "t.repoa", "kind": "ticket", "repo": "", "status": "running"},
         ]
         with pytest.raises(ValueError) as exc:
             resolve_recipient("repoA", containers)
-        assert "cld_ticket_repoA" in str(exc.value)
-        assert "cld_agent_repoA" in str(exc.value)
+        assert "t.repoa" in str(exc.value)
+        assert "a.t1.repoA" in str(exc.value)
 
     def test_ticket_repo_field_never_matches_as_basename(self):
         """A ticket's record carries no repo-root; its (empty) repo must not

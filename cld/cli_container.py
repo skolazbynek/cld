@@ -387,7 +387,7 @@ app.add_typer(chain_app, name="chain")
 def run_start(
     refs: Optional[list[str]] = typer.Argument(None, help=_REFS_HELP),
     revision: str = typer.Option(..., "-r", "--revision", help=_REVISION_HELP),
-    name: str = typer.Option("", "-n", "--name", help="Run name (default: random)"),
+    name: str = typer.Option("", "-n", "--name", help="Run name (default: random); the session is run.<name>"),
     model: str = typer.Option("", "-m", "--model", help="Claude model (e.g. opus, sonnet)"),
     prompt: str = typer.Option("", "-p", "--prompt", help="Inline task, appended after the refs"),
     repo: str = typer.Option("", "--repo", help=_REPO_HELP),
@@ -429,7 +429,7 @@ def run_cancel(name: str = typer.Argument(..., help="Run name")):
 def chain_start(
     refs: Optional[list[str]] = typer.Argument(None, help="`@<chain-name>` first, then the initial brief. " + _REFS_HELP),
     revision: str = typer.Option(..., "-r", "--revision", help=_REVISION_HELP),
-    name: str = typer.Option("", "-n", "--name", help="Chain name (default: the chain's own)"),
+    name: str = typer.Option(..., "-n", "--name", help="Chain name (required, must be unused)"),
     model: str = typer.Option("", "-m", "--model", help="Claude model (e.g. opus, sonnet)"),
     prompt: str = typer.Option("", "-p", "--prompt", help="Inline brief, appended after the refs"),
     repo: str = typer.Option("", "--repo", help=_REPO_HELP),

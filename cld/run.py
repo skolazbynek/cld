@@ -1,15 +1,16 @@
 """One-shot Claude agent (`cld run`) launch logic."""
 
+import secrets
 import subprocess
 import sys
 from pathlib import Path
 
+from cld import names
 from cld.config import Config
 from cld.docker import (
     anchor_env_args,
     base_extra_paths,
     build_container_args,
-    build_session_name,
     ensure_image,
     find_target_repo,
     in_master_container,
@@ -79,7 +80,7 @@ def launch_run(
         quiet=quiet,
     )
 
-    session = session_name or build_session_name("run", name)
+    session = session_name or names.run_id(name or secrets.token_hex(3))
     mode = "shared" if shared_anchor else "isolated"
     # No overlap check: a run may start inside a live container's tree (a ticket
     # launches runs on its own work through the broker).

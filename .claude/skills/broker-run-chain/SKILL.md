@@ -26,7 +26,7 @@ steer, message and reap, use a task-agent (skill `task-agent-start`).
 
 ```bash
 cld run   start [@refs...] -r <rev> [-n <name>] [-m <model>] [-p <text>] [--repo <name>]
-cld chain start @<chain> [@refs...] -r <rev> [-n <name>] [-m <model>] [-p <text>] [--repo <name>]
+cld chain start @<chain> [@refs...] -r <rev> -n <name> [-m <model>] [-p <text>] [--repo <name>]
 ```
 
 - `-r` is required. It must be a **committed change in your own tree** of that repo.
@@ -37,10 +37,14 @@ cld chain start @<chain> [@refs...] -r <rev> [-n <name>] [-m <model>] [-p <text>
 - Refs: `@refs` resolve on the host. A path in your filesystem is read here and
   folded into `-p`. A chain takes `@<chain-name>` first (from the repo's or cld's
   `chains/`), then the `@refs` of its initial brief.
-- `-n` names the job: letters, digits, `_` and `-`. A run's session is `run_<name>`,
-  a chain's name is the name itself. Without `-n` a run gets a random one.
+- `-n` names the job: letters, digits, `_` and `-`. A run's session is `run.<name>`,
+  a chain's session is `chain.<name>`. Without `-n` a run gets a random name; a chain
+  **requires** `-n`, and the name must be unused: it is refused while a chain of that
+  name runs on the host, or while the bookmark `chain.<name>` exists (delete it or pick
+  another name).
 - `--repo <name>` only when the ticket mounts more than one repo (`cld repos`).
-- Prints `started: <name>`. Use that name for the other verbs.
+- Prints `started: <name>`. Use that name for the other verbs (`run.<name>` for a run, the
+  bare `<name>` for a chain).
 - Not available: `--shared-anchor`, `--no-detach`, `--force`, `--parent`.
 
 ## Cap
@@ -78,7 +82,7 @@ content.
 
 Read it with plain jj in the shared store (`jj log -r <bookmark>`).
 
-- The bookmark: `run_<name>` for a run, `chain_<name>` for a chain.
+- The bookmark: `run.<name>` for a run, `chain.<name>` for a chain.
 - A scratch commit right above the base. Its description starts with `cld anchor:`
   and it holds `.cld-run/brief.md`.
 - The `agent-output-<session>/` folder: summary and, on failure, the failure note.

@@ -94,7 +94,7 @@ The manifest is persisted as container labels at `docker run`:
 
 - `org.cld.kind=ticket`
 - `org.cld.ticket=<slug>`
-- `org.cld.session=cld_ticket_<slug>` (existing key, kept for broker/messenger
+- `org.cld.session=t.<slug>` (existing key, kept for broker/messenger
   readers)
 - `org.cld.manifest=<the JSON above>` — authoritative, read by Python via
   `docker inspect`
@@ -215,7 +215,7 @@ shared, not forked.
 
 ### 4.1 Wire: what the launcher passes
 
-- `-e TICKET_MODE=1`, `-e SESSION_NAME=cld_ticket_<slug>`
+- `-e TICKET_MODE=1`, `-e SESSION_NAME=t.<slug>`
 - `-e CLD_TICKET_MANIFEST=<same JSON as the label>` — the boot loop's input,
   parsed with jq (already a hard dependency of `build_claude_config`,
   `container-init.sh:103-149`; the image ships it)
@@ -240,9 +240,9 @@ For each manifest entry, in manifest order:
 
 1. `cd /workspace/origin/<name>`; detect backend (`cld/vcs/detect.py`).
 2. Three-branch workspace logic against `/workspace/<slug>/<name>` with
-   bookmark `cld_ticket_<slug>`: warm restart (workspace dir exists in the
+   bookmark `t.<slug>`: warm restart (workspace dir exists in the
    container layer) / reattach (bookmark exists in the store) / first launch
-   (`jj workspace add --name cld_ticket_<slug> -r <anchor_base> …`).
+   (`jj workspace add --name t.<slug> -r <anchor_base> …`).
 3. First launch only: stage scratch B via
    `python3 -m cld.vcs.scratch --default-payload`, a new flag that synthesizes
    `{"session": …}` locally instead of requiring `AGENT_SCRATCH`
@@ -314,7 +314,7 @@ silence (spec gap 5).
 the pattern at `cli_container.py:25,328`) execs:
 
 ```
-docker exec -it -w /workspace/<slug> cld_ticket_<slug> claude <args…>
+docker exec -it -w /workspace/<slug> t.<slug> claude <args…>
 ```
 
 where `claude` is the in-container wrapper (permission-skip + `--add-dir`
@@ -426,7 +426,7 @@ set. Everything downstream of `$REPO` — `resolve_test_context`'s
 `jj -R "$REPO" … -r "${session}@"` (`:102-106`), per-repo `.env` via
 `resolve_secrets_env_file` (`:75-83`), `cld_conf_get` (`:57-61`) — already
 keys off `$REPO` and multi-repos cleanly; the ticket owns a
-`cld_ticket_<slug>` workspace in every mounted repo, so `${session}@`
+`t.<slug>` workspace in every mounted repo, so `${session}@`
 resolves per repo unchanged.
 
 Client (`cld/broker.py`) and in-container CLI: `cld broker run-tests
@@ -474,11 +474,11 @@ prefix. `Config` gains `path_map: dict[str, str]` parsed from the env.
 ### 6.5 Messenger and in-container target resolution
 
 - **In-container:** already generic — `SESSION_NAME` + `MAILBOX_MOUNT`
-  (`identity.py:18-19`) make `cld_ticket_<slug>` mailboxes work unchanged;
+  (`identity.py:18-19`) make `t.<slug>` mailboxes work unchanged;
   `ensure_own_mailbox` likewise (`container-init.sh:43-56`).
 - **Host-side `resolve_self`** (`identity.py:16-24`, today "the cwd repo's
   master"): new chain — `CLD_TICKET` env / `--ticket` flag → that ticket's
-  container name; else if exactly one `cld_ticket_*` container is running →
+  container name; else if exactly one `t.*` container is running →
   it; else fall back to the v1 master resolution (coexistence); else error
   listing running tickets. A cwd-walk mapping cwd → tickets mounting that
   repo is deliberately not attempted: several tickets can mount one repo, so
@@ -549,8 +549,9 @@ receives the repo name explicitly. Inside the container it cannot read
 v2 lands beside `cld master` / bare devcontainer; removal is a later cleanup
 (spec §14 covers migration).
 
-- **Names:** `cld_ticket_<slug>` cannot collide with `cld_master_<repo>_<sha>`
-  / `cld_agent_<repo>[_<slug>]`; slug sanitation reuses `_TASK_SLUG_RE`.
+- **Names:** `t.<slug>` cannot collide with `cld_master_<repo>_<sha>`
+  / `a.<ticket>.<slug>`; slug sanitation lives in `cld/names.py`
+  (`docs/design-bookmark-naming.md`).
   Bookmarks/workspaces per repo likewise disjoint by prefix.
 - **CLI:** root callback keeps launching the bare devcontainer; the new root
   verbs sit beside it. `cld master` keeps working unchanged. The only shared

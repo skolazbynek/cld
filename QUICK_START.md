@@ -65,7 +65,8 @@ cld task-agent start implementer -n add-oauth -p "Add OAuth login to the web app
 ```
 
 - `implementer` — the role persona (`cld prompts` lists them).
-- `-n add-oauth` — the task slug: names the container and its deliverable branch.
+- `-n add-oauth` — the task slug: it ends the agent's identifier `a._host.add-oauth`
+  (container, mailbox, session bookmark); the deliverable branch is `a._host.add-oauth.mr`.
 
 It starts working immediately; your task is its first turn.
 
@@ -79,8 +80,8 @@ cld task-agent transcript add-oauth    # the conversation
 ## 3. Tell it to wrap up
 
 ```bash
-echo "Wrap up: squash your work into add-oauth and report what landed." > /tmp/msg.md
-python -m cld.messenger.send --to cld_agent_myrepo_add-oauth \
+echo "Wrap up: squash your work into a._host.add-oauth.mr and report what landed." > /tmp/msg.md
+python -m cld.messenger.send --to a._host.add-oauth \
     --subject "wrap up" --body-file /tmp/msg.md --expects-reply
 
 python -m cld.messenger.inbox          # its reply lands here
@@ -93,6 +94,6 @@ two agents no longer thank each other in a loop.
 ## 4. Take the work, then reap
 
 ```bash
-jj log -r add-oauth                    # the branch survives teardown
+jj log -r a._host.add-oauth.mr         # the branch survives teardown
 cld task-agent shutdown add-oauth
 ```

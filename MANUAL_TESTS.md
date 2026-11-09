@@ -398,7 +398,7 @@ Until the W4 lifecycle verbs land, drive launches directly from the W2/W3
 building blocks:
 
 ```bash
-cld_ticket_run() {  # usage: cld_ticket_run <ticket> <repo> [repo...]
+smoke_ticket_run() {  # usage: smoke_ticket_run <ticket> <repo> [repo...]
   python3 - "$@" <<'PY'
 import subprocess, sys
 from cld.config import Config
@@ -419,9 +419,9 @@ With W4, the same checks apply behind `cld start` / `cld stop` /
 
 **Steps**
 
-1. `cld_ticket_run smoke-t1 <repo-a>`
-2. Wait for boot: `docker exec cld_ticket_smoke-t1 ls /tmp/cld-ticket-ready`
-   (retry until present; boot logs: `docker logs cld_ticket_smoke-t1`).
+1. `smoke_ticket_run smoke-t1 <repo-a>`
+2. Wait for boot: `docker exec t.smoke-t1 ls /tmp/cld-ticket-ready`
+   (retry until present; boot logs: `docker logs t.smoke-t1`).
 
 **Observe / confirm**
 
@@ -429,21 +429,21 @@ With W4, the same checks apply behind `cld start` / `cld stop` /
   `[cld] first launch, base=…`, `[cld] anchor=… (mode=isolated, base=…,
   scratch=…)`, `[cld] wrote /workspace/smoke-t1/CLAUDE.md`,
   `[cld] ticket 'smoke-t1' ready (1 repos)`.
-- In the repo on the host: `jj bookmark list` shows `cld_ticket_smoke-t1`;
-  `jj log -r 'description(glob:"cld anchor: cld_ticket_smoke-t1*")'` shows the
+- In the repo on the host: `jj bookmark list` shows `t.smoke-t1`;
+  `jj log -r 'description(glob:"cld anchor: t.smoke-t1*")'` shows the
   scratch commit B as a child of the anchor base, description ending
   `mode=isolated`.
-- `docker exec cld_ticket_smoke-t1 cat /workspace/smoke-t1/CLAUDE.md` — table
+- `docker exec t.smoke-t1 cat /workspace/smoke-t1/CLAUDE.md` — table
   row per repo (name, anchor, mode, backend) and the anchor-contract sentence.
-- `jj log -r 'description(glob:"cld anchor: cld_ticket_smoke-t1*")' -T empty`
+- `jj log -r 'description(glob:"cld anchor: t.smoke-t1*")' -T empty`
   in the repo on the host prints `true`: the ticket's scratch commit carries no
   files (no `AGENT_SCRATCH` env on the container: `docker inspect` shows none).
 - Watchman snapshots: edit a file via
-  `docker exec cld_ticket_smoke-t1 sh -c 'echo x >> /workspace/smoke-t1/<repo-a>/README.md'`,
-  then within ~10 s the host-side `jj log -r cld_ticket_smoke-t1@` (workspace
+  `docker exec t.smoke-t1 sh -c 'echo x >> /workspace/smoke-t1/<repo-a>/README.md'`,
+  then within ~10 s the host-side `jj log -r t.smoke-t1@` (workspace
   working copy) shows the edit.
-- Single-session lock: `docker exec -d cld_ticket_smoke-t1 claude -p 'sleep'`
-  then a second `docker exec cld_ticket_smoke-t1 claude -p hi` refuses with
+- Single-session lock: `docker exec -d t.smoke-t1 claude -p 'sleep'`
+  then a second `docker exec t.smoke-t1 claude -p hi` refuses with
   `a claude session is already live` naming pid + start time.
 
 **Debug if it fails**
@@ -459,11 +459,11 @@ With W4, the same checks apply behind `cld start` / `cld stop` /
 
 **Steps**
 
-1. `docker exec cld_ticket_smoke-t1 sh -c 'touch /workspace/smoke-t1/<repo-a>/warm-marker'`
-2. `docker stop cld_ticket_smoke-t1` — expect a fast, clean stop (TERM trap
+1. `docker exec t.smoke-t1 sh -c 'touch /workspace/smoke-t1/<repo-a>/warm-marker'`
+2. `docker stop t.smoke-t1` — expect a fast, clean stop (TERM trap
    exits 0; **no** bookmark forgetting: `jj bookmark list` on the host still
-   shows `cld_ticket_smoke-t1`).
-3. `docker start cld_ticket_smoke-t1`
+   shows `t.smoke-t1`).
+3. `docker start t.smoke-t1`
 
 **Observe / confirm**
 
@@ -481,15 +481,15 @@ With W4, the same checks apply behind `cld start` / `cld stop` /
 
 **Steps**
 
-1. Make and snapshot an edit (as in 8.1), note `jj log -r cld_ticket_smoke-t1`
+1. Make and snapshot an edit (as in 8.1), note `jj log -r t.smoke-t1`
    on the host.
-2. `docker rm -f cld_ticket_smoke-t1`
-3. `cld_ticket_run smoke-t1 <repo-a>` again (same ticket; with W4 this is
+2. `docker rm -f t.smoke-t1`
+3. `smoke_ticket_run smoke-t1 <repo-a>` again (same ticket; with W4 this is
    `cld restart`, which reuses the labeled manifest).
 
 **Observe / confirm**
 
-- Logs show `[cld] reattaching workspace 'cld_ticket_smoke-t1'` — not first
+- Logs show `[cld] reattaching workspace 't.smoke-t1'` — not first
   launch; the anchor line is absent but the recovered anchor governs (verify:
   no second `cld anchor:` commit appears).
 - The bookmark still points where it did before the rm; the snapshotted edit
@@ -502,15 +502,15 @@ With W4, the same checks apply behind `cld start` / `cld stop` /
 **Steps**
 
 1. `cld shutdown`-equivalent cleanup of 8.1-8.3 first (host-side per repo:
-   `jj workspace forget cld_ticket_smoke-t1 && jj bookmark forget
-   cld_ticket_smoke-t1`; `docker rm -f cld_ticket_smoke-t1`).
-2. `cld_ticket_run smoke-t2 <repo-a> <repo-b>`
+   `jj workspace forget t.smoke-t1 && jj bookmark forget
+   t.smoke-t1`; `docker rm -f t.smoke-t1`).
+2. `smoke_ticket_run smoke-t2 <repo-a> <repo-b>`
 
 **Observe / confirm**
 
 - Progress lines `[cld] repo 1/2: …` and `[cld] repo 2/2: …`; ready line says
   `(2 repos)`.
-- Both repos' stores gain a `cld_ticket_smoke-t2` bookmark + workspace; the
+- Both repos' stores gain a `t.smoke-t2` bookmark + workspace; the
   ticket root holds both subdirs; CLAUDE.md lists two rows.
 - Per-repo `ignore_gitignore`: give repo-a a `.cld/config.toml` with
   `ignore_gitignore = [".env"]` and a host `.env` before launch. The launch
@@ -523,7 +523,7 @@ With W4, the same checks apply behind `cld start` / `cld stop` /
 
 **Steps**
 
-1. `cld_ticket_run` variant with `anchor_mode="shared"` for one repo (pass
+1. `smoke_ticket_run` variant with `anchor_mode="shared"` for one repo (pass
    `shared=["<repo-a>"]` to `resolve_manifest`; with W4:
    `cld start smoke-t3 <repo-a> --shared-anchor <repo-a>`).
 

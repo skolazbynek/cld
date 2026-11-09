@@ -11,6 +11,7 @@ from pathlib import Path
 from string import Template
 from typing import TYPE_CHECKING, Iterator
 
+from cld import names
 from cld.run import launch_run
 from cld.agent_runtime import wait_for_agent, read_agent_cost, format_duration
 from cld.config import Config
@@ -262,7 +263,7 @@ def apply_name_override(chain: Chain, override: str) -> Chain:
     dirs, output paths and report banners uniformly.
     """
     if not override:
-        return chain
+        raise ValueError("a chain name is required: pass -n/--name <chain>")
     if not _NAME_RE.match(override):
         raise ValueError(
             f"chain name override '{override}' must match {_NAME_RE.pattern}"
@@ -271,15 +272,12 @@ def apply_name_override(chain: Chain, override: str) -> Chain:
 
 
 def chain_branch(chain: Chain) -> str:
-    return f"chain_{chain.name}"
+    return names.chain_id(chain.name)
 
 
-def step_session(chain: Chain, step: ChainStep, group_idx: int | None = None) -> str:
+def step_session(chain: Chain, step: ChainStep) -> str:
     """Session/branch name for an individual step's agent."""
-    prefix = chain_branch(chain)
-    if group_idx is not None:
-        return f"{prefix}_{group_idx}_{step.name}"
-    return f"{prefix}_{step.name}"
+    return names.step_id(chain.name, step.name)
 
 
 def _anchor_ref(vcs, anchor_commit: str) -> str:
@@ -413,7 +411,7 @@ class ChainResult:
 
 
 def chain_state_dir(repo_root: Path, chain_name: str) -> Path:
-    return repo_root / ".cld" / "chains" / f"chain_{chain_name}"
+    return repo_root / ".cld" / "chains" / names.chain_id(chain_name)
 
 
 def run_chain(
@@ -479,12 +477,12 @@ def run_chain(
                 log.debug("parallel group (%d siblings) launching", len(item.siblings))
                 if state_writer is not None:
                     sibling_names = ",".join(s.name for s in item.siblings)
-                    sibling_sessions = [step_session(chain, s, group_idx=i) for s in item.siblings]
+                    sibling_sessions = [step_session(chain, s) for s in item.siblings]
                     state_writer.mark_step_start(i, "parallel", sibling_names, sibling_sessions)
                 prior_outputs = _gather_prior_outputs(chain, item, results, i)
                 step_initial = initial_text or None
                 group_results = _run_parallel(
-                    cfg=cfg, vcs=vcs, chain=chain, group=item, group_idx=i,
+                    cfg=cfg, vcs=vcs, chain=chain, group=item,
                     prior_outputs=prior_outputs,
                     initial_task=step_initial,
                     repo_root=repo_root, cld_root=cld_root,
@@ -647,7 +645,6 @@ def _run_parallel(
     vcs,
     chain: Chain,
     group: ParallelGroup,
-    group_idx: int,
     prior_outputs: list[tuple[str, str]],
     initial_task: str | None,
     repo_root: Path,
@@ -656,7 +653,7 @@ def _run_parallel(
     """Launch all siblings (serialized launch), wait concurrently, return results."""
     sessions: list[tuple[ChainStep, str]] = []
     for sibling in group.siblings:
-        session = step_session(chain, sibling, group_idx=group_idx)
+        session = step_session(chain, sibling)
         brief = compose_task(
             chain=chain, step=sibling,
             initial_task=initial_task,

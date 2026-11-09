@@ -31,7 +31,7 @@ for the full design.
 ```
 container: cld broker run-tests -k login -x tests/
    └─ssh (restricted key)─▶ dedicated sshd ─ForceCommand▶ cld-broker.py
-        ├─ validate: action=run-tests, session=cld_agent_… or cld_ticket_…
+        ├─ validate: action=run-tests, session=a.<ticket>.<agent> or t.<ticket>
         ├─ REPO = docker inspect <session> -> org.cld.repo-root label
         ├─ REV  = jj -R <repo> --ignore-working-copy log -r "<session>@"   (workspace tip, store-reading only)
         ├─ .env = <repo>/.env  (or under pyproject_dir from <repo>/.cld/config.toml)
@@ -131,20 +131,20 @@ a throwaway):
 
 ```
 REPO=/abs/path/to/some/repo
-docker run -d --name cld_agent_demo --label org.cld.repo-root="$REPO" alpine sleep 300
-jj -R "$REPO" bookmark create cld_agent_demo -r @
+docker run -d --name a.t1.demo --label org.cld.repo-root="$REPO" alpine sleep 300
+jj -R "$REPO" bookmark create a.t1.demo -r @
 
 payload=$(printf '%s\0' -k some_test -x | base64 -w0)
 ssh -i /etc/cld/broker_key \
     -o UserKnownHostsFile=<known_hosts> -o StrictHostKeyChecking=yes \
-    -p 2222 <user>@172.17.0.1 -- "run-tests cld_agent_demo $payload"
+    -p 2222 <user>@172.17.0.1 -- "run-tests a.t1.demo $payload"
 
 # rejected: anything but a defined action, or a malformed/unknown session
-ssh ... -- "deploy cld_agent_demo $payload"        # -> denied (bad action)
+ssh ... -- "deploy a.t1.demo $payload"        # -> denied (bad action)
 ssh ... -- "run-tests ../../etc/passwd $payload"    # -> denied (bad session)
-ssh ... -- "run-tests cld_agent_nope $payload"     # -> denied (no such container)
+ssh ... -- "run-tests a.t1.nope $payload"     # -> denied (no such container)
 
-docker rm -f cld_agent_demo; jj -R "$REPO" bookmark delete cld_agent_demo
+docker rm -f a.t1.demo; jj -R "$REPO" bookmark delete a.t1.demo
 ```
 
 ## Adding an action

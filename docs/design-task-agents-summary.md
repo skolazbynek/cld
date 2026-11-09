@@ -15,7 +15,7 @@ conversational session).
 | Lifespan | bounded — lives until its task is done |
 | Persona / task | chosen by the master at spawn |
 | Lifecycle owner | the master (with a manual host fallback) |
-| Identity | `cld_agent_<repo>_<task-slug>` |
+| Identity | `a.<ticket>.<task-slug>` |
 
 A master runs a **control tower**: it spawns several task-agents (on its own
 repo and/or registered sibling targets), drives each by messenger, and reaps

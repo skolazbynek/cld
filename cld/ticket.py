@@ -31,8 +31,6 @@ from cld.docker import (
     stage_home_ro,
     stage_ssh_agent,
     ticket_anchor_resolver,
-    ticket_container_name,
-    ticket_slug,
 )
 from cld.log import get_logger, log_subprocess
 from cld.manifest import (
@@ -44,6 +42,7 @@ from cld.manifest import (
     read_manifest,
     resolve_manifest,
 )
+from cld.names import ticket_id, ticket_slug
 from cld.registry import pick_repos
 from cld.vcs import get_backend
 from cld.vcs.anchor import find_anchor_commit, move_anchor_commit, revert_ops
@@ -110,7 +109,7 @@ def _launch(cfg: Config, manifest: TicketManifest) -> None:
     extras every interactive kind gets -- devcontainer home mounts, the
     forwarded ssh-agent -- ride along, recomputed per launch.
     """
-    container = ticket_container_name(manifest.ticket)
+    container = ticket_id(manifest.ticket)
     cld_root = Path(__file__).resolve().parent.parent
     ensure_image(
         cfg.devcontainer_image,
@@ -172,7 +171,7 @@ def _resolve_launch_manifest(
 
 
 def _start_banner(manifest: TicketManifest) -> None:
-    typer.echo(f"Ticket '{manifest.ticket}' ready ({ticket_container_name(manifest.ticket)}).")
+    typer.echo(f"Ticket '{manifest.ticket}' ready ({ticket_id(manifest.ticket)}).")
     for repo in manifest.repos:
         typer.echo(
             f"  {repo.name}: {repo.anchor_base[:12]} "
@@ -245,7 +244,7 @@ def start_ticket(cfg: Config, ticket: str, specs: list[str], shared: list[str]) 
     repos reattach at their bookmarks (design section 2.3).
     """
     slug = ticket_slug(ticket)
-    container = ticket_container_name(slug)
+    container = ticket_id(slug)
     status = _docker_status(container)
 
     if status == "absent":
@@ -291,7 +290,7 @@ def start_ticket(cfg: Config, ticket: str, specs: list[str], shared: list[str]) 
 def _require_running(ticket: str) -> tuple[str, str]:
     """Return ``(slug, container)`` of a *running* ticket, or raise with the fix."""
     slug = ticket_slug(ticket)
-    container = ticket_container_name(slug)
+    container = ticket_id(slug)
     status = _docker_status(container)
     if status != "running":
         hint = (
@@ -352,7 +351,7 @@ def _stop_and_remove(container: str) -> None:
 def stop_ticket(ticket: str) -> None:
     """Pause: ``docker stop``. Workspaces stay in place for a warm start."""
     slug = ticket_slug(ticket)
-    container = ticket_container_name(slug)
+    container = ticket_id(slug)
     status = _docker_status(container)
     if status == "absent":
         raise RuntimeError(f"no ticket container '{container}'")
@@ -474,7 +473,7 @@ def restart_ticket(cfg: Config, ticket: str, reanchor: tuple[str, ...] = ()) -> 
     unless *reanchor* names repos to move first (design-anchor-move section 5).
     """
     slug = ticket_slug(ticket)
-    container = ticket_container_name(slug)
+    container = ticket_id(slug)
     if _docker_status(container) == "absent":
         raise RuntimeError(
             f"no ticket container '{container}' to restart; `cld start {slug}` creates one"
@@ -517,7 +516,7 @@ def _teardown(container: str) -> None:
 
 def shutdown_ticket(ticket: str) -> None:
     """End of ticket: teardown plus per-repo bookmark/workspace forget."""
-    container = ticket_container_name(ticket)
+    container = ticket_id(ticket)
     if _docker_status(container) == "absent":
         typer.echo(f"No ticket container '{container}'.")
         return
@@ -670,7 +669,7 @@ def print_ticket_roster() -> None:
             slug = manifest.ticket
             repos = ", ".join(r.name for r in manifest.repos)
         except (RuntimeError, ValueError) as e:
-            slug = name.removeprefix("cld_ticket_")
+            slug = name.removeprefix("t.")
             repos = f"<unreadable manifest: {e}>"
         session = _session_state(name) if state == "running" else "-"
         rows.append((slug, state, session, repos))
@@ -680,7 +679,7 @@ def print_ticket_roster() -> None:
 def print_ticket_detail(ticket: str) -> None:
     """One ticket: per-repo anchors, modes, bookmark tips, session, uptime."""
     slug = ticket_slug(ticket)
-    container = ticket_container_name(slug)
+    container = ticket_id(slug)
     status = _docker_status(container)
     if status == "absent":
         raise RuntimeError(
@@ -717,7 +716,7 @@ def _print_logs(container: str, tail: int) -> None:
 
 def print_ticket_logs(ticket: str, tail: int) -> None:
     """Entrypoint/boot logs of the ticket container (spec section 5)."""
-    container = ticket_container_name(ticket)
+    container = ticket_id(ticket)
     if _docker_status(container) == "absent":
         raise RuntimeError(f"no ticket container '{container}'")
     _print_logs(container, tail)

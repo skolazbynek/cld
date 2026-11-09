@@ -48,8 +48,8 @@ cld run -p "Fix the auth bug in src/login.py"
 cld run task.md -p "Focus on the database layer"
 
 # Declarative multi-agent chain
-cld chain run @review-implement task.md
-cld chain run chains/parallel-review.yaml -p "Focus on auth code"
+cld chain run @review-implement task.md -n my-review
+cld chain run chains/parallel-review.yaml -n my-review -p "Focus on auth code"
 cld chain list
 cld chain validate chains/my-chain.yaml
 cld chain dry-run @review-implement
@@ -149,17 +149,17 @@ Agent containers run detached and auto-remove on exit. Results are committed to 
 
 ## Chain workflow
 
-`cld chain` runs a declarative sequence of named agents defined in a YAML file. Each step is an autonomous agent that receives the prior step's output as context. Steps can run in parallel (a `parallel:` group); the synthesiser step that follows sees a combined summary. Built-in chains live in `chains/` in the repo and in the installed package; reference them with `@name` shorthand.
+`cld chain` runs a declarative sequence of named agents defined in a YAML file. Each step is an autonomous agent that receives the prior step's output as context. Steps can run in parallel (a `parallel:` group); the synthesiser step that follows sees a combined summary. Built-in chains live in `chains/` in the repo and in the installed package; reference them with `@name` shorthand. `-n <chain>` is required and names the run: its result lands on the bookmark `chain.<chain>` and each step runs as `chain.<chain>.<step>`. A name is refused while a chain of that name is running, or while the bookmark `chain.<chain>` exists (see `docs/design-bookmark-naming.md`).
 
 ```bash
 # Run a built-in chain against a task file
-cld chain run @review-implement task.md
+cld chain run @review-implement task.md -n my-review
 
 # Run with an inline prompt instead of a task file
-cld chain run @review-implement -p "Fix the N+1 query in user_repo.py"
+cld chain run @review-implement -n my-review -p "Fix the N+1 query in user_repo.py"
 
 # Run a local chain file
-cld chain run chains/parallel-review.yaml task.md
+cld chain run chains/parallel-review.yaml task.md -n my-review
 
 # Inspect without running
 cld chain list
@@ -253,7 +253,7 @@ This detection runs both on the host (CLI commands) and inside containers (entry
 
 Lets any cld container (ticket or task-agent) send a message to any other and get a reply on its next turn, backed by a shared mailbox directory on the host -- no threads, no polling required from the user. Full design and mental model: `docs/design-agent-messaging.md`.
 
-Ticket containers get a mailbox named `cld_ticket_<slug>` and can be addressed by the ticket slug; a slug that is also some repo's basename is an ambiguity error naming both. Host-side `cld msg` acts as: the `--ticket` flag (or `CLD_TICKET` env), else the single running ticket container if exactly one exists, else the cwd repo's own host identity.
+Ticket containers get a mailbox named `t.<slug>` and can be addressed by the ticket slug; a slug that is also some repo's basename is an ambiguity error naming both. Host-side `cld msg` acts as: the `--ticket` flag (or `CLD_TICKET` env), else the single running ticket container if exactly one exists, else the cwd repo's own host identity.
 
 ```bash
 # Register for host use (user-scoped, works from any directory)
@@ -263,7 +263,7 @@ claude mcp add -s user messenger -- /path/to/cld/scripts/mcp/run-messenger.sh
 cld task-agent start @personas/implementer -n add-oauth -p "Add OAuth login."
 
 # From any other container (a ticket or another agent), message it by container name
-# (inside Claude): mcp__messenger__send(to="cld_agent_my-repo_add-oauth", subject="...", body="...", expects_reply=True)
+# (inside Claude): mcp__messenger__send(to="a._host.add-oauth", subject="...", body="...", expects_reply=True)
 ```
 
 **Tools:** `send(to, subject, body)`, `list_inbox(unread_only)`, `read_message(id)`, `archive(id)`, `list_agents(kind)`.

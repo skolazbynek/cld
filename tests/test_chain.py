@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 from typer.testing import CliRunner
 
-from cld.chain import apply_name_override, chain_branch, load_chain, run_chain, validate_chain
+from cld.chain import apply_name_override, chain_branch, load_chain, run_chain, step_session, validate_chain
 from cld.chain_state import ChainState, _utcnow_iso, write_state
 from cld.cli import _collect_chain_rows, app
 from cld.config import Config
@@ -90,15 +90,26 @@ class TestNameOverride:
         chain = load_chain(f)
         overridden = apply_name_override(chain, "myrun")
         assert overridden.name == "myrun"
-        assert chain_branch(overridden) == "chain_myrun"
+        assert chain_branch(overridden) == "chain.myrun"
 
-    def test_apply_name_override_empty_is_noop(self, tmp_path):
+    def test_apply_name_override_empty_is_refused(self, tmp_path):
         f = _write_chain(
             tmp_path / "c.yaml", "demo",
             "  - name: build\n    prompts: ['@personas/implementer']\n",
         )
         chain = load_chain(f)
-        assert apply_name_override(chain, "").name == "demo"
+        with pytest.raises(ValueError, match="chain name is required"):
+            apply_name_override(chain, "")
+
+    def test_step_session_has_no_group_index(self, tmp_path):
+        f = _write_chain(
+            tmp_path / "c.yaml", "demo",
+            "  - parallel:\n"
+            "    - name: a\n      prompts: ['@personas/implementer']\n"
+            "    - name: b\n      prompts: ['@personas/reviewer']\n",
+        )
+        chain = apply_name_override(load_chain(f), "mine")
+        assert [step_session(chain, s) for s in chain.steps[0].siblings] == ["chain.mine.a", "chain.mine.b"]
 
     def test_apply_name_override_rejects_bad_chars(self, tmp_path):
         f = _write_chain(
@@ -129,9 +140,9 @@ class TestNameOverride:
         la_mock.side_effect = fake
         result = run_chain(Config(), f, initial_task="x", name_suffix="myrun")
         assert result.chain_name == "myrun"
-        assert result.chain_branch == "chain_myrun"
+        assert result.chain_branch == "chain.myrun"
         session_used = la_mock.call_args.kwargs["session_name"]
-        assert session_used == "chain_myrun_build"
+        assert session_used == "chain.myrun.build"
 
 
 # --- run_chain core -----------------------------------------------------------
@@ -158,7 +169,7 @@ class TestRunChain:
 
         la_mock.side_effect = fake
 
-        result = run_chain(Config(), f, initial_task="do it")
+        result = run_chain(Config(), f, initial_task="do it", name_suffix="t")
 
         assert result.success
         assert la_mock.call_count == 1
@@ -189,9 +200,9 @@ class TestRunChain:
 
         def fake(cfg, brief="", *, revision="", session_name=None, **kw):
             files = {}
-            if session_name.endswith("_first"):
+            if session_name.endswith(".first"):
                 files = {"chain-outputs/t/first.md": "FIRST_OUTPUT\n"}
-            elif session_name.endswith("_second"):
+            elif session_name.endswith(".second"):
                 captured["task"] = brief
                 files = {"chain-outputs/t/second.md": "SECOND_OUTPUT\n"}
             _make_fake_agent_commit(vcs, revision, session_name, files)
@@ -199,7 +210,7 @@ class TestRunChain:
 
         la_mock.side_effect = fake
 
-        result = run_chain(Config(), f, initial_task="do it")
+        result = run_chain(Config(), f, initial_task="do it", name_suffix="t")
 
         assert result.success
         assert la_mock.call_count == 2
@@ -223,7 +234,7 @@ class TestRunChain:
 
         la_mock.side_effect = fake
 
-        result = run_chain(Config(), f, initial_task="do it")
+        result = run_chain(Config(), f, initial_task="do it", name_suffix="demo")
 
         assert not result.success
         assert la_mock.call_count == 1
@@ -239,6 +250,66 @@ class TestChainRunDetached:
         """The store preflight needs host jj 0.38+ and is covered in test_docker.py."""
         monkeypatch.setattr("cld.cli.prepare_store_mounts", lambda repo: None)
 
+    @pytest.fixture(autouse=True)
+    def running_containers(self, monkeypatch):
+        """No chain container is running unless a test says so."""
+        mock = MagicMock(return_value=[])
+        monkeypatch.setattr("cld.cli._running_chain_containers", mock)
+        return mock
+
+    def _chain_file(self, vcs):
+        return _write_chain(
+            vcs.repo_root / "c.yaml", "demo",
+            "  - name: build\n    prompts: ['@personas/implementer']\n",
+        )
+
+    @pytest.mark.parametrize("flags", [[], ["--no-detach"]], ids=["detached", "foreground"])
+    def test_name_is_required(self, vcs_repo, monkeypatch, flags):
+        monkeypatch.chdir(vcs_repo.repo_root)
+        spawn = MagicMock()
+        monkeypatch.setattr("cld.cli._spawn_chain_runner", spawn)
+        result = runner.invoke(app, ["chain", "run", str(self._chain_file(vcs_repo)), "-p", "x", *flags])
+        assert result.exit_code == 1
+        assert "chain name is required" in result.output
+        spawn.assert_not_called()
+
+    @pytest.mark.parametrize("flags", [[], ["--no-detach"]], ids=["detached", "foreground"])
+    def test_refuses_a_running_chain_container(self, vcs_repo, running_containers, monkeypatch, flags):
+        monkeypatch.chdir(vcs_repo.repo_root)
+        running_containers.return_value = ["chain.demo.build"]
+        spawn = MagicMock()
+        monkeypatch.setattr("cld.cli._spawn_chain_runner", spawn)
+        result = runner.invoke(
+            app, ["chain", "run", str(self._chain_file(vcs_repo)), "-n", "demo", "-p", "x", *flags],
+        )
+        assert result.exit_code == 1
+        assert "is in use" in result.output
+        assert "chain.demo.build is running" in result.output
+        running_containers.assert_called_once_with("chain.demo")
+        spawn.assert_not_called()
+
+    @pytest.mark.parametrize("flags", [[], ["--no-detach"]], ids=["detached", "foreground"])
+    def test_refuses_an_existing_result_bookmark(self, vcs_repo, monkeypatch, flags):
+        monkeypatch.chdir(vcs_repo.repo_root)
+        vcs_repo.create_branch("chain.demo")
+        spawn = MagicMock()
+        monkeypatch.setattr("cld.cli._spawn_chain_runner", spawn)
+        result = runner.invoke(
+            app, ["chain", "run", str(self._chain_file(vcs_repo)), "-n", "demo", "-p", "x", *flags],
+        )
+        assert result.exit_code == 1
+        assert "the bookmark 'chain.demo' already exists" in result.output
+        spawn.assert_not_called()
+
+    def test_a_bookmark_of_another_chain_does_not_block(self, vcs_repo, monkeypatch):
+        monkeypatch.chdir(vcs_repo.repo_root)
+        vcs_repo.create_branch("chain.demo2")
+        monkeypatch.setattr("cld.cli._spawn_chain_runner", MagicMock(return_value=1))
+        result = runner.invoke(
+            app, ["chain", "run", str(self._chain_file(vcs_repo)), "-n", "demo", "-p", "x"],
+        )
+        assert result.exit_code == 0, result.output
+
     def test_pins_anchor_and_records_running_state(self, vcs_repo, monkeypatch):
         vcs = vcs_repo
         monkeypatch.chdir(vcs.repo_root)
@@ -251,12 +322,12 @@ class TestChainRunDetached:
         spawn = MagicMock(return_value=44321)
         monkeypatch.setattr("cld.cli._spawn_chain_runner", spawn)
 
-        result = runner.invoke(app, ["chain", "run", str(f), "-p", "do stuff"])
+        result = runner.invoke(app, ["chain", "run", str(f), "-n", "demo", "-p", "do stuff"])
         assert result.exit_code == 0, result.output
 
         # No real child ran; the parent must have pinned everything in foreground.
         spawn.assert_called_once()
-        state_file = vcs.repo_root / ".cld" / "chains" / "chain_demo" / "state.json"
+        state_file = vcs.repo_root / ".cld" / "chains" / "chain.demo" / "state.json"
         state = ChainState.load(state_file)
         assert state.status == "running"
         assert state.anchor_hash  # resolved in the foreground, before child boot
@@ -276,12 +347,12 @@ class TestChainRunDetached:
             vcs.repo_root / "c.yaml", "demo",
             "  - name: build\n    prompts: ['@personas/implementer']\n",
         )
-        state_dir = vcs.repo_root / ".cld" / "chains" / "chain_demo"
+        state_dir = vcs.repo_root / ".cld" / "chains" / "chain.demo"
         state_dir.mkdir(parents=True)
         _seed_state(
             state_dir, "demo", status="running", pid=0,
             anchor_hash=anchor, chain_file=str(f),
-            inputs={"inline_prompt": "go"},
+            inputs={"inline_prompt": "go", "name": "demo"},
         )
 
         la_mock = _install_chain_mocks(monkeypatch, vcs, [{"status": "success"}])
@@ -316,14 +387,14 @@ class TestChainRunDetached:
             vcs.repo_root / "c.yaml", "demo",
             "  - name: build\n    prompts: ['@personas/implementer']\n",
         )
-        state_dir = vcs.repo_root / ".cld" / "chains" / "chain_demo"
+        state_dir = vcs.repo_root / ".cld" / "chains" / "chain.demo"
         state_dir.mkdir(parents=True)
         _seed_state(state_dir, "demo", status="running", pid=os.getpid())
 
         spawn = MagicMock()
         monkeypatch.setattr("cld.cli._spawn_chain_runner", spawn)
 
-        result = runner.invoke(app, ["chain", "run", str(f), "-p", "do stuff"])
+        result = runner.invoke(app, ["chain", "run", str(f), "-n", "demo", "-p", "do stuff"])
         assert result.exit_code == 1
         assert "already running" in result.output
         spawn.assert_not_called()
@@ -339,7 +410,7 @@ def _seed_state(
 ) -> None:
     st = ChainState(
         schema_version=1, kind="chain", chain_name=name,
-        chain_session=f"chain_{name}", chain_branch=f"chain_{name}",
+        chain_session=f"chain.{name}", chain_branch=f"chain.{name}",
         chain_file=chain_file, anchor_hash=anchor_hash, pid=pid,
         started_at=_utcnow_iso(), finished_at=None,
         log_file=str(state_dir / "chain.log"), status=status,
@@ -355,7 +426,7 @@ class TestChainStatus:
     def _chains_dir(self, root, specs):
         cdir = root / ".cld" / "chains"
         for name, status, pid in specs:
-            d = cdir / f"chain_{name}"
+            d = cdir / f"chain.{name}"
             d.mkdir(parents=True)
             _seed_state(d, name, status=status, pid=pid)
         return cdir
@@ -379,10 +450,10 @@ class TestChainStatus:
 
     def test_archived_prev_dir_ignored(self, tmp_path):
         cdir = tmp_path / ".cld" / "chains"
-        live = cdir / "chain_demo"
+        live = cdir / "chain.demo"
         live.mkdir(parents=True)
         _seed_state(live, "demo", status="running", pid=os.getpid())
-        prev = cdir / "chain_demo.prev"
+        prev = cdir / "chain.demo.prev"
         prev.mkdir(parents=True)
         _seed_state(prev, "demo", status="running", pid=999999)
         rows = _collect_chain_rows(cdir, include_terminal=True)

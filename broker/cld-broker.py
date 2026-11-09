@@ -20,10 +20,9 @@
 # route, and CliCaller (command-line flags, via `cld-brokerctl run`) for
 # running an action from the host without any container.
 #
-# v1 sessions are all named `cld_agent_*` (task-agents -- the prefix is a
-# leftover of the removed standing repo agent; kind is a label, not a name, see
-# cld/docker.py:task_agent_container_name), plus the v2 ticket containers. Any
-# of these may call `run-tests` / `list-containers` / `list-repos`. The
+# Sessions are the dotted identifiers of cld/names.py (task-agents `a.<ticket>.<agent>`,
+# tickets `t.<ticket>`; kind is a label, not a name). Any of these may call
+# `run-tests` / `list-containers` / `list-repos`. The
 # `task-agent` launcher action's `start` resolves its `--repo` against the
 # caller's mounted repos first, then the host registry (`cld repos add`, the
 # operator's own allowlist) -- see resolve_task_agent_repo; its other ops need
@@ -1052,6 +1051,8 @@ _JOB_CAP = 2
 _JOB_LAUNCH_GRACE = 120
 _JOB_KEEP_SECONDS = 7 * 24 * 3600
 _JOB_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+# What `status`/`cancel` take: a record's name, which is `run.<name>` for a run.
+_JOB_LOOKUP_RE = re.compile(r"[A-Za-z0-9_.-]+")
 _JOB_OPS = ("start", "status", "cancel")
 # The only options of `cld run` / `cld chain run` that take a *separate* value and that the
 # broker passes on; any other `-*` token is refused, so the arity is never guessed.
@@ -1063,7 +1064,7 @@ _JOB_TEXT_WIDTH = 200
 
 
 class Job(NamedTuple):
-    """One launch record. *name* is the run's session (``run_<suffix>``) or the chain name,
+    """One launch record. *name* is the run's session (``run.<suffix>``) or the chain name,
     *base* the change id the job was anchored on."""
 
     kind: str
@@ -1118,6 +1119,8 @@ def parse_job_start(kind: str, args: list[str]) -> JobArgs:
         _die(f"denied: -n '{name}' must match {_JOB_NAME_RE.pattern}", 2)
     if not values.get("revision"):
         _die("denied: -r <revision> is required", 2)
+    if kind == "chain" and not values.get("name"):
+        _die("denied: chain start needs -n <chain>: the name of this chain, unused", 2)
     return JobArgs(refs, name, values.get("model", ""), values.get("prompt", ""), values["revision"])
 
 
@@ -1238,7 +1241,8 @@ def _job_records(caller: Caller) -> list[Job]:
 
 def _chain_state(job: Job) -> dict | None:
     try:
-        data = read_repo_file(job.repo, f".cld/chains/chain_{job.name}/state.json")
+        # chain.<name>: the identifier of cld/names.py:chain_id (the broker cannot import it).
+        data = read_repo_file(job.repo, f".cld/chains/chain.{job.name}/state.json")
         state = json.loads(data) if data else None
     except (SecretsRefused, ValueError):
         return None
@@ -1341,7 +1345,7 @@ def _job_detail(job: Job) -> list[str]:
         chain = _chain_state(job) or {}
         started, finished = _iso_epoch(chain.get("started_at")), _iso_epoch(chain.get("finished_at"))
         steps = [step for step in chain.get("completed_steps") or [] if isinstance(step, dict)]
-        fields |= {"bookmark": f"chain_{job.name}", "base": job.base,
+        fields |= {"bookmark": f"chain.{job.name}", "base": job.base,
                    "cost": _number(chain.get("total_cost_usd"), "{:.4f}"),
                    "duration": None if started is None else f"{(finished or int(time.time())) - started}s",
                    "outputs": f"chain-outputs/{job.name}/" if steps else None,
@@ -1362,18 +1366,19 @@ def _job_name_free(kind: str, repo: str, name: str, jobs: list[Job]) -> bool:
 
 
 def _job_pick_name(kind: str, repo: str, requested: str, jobs: list[Job]) -> str:
+    # run.<name>: the identifier of cld/names.py:run_id (the broker cannot import it).
     if kind == "run" and not requested:
-        while not _job_name_free(kind, repo, name := f"run_{os.urandom(3).hex()}", jobs):
+        while not _job_name_free(kind, repo, name := f"run.{os.urandom(3).hex()}", jobs):
             pass
         return name
-    name = f"run_{requested}" if kind == "run" else requested
+    name = f"run.{requested}" if kind == "run" else requested
     if not _job_name_free(kind, repo, name, jobs):
         _die(f"denied: a {kind} named '{name}' already exists or is running", 3)
     return name
 
 
 def _job_command(kind: str, args: JobArgs, name: str, change: str) -> list[str]:
-    command = (["cld", "run", *args.refs, "-n", name.removeprefix("run_")] if kind == "run"
+    command = (["cld", "run", *args.refs, "-n", name.removeprefix("run.")] if kind == "run"
                else ["cld", "chain", "run", *args.refs, "-n", name])
     command += ["-r", change]
     if args.model:
@@ -1394,7 +1399,7 @@ def _job_start(caller: Caller, kind: str, selector: str, argv: list[str]) -> NoR
         if len(live := [job.name for job in jobs if _job_running(job)]) >= _JOB_CAP:
             _die(f"denied: {caller.name} already has {len(live)} live jobs ({', '.join(live)}) -- "
                  "wait for one to finish or cancel it", 3)
-        name = _job_pick_name(kind, repo, args.name or (args.refs[0][1:] if kind == "chain" else ""), jobs)
+        name = _job_pick_name(kind, repo, args.name, jobs)
         _job_write(caller, Job(kind, name, repo, change, int(time.time())))
     try:
         os.chdir(repo)
@@ -1405,7 +1410,7 @@ def _job_start(caller: Caller, kind: str, selector: str, argv: list[str]) -> NoR
 
 
 def _find_job(caller: Caller, kind: str, selector: str, name: str) -> Job:
-    if not _JOB_NAME_RE.fullmatch(name):
+    if not _JOB_LOOKUP_RE.fullmatch(name):
         _die(f"denied: '{name}' is not a {kind} name", 2)
     repo = caller.repo(selector) if selector else ""
     if job := next((job for job in _job_records(caller)
@@ -1979,7 +1984,13 @@ def decode_argv(payload: str) -> list[str]:
     return [os.fsdecode(arg) for arg in args]
 
 
-_SESSION_RE = re.compile(r"cld_[A-Za-z0-9_-]+")
+_SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _session_ok(session: str) -> bool:
+    """The identifiers of cld/names.py are dotted (`t.x`, `a.x.y`); `..` stays out of the paths
+    built from the caller id."""
+    return bool(_SESSION_RE.fullmatch(session)) and ".." not in session
 
 
 # Resolve the action to an action_* function. The charset check keeps the
@@ -1996,7 +2007,7 @@ def main_ssh() -> None:
     command = _first_line(os.environ.get("SSH_ORIGINAL_COMMAND", "")).strip(" \t")
     action, session, payload = (re.split(r"[ \t]+", command, maxsplit=2) + ["", ""])[:3]
     fn = resolve_action(action)
-    if not _SESSION_RE.fullmatch(session):
+    if not _session_ok(session):
         _die("denied: bad session id", 2)
 
     # The sshd route's caller source: the calling container's host-set labels.
@@ -2035,7 +2046,7 @@ def main_cli(argv: list[str]) -> None:
     fn = resolve_action(args.action)
     repo = _repo_root(args.repo)
     session = args.session or "cld_host_" + re.sub(r"[^A-Za-z0-9_-]", "-", Path(repo).name)
-    if not _SESSION_RE.fullmatch(session):
+    if not _session_ok(session):
         _die(f"denied: bad session id '{session}'", 2)
     fn(CliCaller(session, repo, args.revset), args.argv)
 

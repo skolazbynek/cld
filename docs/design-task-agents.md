@@ -31,7 +31,7 @@ We are inverting three of those properties. A **task-agent** is a **task**:
 | Lifespan | immortal | bounded — lives until its task is done |
 | Persona / task | fixed at build | chosen by the master at spawn |
 | Lifecycle owner | the human | the **master** (with a manual host fallback) |
-| Identity | `cld_agent_<repo>` | `cld_agent_<repo>_<task-slug>` |
+| Identity | `cld_agent_<repo>` (removed) | `a.<ticket>.<task-slug>` |
 
 It is deliberately a **fusion of `cld run` and `cld agent`**: `cld run`'s
 task+persona launch and branch deliverable, plus `cld agent`'s persistent,
@@ -142,18 +142,17 @@ cld task-agent shutdown <name> --force  # host-only: override a reap-readiness r
 ```
 
 Naming decisions:
-- **Name:** `cld_agent_<repo>_<task-slug>`. The prefix `cld_agent_` is shared
-  with today's repo-agent on purpose — enumeration keys on the **label**, not
-  the name.
+- **Name:** `a.<ticket>.<task-slug>` (`a._host.<task-slug>` with no ticket), see
+  `docs/design-bookmark-naming.md`. Enumeration keys on the **label**, not the name.
 - **Slug:** the **master generates it** from the task (short, kebab-cased). It
   is a human-readable handle, not a UUID.
 - **`<name>` accepts a bare slug at the CLI.** Every command taking `<name>`
-  resolves a bare slug against the cwd's repo (`cld task-agent status
-  add-oauth-login`), and accepts the full container name too. Ambiguity (same
-  slug live in two repos, resolved from outside either) is an error naming the
+  resolves a bare slug against the last dot part of every known identifier (`cld
+  task-agent status add-oauth-login`), and accepts the full identifier too.
+  Ambiguity (same slug live under two tickets) is an error naming the
   candidates. **Mailbox addressing is unaffected — that is always by full
   container name** (§7); the shortcut is a CLI affordance only, so a human never
-  types `cld_agent_myrepo_add-oauth-login`.
+  types `a.lide-1.add-oauth-login`.
 - **Collisions:** before spawning, the master checks the registry (§6); on a
   live-name collision the launcher appends a short suffix (`-2`, `-3`, …). The
   master should prefer picking a fresh slug so names stay meaningful.
@@ -941,7 +940,7 @@ launch, and cleanup deltas so `cld agent` can later be deleted cleanly.
 | D2b | Work-captured is **not** a teardown check; it is §9's verification, already performed at §5 step 4 | One mechanism per question: local `jj` for the master's own repo, pushed branch/MR or self-report for a different repo. A premature reap falls back to §8's recovery path, which the design already accepts (§7, §9) |
 | D2a | **Rejected:** a per-reap human authorization token | Gates the only fleet op that frees resources (blocked masters leave agents idling against the cap) while leaving spawning — the op that actually spends — open; would be pre-authorized away after the first stall. The interrupt patterns it borrowed from gate *external* effects, not internal cleanup (§7) |
 | D3 | Interleaved control tower, manually cranked (no auto-notice) | POC simplicity; notice is future work (§7) |
-| D4 | Name `cld_agent_<repo>_<task-slug>`, master-generated slug, suffix on collision | Human-readable, task-scoped, unique |
+| D4 | Name `a.<ticket>.<task-slug>` (was `cld_agent_<repo>_<task-slug>`), master-generated slug, suffix on collision | Human-readable, task-scoped, unique |
 | D5 | `org.cld.kind=task-agent` label is the discriminator, not the name prefix | Prefix is shared with repo-agent; label is unambiguous |
 | D6 | Mailbox tree = master roster; docker labels = host truth | Master needs a socket-free roster; host needs liveness |
 | D7 | Archive mailbox on shutdown (not delete) | Preserve the conversation transcript; keep registry honest |

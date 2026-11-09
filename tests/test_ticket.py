@@ -193,9 +193,9 @@ class TestStartTicket:
              patch("cld.ticket._launch") as launch:
             start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
         launch.assert_not_called()
-        assert run.call_args.args[0] == ["docker", "start", "cld_ticket_lide-2600"]
+        assert run.call_args.args[0] == ["docker", "start", "t.lide-2600"]
         # Warm-start wait is scaled by the labeled repo count, not a flat 60 s.
-        assert wait.call_args.args == ("cld_ticket_lide-2600", 2)
+        assert wait.call_args.args == ("t.lide-2600", 2)
         assert "warm" in capsys.readouterr().out
 
 
@@ -238,7 +238,7 @@ class TestWarmStartRefusesOldMounts:
              patch("cld.ticket.subprocess.run", return_value=_res()) as run, \
              patch("cld.ticket.wait_ticket_ready", return_value=True):
             start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
-        assert run.call_args.args[0] == ["docker", "start", "cld_ticket_lide-2600"]
+        assert run.call_args.args[0] == ["docker", "start", "t.lide-2600"]
 
     def test_label_is_read_off_the_container(self, tmp_path):
         with patch("cld.ticket._docker_status", return_value="stopped"), \
@@ -247,7 +247,7 @@ class TestWarmStartRefusesOldMounts:
              patch("cld.ticket.subprocess.run"), \
              pytest.raises(RuntimeError):
             start_ticket(self._cfg(tmp_path), "lide-2600", [], [])
-        has.assert_called_once_with("cld_ticket_lide-2600")
+        has.assert_called_once_with("t.lide-2600")
 
     def test_running_container_without_label_warns_and_stays_running(self, tmp_path, caplog):
         with patch("cld.ticket._docker_status", return_value="running"), \
@@ -297,9 +297,9 @@ class TestStartRepoSetChange:
 
     def test_confirmed_change_tears_down_leaving_repos_and_relaunches(self, tmp_path, capsys):
         mocks = self._start(tmp_path, confirm=True)
-        mocks["stop"].assert_called_once_with("cld_ticket_lide-2600")
+        mocks["stop"].assert_called_once_with("t.lide-2600")
         # Only the repo leaving the set is torn down; the kept one reattaches.
-        mocks["forget"].assert_called_once_with("/home/u/leaving", "cld_ticket_lide-2600")
+        mocks["forget"].assert_called_once_with("/home/u/leaving", "t.lide-2600")
         new = mocks["launch"].call_args.args[1]
         assert [r.name for r in new.repos] == ["lide-api"]
         out = capsys.readouterr().out
@@ -395,7 +395,7 @@ class TestRestartTicket:
         """The manifest survives the recreate byte-for-byte: read from the real
         label encoding, and read BEFORE stop/rm (labels die with `docker rm`)."""
         manifest = _manifest()
-        labels = manifest_labels(manifest, "cld_ticket_lide-2600")
+        labels = manifest_labels(manifest, "t.lide-2600")
         order: list[str] = []
         cfg = Config()
 
@@ -488,7 +488,7 @@ class TestReanchorRestart:
              patch("cld.ticket.subprocess.run", side_effect=lambda *a, **k: (calls.append(a[0]), _res())[1]), \
              patches["launch"] as launch, patches["warm_start"] as warm:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
-        assert calls == [["docker", "stop", "cld_ticket_lide-2600"], ["docker", "rm", "cld_ticket_lide-2600"]]
+        assert calls == [["docker", "stop", "t.lide-2600"], ["docker", "rm", "t.lide-2600"]]
         warm.assert_not_called()
         new_manifest = launch.call_args.args[1]
         by_name = {r.name: r for r in new_manifest.repos}
@@ -496,7 +496,7 @@ class TestReanchorRestart:
         assert by_name["lide-api"].rev_source == "arg"
         # Untouched repo keeps its old anchor.
         assert by_name["diskuze-api"].anchor_base == "c" * 40
-        assert rc == [("/home/u/lide-api", "feature-x", "isolated", "cld_ticket_lide-2600")]
+        assert rc == [("/home/u/lide-api", "feature-x", "isolated", "t.lide-2600")]
 
     def test_stopped_ticket_moves_without_docker_stop_or_start(self):
         manifest = self._manifest()
@@ -508,8 +508,8 @@ class TestReanchorRestart:
              patch("cld.ticket.subprocess.run", side_effect=lambda *a, **k: (calls.append(a[0]), _res())[1]), \
              patches["launch"], patches["warm_start"] as warm:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
-        assert ["docker", "stop", "cld_ticket_lide-2600"] not in calls
-        assert calls == [["docker", "rm", "cld_ticket_lide-2600"]]
+        assert ["docker", "stop", "t.lide-2600"] not in calls
+        assert calls == [["docker", "rm", "t.lide-2600"]]
         warm.assert_not_called()
 
     def test_live_session_is_refused(self):
@@ -579,7 +579,7 @@ class TestReanchorRestart:
              patches["move"], patches["revert"], patches["subprocess_run"], \
              patches["launch"], patches["warm_start"]:
             restart_ticket(Config(), "lide-2600", ["feature-x"])
-        assert rc == [("/home/u/lide-api", "feature-x", "isolated", "cld_ticket_lide-2600")]
+        assert rc == [("/home/u/lide-api", "feature-x", "isolated", "t.lide-2600")]
 
     def test_second_repo_failing_reverts_the_first_and_warm_starts(self):
         manifest = self._manifest()
@@ -611,7 +611,7 @@ class TestReanchorRestart:
         revert.assert_called_once_with(revert.call_args.args[0], ["op2", "op1"])
         warm.assert_called_once()
         launch.assert_not_called()
-        assert ["docker", "rm", "cld_ticket_lide-2600"] not in [c.args[0] for c in run.call_args_list]
+        assert ["docker", "rm", "t.lide-2600"] not in [c.args[0] for c in run.call_args_list]
 
     def test_second_repo_failing_on_a_stopped_ticket_does_not_warm_start(self):
         manifest = self._manifest()
@@ -641,7 +641,7 @@ class TestReanchorRestart:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x", "diskuze-api@feature-y"])
         warm.assert_not_called()
         launch.assert_not_called()
-        assert ["docker", "stop", "cld_ticket_lide-2600"] not in [c.args[0] for c in run.call_args_list]
+        assert ["docker", "stop", "t.lide-2600"] not in [c.args[0] for c in run.call_args_list]
 
     def test_exclude_session_reaches_the_resolver(self):
         manifest = self._manifest()
@@ -651,7 +651,7 @@ class TestReanchorRestart:
              patches["move"], patches["revert"], patches["subprocess_run"], \
              patches["launch"], patches["warm_start"]:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
-        assert rc[0][3] == "cld_ticket_lide-2600"
+        assert rc[0][3] == "t.lide-2600"
 
 
 class TestStopTicket:
@@ -659,7 +659,7 @@ class TestStopTicket:
         with patch("cld.ticket._docker_status", return_value="running"), \
              patch("cld.ticket.subprocess.run", return_value=_res()) as run:
             stop_ticket("lide-2600")
-        assert run.call_args.args[0] == ["docker", "stop", "cld_ticket_lide-2600"]
+        assert run.call_args.args[0] == ["docker", "stop", "t.lide-2600"]
         assert "paused" in capsys.readouterr().out
 
     def test_stopped_is_a_noop(self, capsys):
@@ -683,10 +683,10 @@ class TestShutdownTicket:
              patch("cld.ticket._stop_and_remove") as stop, \
              patch("cld.ticket.forget_session_state") as forget:
             shutdown_ticket("lide-2600")
-        stop.assert_called_once_with("cld_ticket_lide-2600")
+        stop.assert_called_once_with("t.lide-2600")
         assert forget.call_args_list == [
-            (("/home/u/lide-api", "cld_ticket_lide-2600"),),
-            (("/home/u/diskuze-api", "cld_ticket_lide-2600"),),
+            (("/home/u/lide-api", "t.lide-2600"),),
+            (("/home/u/diskuze-api", "t.lide-2600"),),
         ]
 
     def test_unreadable_manifest_still_removes_the_container(self, caplog):
@@ -709,10 +709,10 @@ class TestShutdownTicket:
 
     def test_shutdown_all_walks_every_ticket(self):
         with patch("cld.ticket.list_tickets",
-                   return_value=[("cld_ticket_b", "exited"), ("cld_ticket_a", "running")]), \
+                   return_value=[("t.b", "exited"), ("t.a", "running")]), \
              patch("cld.ticket._teardown") as teardown:
             shutdown_all_tickets()
-        assert [c.args[0] for c in teardown.call_args_list] == ["cld_ticket_a", "cld_ticket_b"]
+        assert [c.args[0] for c in teardown.call_args_list] == ["t.a", "t.b"]
 
 
 class TestForgetSessionState:
@@ -728,18 +728,18 @@ class TestForgetSessionState:
         backend.name = "jj"
         backend.run.return_value = MagicMock(returncode=0, stderr="")
         with patch("cld.ticket.get_backend", return_value=backend):
-            forget_session_state(str(tmp_path), "cld_ticket_x")
+            forget_session_state(str(tmp_path), "t.x")
         calls = [c.args[0] for c in backend.run.call_args_list]
         assert calls == [
-            ["bookmark", "forget", "cld_ticket_x"],
-            ["workspace", "forget", "cld_ticket_x"],
+            ["bookmark", "forget", "t.x"],
+            ["workspace", "forget", "t.x"],
         ]
 
     def test_git_backend_skips_forget(self, tmp_path):
         backend = MagicMock()
         backend.name = "git"
         with patch("cld.ticket.get_backend", return_value=backend):
-            forget_session_state(str(tmp_path), "cld_agent_r_x")
+            forget_session_state(str(tmp_path), "a.r.x")
         backend.run.assert_not_called()
 
     def test_forget_failure_is_non_fatal(self, tmp_path):
@@ -747,17 +747,17 @@ class TestForgetSessionState:
         backend.name = "jj"
         backend.run.return_value = MagicMock(returncode=1, stderr="conflict")
         with patch("cld.ticket.get_backend", return_value=backend):
-            forget_session_state(str(tmp_path), "cld_agent_r_x")
+            forget_session_state(str(tmp_path), "a.r.x")
         assert backend.run.call_count == 2
 
     def test_missing_repo_root_never_touches_the_backend(self, tmp_path):
         with patch("cld.ticket.get_backend") as get_backend_mock:
-            forget_session_state(str(tmp_path / "gone"), "cld_agent_r_x")
+            forget_session_state(str(tmp_path / "gone"), "a.r.x")
         get_backend_mock.assert_not_called()
 
     def test_get_backend_failure_is_non_fatal(self, tmp_path):
         with patch("cld.ticket.get_backend", side_effect=RuntimeError("no vcs")):
-            forget_session_state(str(tmp_path), "cld_agent_r_x")
+            forget_session_state(str(tmp_path), "a.r.x")
 
 
 class TestExecVerbs:
@@ -769,7 +769,7 @@ class TestExecVerbs:
             exec_claude("LIDE-2600", ["--model", "opus"])
         execvp.assert_called_once_with("docker", [
             "docker", "exec", "-it", "-w", "/workspace/lide-2600",
-            "cld_ticket_lide-2600", "/tmp/bin/claude", "--model", "opus",
+            "t.lide-2600", "/tmp/bin/claude", "--model", "opus",
         ])
 
     def test_claude_on_a_stopped_ticket_names_the_fix(self):
@@ -811,7 +811,7 @@ class TestStatus:
         """End to end through the real manifest reader against fake `docker
         inspect` label output."""
         manifest = _manifest()
-        labels = manifest_labels(manifest, "cld_ticket_lide-2600")
+        labels = manifest_labels(manifest, "t.lide-2600")
 
         def fake_run(cmd, **kwargs):
             if cmd[:2] == ["docker", "inspect"]:
@@ -819,7 +819,7 @@ class TestStatus:
             raise AssertionError(f"unexpected {cmd}")
 
         with patch("cld.ticket.list_tickets",
-                   return_value=[("cld_ticket_lide-2600", "running")]), \
+                   return_value=[("t.lide-2600", "running")]), \
              patch("cld.ticket._session_state", return_value="live"), \
              patch("cld.manifest.subprocess.run", side_effect=fake_run):
             print_ticket_roster()
@@ -835,7 +835,7 @@ class TestStatus:
         assert "No ticket containers" in capsys.readouterr().out
 
     def test_roster_unreadable_manifest_row_survives(self, capsys):
-        with patch("cld.ticket.list_tickets", return_value=[("cld_ticket_x", "exited")]), \
+        with patch("cld.ticket.list_tickets", return_value=[("t.x", "exited")]), \
              patch("cld.ticket.read_manifest", side_effect=RuntimeError("gone")):
             print_ticket_roster()
         out = capsys.readouterr().out
@@ -850,7 +850,7 @@ class TestStatus:
              patch("cld.ticket._bookmark_tip", return_value="deadbeef1234"):
             print_ticket_detail("LIDE-2600")
         out = capsys.readouterr().out
-        assert "Ticket: lide-2600 (cld_ticket_lide-2600)" in out
+        assert "Ticket: lide-2600 (t.lide-2600)" in out
         assert "running (started 3h ago)" in out
         assert "aaaaaaaaaaaa" in out            # anchor short-hash
         assert "isolated" in out
@@ -864,8 +864,8 @@ class TestStatus:
 
     def test_list_tickets_parses_docker_ps(self):
         with patch("cld.ticket.subprocess.run",
-                   return_value=_res(0, out="cld_ticket_a\trunning\ncld_ticket_b\texited\n")):
-            assert list_tickets() == [("cld_ticket_a", "running"), ("cld_ticket_b", "exited")]
+                   return_value=_res(0, out="t.a\trunning\nt.b\texited\n")):
+            assert list_tickets() == [("t.a", "running"), ("t.b", "exited")]
 
     def test_list_tickets_docker_failure_reads_as_none(self):
         with patch("cld.ticket.subprocess.run", return_value=_res(1)):

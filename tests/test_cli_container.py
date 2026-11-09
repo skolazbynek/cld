@@ -88,14 +88,14 @@ class TestTaskAgentDispatch:
             result = runner.invoke(app, [
                 "task-agent", "start", "@personas/implementer", "@some-task",
                 "-n", "add-oauth", "-p", "do it",
-                "--branch", "oauth", "-m", "opus", "-r", "@-", "--peer", "cld_agent_x_y:3",
+                "--branch", "oauth", "-m", "opus", "-r", "@-", "--peer", "a.x.y:3",
             ])
         assert result.exit_code == 0, result.output
         verb, argv = op.call_args.args
         assert verb == "start"
         assert argv == [
             "@personas/implementer", "@some-task", "-n", "add-oauth", "-p", "do it",
-            "--branch", "oauth", "-m", "opus", "-r", "@-", "--peer", "cld_agent_x_y:3",
+            "--branch", "oauth", "-m", "opus", "-r", "@-", "--peer", "a.x.y:3",
         ]
         assert "--parent" not in argv          # the broker sets it, host-side
         assert "--repo" not in argv            # none given: the broker's single-repo default
@@ -177,7 +177,7 @@ class TestTaskAgentDispatch:
 
     def test_transcript_works_without_the_broker_or_docker(self, tmp_path, monkeypatch):
         root = tmp_path / "mailboxes"
-        name = "cld_agent_myrepo_add-oauth"
+        name = "a.t1.add-oauth"
         d = _write_mailbox(root, name, meta=_meta())
         (d / "archive" / "m1.json").write_text(json.dumps({
             "id": "m1", "from": "cld_master_myrepo_ab12", "to": name,
@@ -248,17 +248,17 @@ class TestRunAndChainDispatch:
         return stack.enter_context(patch("cld.cli_container.subprocess.run", side_effect=fake))
 
     def _first_ref(self, kind: str) -> list[str]:
-        return ["@personas/implementer"] if kind == "run" else ["@review-chain"]
+        return ["@personas/implementer"] if kind == "run" else ["@review-chain", "-n", "c1"]
 
     def test_start_sends_the_change_id_not_the_revset(self, stack, kind):
         ops = self._ops(stack)
         jj = self._jj(stack)
         result = runner.invoke(app, [
-            kind, "start", *self._first_ref(kind), "-r", "@-", "-n", "job", "-m", "opus", "-p", "do it",
+            kind, "start", *self._first_ref(kind)[:1], "-r", "@-", "-n", "job", "-m", "opus", "-p", "do it",
         ])
         assert result.exit_code == 0, result.output
         assert ops[kind].call_args.args == (
-            "start", *self._first_ref(kind), "-n", "job", "-p", "do it", "-m", "opus", "-r", _CHANGE_ID,
+            "start", *self._first_ref(kind)[:1], "-n", "job", "-p", "do it", "-m", "opus", "-r", _CHANGE_ID,
         )
         assert ops[kind].call_args.kwargs["repo"] == ""
         assert not ops["chain" if kind == "run" else "run"].called
@@ -333,9 +333,17 @@ class TestRunAndChainDispatch:
         local.write_text("x")
         ops = self._ops(stack)
         self._jj(stack)
-        result = runner.invoke(app, ["chain", "start", str(local), "-r", "@-"])
+        result = runner.invoke(app, ["chain", "start", str(local), "-n", "c1", "-r", "@-"])
         assert result.exit_code == 1
         assert "@<chain-name>" in result.output
+        assert not ops["chain"].called
+
+    def test_chain_needs_a_name(self, stack):
+        ops = self._ops(stack)
+        self._jj(stack)
+        result = runner.invoke(app, ["chain", "start", "@review-chain", "-r", "@-"])
+        assert result.exit_code == 2
+        assert "--name" in result.output
         assert not ops["chain"].called
 
     @pytest.mark.parametrize(("manifest", "argv", "message"), [
@@ -542,27 +550,27 @@ class TestMsg:
         body.write_text("the body\n")
         with patch("cld.cli_msg.send_cmd.deliver") as deliver:
             result = runner.invoke(app, [
-                "msg", "send", "--to", "cld_agent_x_y", "--subject", "hi",
+                "msg", "send", "--to", "a.x.y", "--subject", "hi",
                 "--body-file", str(body), "--expects-reply", "--answers", "m3",
             ])
         assert result.exit_code == 0, result.output
-        assert deliver.call_args.args == ("cld_agent_x_y", "hi", "the body\n")
+        assert deliver.call_args.args == ("a.x.y", "hi", "the body\n")
         assert deliver.call_args.kwargs == {"expects_reply": True, "answers": "m3"}
 
     def test_send_accepts_inline_body(self):
         with patch("cld.cli_msg.send_cmd.deliver") as deliver:
             result = runner.invoke(app, [
-                "msg", "send", "--to", "cld_agent_x_y", "--subject", "hi",
+                "msg", "send", "--to", "a.x.y", "--subject", "hi",
                 "--body", "quick note",
             ])
         assert result.exit_code == 0, result.output
-        assert deliver.call_args.args == ("cld_agent_x_y", "hi", "quick note")
+        assert deliver.call_args.args == ("a.x.y", "hi", "quick note")
 
     def test_send_rejects_body_and_body_file_together(self, tmp_path):
         body = tmp_path / "body.md"
         body.write_text("the body\n")
         result = runner.invoke(app, [
-            "msg", "send", "--to", "cld_agent_x_y", "--subject", "hi",
+            "msg", "send", "--to", "a.x.y", "--subject", "hi",
             "--body", "quick note", "--body-file", str(body),
         ])
         assert result.exit_code == 1
@@ -570,7 +578,7 @@ class TestMsg:
 
     def test_send_rejects_neither_body_nor_body_file(self):
         result = runner.invoke(app, [
-            "msg", "send", "--to", "cld_agent_x_y", "--subject", "hi",
+            "msg", "send", "--to", "a.x.y", "--subject", "hi",
         ])
         assert result.exit_code == 1
         assert "exactly one of --body or --body-file" in result.output
@@ -597,7 +605,7 @@ class TestMsg:
         monkeypatch.setenv("CLD_TICKET", "previous")  # also restores env after
         with patch("cld.cli_msg.send_cmd.deliver") as deliver:
             result = runner.invoke(app, [
-                "msg", "send", "--to", "cld_ticket_other", "--subject", "hi",
+                "msg", "send", "--to", "t.other", "--subject", "hi",
                 "--body", "b", "--ticket", "LIDE-2600",
             ])
         assert result.exit_code == 0, result.output

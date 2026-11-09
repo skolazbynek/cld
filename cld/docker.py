@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import shutil
 import stat
 import subprocess
@@ -14,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn
 
+from cld import names
 from cld.config import Config, _load_toml
 from cld.manifest import TicketManifest, manifest_labels, read_manifest
 from cld.log import get_logger, log_subprocess, mask_secrets
@@ -74,11 +74,6 @@ def find_repo_context(start: Path | None = None) -> tuple[Path, str]:
         sys.exit(1)
     log.info("Repository: %s (VCS: %s)", backend.repo_root, backend.name)
     return backend.repo_root, backend.workspace_revision
-
-
-def build_session_name(prefix: str, suffix: str = "") -> str:
-    """Generate a session name like ``prefix_suffix`` or ``prefix_<random>``."""
-    return f"{prefix}_{suffix or secrets.token_hex(3)}"
 
 
 def require_docker() -> None:
@@ -850,7 +845,7 @@ def build_ticket_container_args(manifest: TicketManifest, cfg: Config) -> list[s
     Anchors ride only in the manifest label: no ``org.cld.anchor`` labels here.
     The effective per-repo anchor is derived from the jj store at check time.
     """
-    session = ticket_container_name(manifest.ticket)
+    session = names.ticket_id(manifest.ticket)
     home = os.path.expanduser("~")
     host_home = to_host_path(home, cfg)
 
@@ -943,54 +938,17 @@ def host_identity_name(repo_root: Path) -> str:
     return f"cld_master_{repo_root.name}_{sha}"
 
 
-def ticket_slug(ticket: str) -> str:
-    """Sanitize a free-form ticket name into the slug that names the container,
-    workspaces, bookmarks and mailbox (``LIDE-2600`` -> ``lide-2600``)."""
-    slug = re.sub(r"[^a-z0-9]+", "-", ticket.lower()).strip("-")
-    if not slug:
-        raise ValueError(f"ticket name {ticket!r} sanitizes to an empty slug")
-    return slug
+def allocate_task_agent_name(ticket: str | None, slug: str) -> str:
+    """Return the first task-agent identifier for *slug* that no container holds yet.
 
-
-def ticket_container_name(ticket: str) -> str:
-    """Deterministic container name for a ticket: ``cld_ticket_<slug>``.
-
-    One container per ticket, enforced by the name (PRODUCT_DESIGN.md
-    section 3). Idempotent on an already-sanitized slug.
-    """
-    return f"cld_ticket_{ticket_slug(ticket)}"
-
-
-_TASK_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-
-
-def task_agent_container_name(repo_root: Path, slug: str, suffix: int = 0) -> str:
-    """Container name for a task-scoped agent: ``cld_agent_<repo>_<slug>[-<suffix>]``.
-
-    The ``cld_agent_`` prefix was deliberately shared with the (now removed)
-    standing repo agent -- the ``org.cld.kind`` label is the discriminator, not
-    the name (see docs/design-task-agents.md D5). *suffix* > 1 is the collision
-    disambiguator.
-    """
-    if not _TASK_SLUG_RE.match(slug):
-        raise ValueError(
-            f"invalid task slug {slug!r}: expected kebab-case (lowercase letters, "
-            "digits and dashes, starting with a letter or digit)"
-        )
-    base = f"cld_agent_{repo_root.name}_{slug}"
-    return f"{base}-{suffix}" if suffix > 1 else base
-
-
-def allocate_task_agent_name(repo_root: Path, slug: str) -> str:
-    """Return the first task-agent name for *slug* that no container holds yet.
-
+    *ticket* is the ticket slug the agent belongs to, None for none (``_host``).
     Docker is the liveness ground truth here: an archived mailbox from a reaped
     agent must not block its slug from being reused (§4). The master should still
     prefer a fresh slug so names stay meaningful.
     """
     suffix = 0
     while True:
-        name = task_agent_container_name(repo_root, slug, suffix)
+        name = names.agent_id(ticket, slug, suffix)
         if _docker_status(name) == "absent":
             return name
         log.info("task-agent name %s is taken; trying the next suffix", name)
@@ -1210,7 +1168,7 @@ def _effective_anchor(vcs, occupant: dict) -> str:
         f"heads(descendants(bookmarks(exact:\"{occupant['session']}\")) & "
         # The trailing space before the wildcard is load-bearing: every staged
         # description is 'cld anchor: <session> mode=<mode>' (stage_in_workspace),
-        # and without it session cld_ticket_x-1 would also match cld_ticket_x-12.
+        # and without it session t.x-1 would also match t.x-12.
         f"description(glob:'cld anchor: {occupant['session']} *'))"
     )
     result = vcs.run(["log", "-r", revset, "--no-graph", "-T", "change_id", "-n", "1"])
@@ -1474,7 +1432,7 @@ def stage_broker(cfg: Config) -> list[str]:
     (``cld broker <action>``) can reach it. No-op unless ``cfg.broker_key`` is set.
     Called for task-agent and ticket containers
     (see the call site in ``build_container_args``); the broker's sshd accepts
-    any ``cld_*`` session and resolves its role from the ``org.cld.kind`` label
+    any well-formed session name and resolves its role from the ``org.cld.kind`` label
     set at launch, not from the name -- see ``broker/cld-broker.py``. See
     docs/design-cld-broker.md.
     """

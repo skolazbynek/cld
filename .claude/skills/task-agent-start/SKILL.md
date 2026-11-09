@@ -48,15 +48,19 @@ it on the host with `cld repos add <name> <path>`.
 ## Step 2: Choose the slug, the prompt refs and the branch
 
 - **Slug** (`-n`): short, kebab-case, describes the task — `add-oauth`, not `task-1`.
-  It becomes the container name (`cld_agent_<repo>_<slug>`), the handle for every other
-  command, and the default deliverable branch. Prefer a fresh slug over re-using one; a
+  It becomes the agent's identifier `a.<ticket>.<slug>` (`<ticket>` is yours, `_host`
+  when started from the host): container name, mailbox and session bookmark. Any
+  command takes the bare slug as its handle. Prefer a fresh slug over re-using one; a
   live collision gets a `-2` suffix and stops being self-explanatory.
 - **Prompt refs**: an ordered list of `@refs` — the role persona first
   (`@personas/implementer`), then any prepared task prompt (`@some-task`). Personas and
   task files are interchangeable blocks; they are appended in the order you pass them.
   From inside the container only `@refs` cross to the host; a path in *your* filesystem is
   read here and folded into `-p` for you.
-- **`--branch`**: only when the deliverable branch should differ from the slug.
+- **`--branch`**: only when the deliverable bookmark should differ from the default
+  `<agent id>.mr`. A value without a dot is appended to the agent id
+  (`--branch mr-fix` gives `<agent id>.mr-fix`); a value with a dot is used as is. The
+  start is refused when that bookmark already exists outside the new agent's tree.
 
 ## Step 3: Write the task
 

@@ -20,7 +20,8 @@ If the user did not name a recipient, list available targets:
 cld msg agents
 ```
 
-The recipient is the container `name` (or its repo basename as a shortname).
+The recipient is the container `name` -- `t.<ticket>` for a ticket, `a.<ticket>.<agent>`
+for a task-agent -- or a shortname: a bare `<ticket>` for `t.<ticket>`, or a repo basename.
 An agent is preferred over a master when both exist for the same shortname.
 
 **Task-agents and peers must be addressed by full container name** -- several

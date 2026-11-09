@@ -86,6 +86,53 @@ class TestWorkspace:
         vcs_repo.forget_workspace("ws-rev", ws_path)
 
 
+class TestDottedNames:
+    """The naming convention puts dots into workspace and bookmark names."""
+
+    def test_jj_dotted_workspace_and_bookmarks(self, jj_repo):
+        ws = jj_repo.repo_root / "ws-dotted"
+        jj_repo.create_workspace("t.x-y", str(ws))
+        assert ws.is_dir()
+        assert jj_repo.run(["log", "-r", "t.x-y@", "--no-graph", "-T", "change_id"]).stdout
+
+        jj_repo.create_branch("t.x-y")
+        jj_repo.create_branch("t.x-y.mr")
+        listing = _list_branches(jj_repo)
+        assert "t.x-y:" in listing
+        assert "t.x-y.mr:" in listing
+
+        exported = jj_repo.run(["git", "export"])
+        assert "Failed" not in exported.stdout + exported.stderr
+        jj_repo.forget_workspace("t.x-y", str(ws))
+
+
+class TestAssertDeliverableFree:
+    def test_missing_bookmark_passes(self, jj_repo):
+        from cld.vcs.anchor import assert_deliverable_free, resolve_anchor
+        assert_deliverable_free(jj_repo, "a.t.x.mr", resolve_anchor(jj_repo, "@"))
+
+    def test_bookmark_inside_the_tree_passes(self, jj_repo):
+        from cld.vcs.anchor import assert_deliverable_free, resolve_anchor
+        jj_repo.create_branch("a.t.x.mr", "@")
+        assert_deliverable_free(jj_repo, "a.t.x.mr", resolve_anchor(jj_repo, "@"))
+
+    def test_bookmark_outside_the_tree_refuses(self, jj_repo):
+        from cld.vcs.anchor import assert_deliverable_free, resolve_anchor
+        jj_repo.create_branch("a.t.x.mr", "@-")
+        with pytest.raises(RuntimeError, match="already exists outside"):
+            assert_deliverable_free(jj_repo, "a.t.x.mr", resolve_anchor(jj_repo, "@"))
+
+    def test_a_longer_bookmark_with_the_same_prefix_is_ignored(self, jj_repo):
+        from cld.vcs.anchor import assert_deliverable_free, resolve_anchor
+        jj_repo.create_branch("a.t.x.mr-fix", "@-")
+        assert_deliverable_free(jj_repo, "a.t.x.mr", resolve_anchor(jj_repo, "@"))
+
+    def test_git_backend_is_skipped(self, git_repo):
+        from cld.vcs.anchor import assert_deliverable_free
+        git_repo.create_branch("a.t.x.mr")
+        assert_deliverable_free(git_repo, "a.t.x.mr", "HEAD")
+
+
 class TestBranch:
     def test_create_and_list(self, vcs_repo):
         vcs_repo.create_branch("test-branch")

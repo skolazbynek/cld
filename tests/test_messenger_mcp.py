@@ -27,17 +27,17 @@ def _mailbox_env(tmp_path, monkeypatch):
 
 class TestSend:
     def test_requires_session_name(self):
-        result = send(to="cld_agent_repoB", subject="hi", body="b")
+        result = send(to="a.t1.repoB", subject="hi", body="b")
         assert "error" in result
 
     def test_sends_to_full_container_name(self, monkeypatch, tmp_path):
         monkeypatch.setenv("SESSION_NAME", "cld_master_repoA_abcd1234")
         with patch("cld.messenger.mailbox.list_containers", return_value=[
-            {"name": "cld_agent_repoB", "kind": "agent", "repo": "/x/repoB", "status": "running"},
+            {"name": "a.t1.repoB", "kind": "agent", "repo": "/x/repoB", "status": "running"},
         ]):
-            result = send(to="cld_agent_repoB", subject="hi", body="review this")
+            result = send(to="a.t1.repoB", subject="hi", body="review this")
         assert "id" in result
-        inbox_files = list((tmp_path / "cld_agent_repoB" / "inbox").glob("*.json"))
+        inbox_files = list((tmp_path / "a.t1.repoB" / "inbox").glob("*.json"))
         assert len(inbox_files) == 1
 
     def test_unresolvable_recipient_returns_error(self, monkeypatch):
@@ -49,11 +49,11 @@ class TestSend:
 
 class TestListInboxAndRead:
     def test_round_trip(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("SESSION_NAME", "cld_agent_repoB")
+        monkeypatch.setenv("SESSION_NAME", "a.t1.repoB")
         with patch("cld.messenger.mailbox.list_containers", return_value=[
-            {"name": "cld_agent_repoB", "kind": "agent", "repo": "/x/repoB", "status": "running"},
+            {"name": "a.t1.repoB", "kind": "agent", "repo": "/x/repoB", "status": "running"},
         ]):
-            sent = send(to="cld_agent_repoB", subject="hi", body="body text")
+            sent = send(to="a.t1.repoB", subject="hi", body="body text")
 
         entries = list_inbox()
         assert len(entries) == 1
@@ -68,24 +68,24 @@ class TestListInboxAndRead:
         assert result[0]["error"]
 
     def test_read_missing_message_returns_error(self, monkeypatch):
-        monkeypatch.setenv("SESSION_NAME", "cld_agent_repoB")
+        monkeypatch.setenv("SESSION_NAME", "a.t1.repoB")
         result = read_message(id="nonexistent")
         assert "error" in result
 
 
 class TestArchive:
     def test_archives_own_message(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("SESSION_NAME", "cld_agent_repoB")
+        monkeypatch.setenv("SESSION_NAME", "a.t1.repoB")
         with patch("cld.messenger.mailbox.list_containers", return_value=[
-            {"name": "cld_agent_repoB", "kind": "agent", "repo": "/x/repoB", "status": "running"},
+            {"name": "a.t1.repoB", "kind": "agent", "repo": "/x/repoB", "status": "running"},
         ]):
-            sent = send(to="cld_agent_repoB", subject="hi", body="b")
+            sent = send(to="a.t1.repoB", subject="hi", body="b")
         result = archive(id=sent["id"])
         assert result == {"ok": True}
         assert list_inbox() == []
 
     def test_missing_message_returns_error(self, monkeypatch):
-        monkeypatch.setenv("SESSION_NAME", "cld_agent_repoB")
+        monkeypatch.setenv("SESSION_NAME", "a.t1.repoB")
         result = archive(id="nonexistent")
         assert "error" in result
 
@@ -216,8 +216,8 @@ class TestReadMailbox:
 
     def test_non_task_agent_refused(self, monkeypatch, tmp_path):
         monkeypatch.setenv("SESSION_NAME", "cld_master_repoA_abcd1234")
-        ensure_mailbox(tmp_path, "cld_agent_repoA")
-        assert "not a task-agent" in read_mailbox(name="cld_agent_repoA")[0]["error"]
+        ensure_mailbox(tmp_path, "a.t1.repoA")
+        assert "not a task-agent" in read_mailbox(name="a.t1.repoA")[0]["error"]
 
     def test_reaped_member_still_readable(self, monkeypatch, tmp_path):
         monkeypatch.setenv("SESSION_NAME", "cld_master_repoA_abcd1234")

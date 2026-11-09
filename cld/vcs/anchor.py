@@ -57,6 +57,32 @@ def assert_descendant(vcs: VcsBackend, anchor_hash: str, candidate: str) -> None
             )
 
 
+def assert_deliverable_free(vcs: VcsBackend, bookmark: str, anchor_hash: str) -> None:
+    """Raise RuntimeError if the bookmark *bookmark* exists and points outside
+    ``descendants(anchor_hash)``: a new task-agent would be handed a deliverable
+    it can neither move nor own. A missing bookmark passes (the entrypoint
+    creates it). jj-only, like the live-anchor overlap check.
+    """
+    if vcs.name != "jj":
+        return
+    listed = vcs.run(["bookmark", "list", "-T", 'name ++ "\\n"', f"exact:{bookmark}"])
+    if listed.returncode != 0:
+        raise RuntimeError(f"could not look up bookmark '{bookmark}': {listed.stderr.strip()}")
+    if bookmark not in listed.stdout.splitlines():
+        return
+    outside = vcs.run([
+        "log", "-r", f'bookmarks(exact:"{bookmark}") ~ descendants({anchor_hash})',
+        "--no-graph", "-T", "commit_id", "-n", "1",
+    ])
+    if outside.returncode != 0:
+        raise RuntimeError(f"could not check bookmark '{bookmark}': {outside.stderr.strip()}")
+    if outside.stdout.strip():
+        raise RuntimeError(
+            f"the deliverable bookmark '{bookmark}' already exists outside the tree of "
+            f"anchor {anchor_hash[:12]}. Pick another -n or --branch, or delete the bookmark."
+        )
+
+
 def find_anchor_commit(vcs: VcsBackend, session: str) -> str:
     """Find the change id of a ticket's own scratch commit S: the commit at or below the
     *session* bookmark (which sits on the anchor) carrying its own ``cld anchor: <session> mode=<mode>`` staging

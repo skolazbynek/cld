@@ -5,6 +5,7 @@ import json
 import subprocess
 import time
 
+from cld import names
 from cld.config import Config
 from cld.log import get_logger
 from cld.vcs import VcsBackend
@@ -21,7 +22,7 @@ def wait_for_agent(session_name: str, vcs: VcsBackend, cfg: Config) -> dict:
     while time.monotonic() - start < cfg.agent_timeout:
         log.debug("polling %s (elapsed=%.0fs)", session_name, time.monotonic() - start)
         result = subprocess.run(
-            ["docker", "ps", "--filter", f"name=^{session_name}$", "--format", "{{.Status}}"],
+            ["docker", "ps", "--filter", names.docker_name_filter(session_name), "--format", "{{.Status}}"],
             capture_output=True, text=True,
         )
         if not result.stdout.strip():

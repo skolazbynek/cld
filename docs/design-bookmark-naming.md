@@ -1,6 +1,6 @@
 # Naming convention
 
-Status: design, not implemented. A first version, to be revisited after use.
+Status: implemented. A first version, to be revisited after use.
 
 ## Goal
 
@@ -58,7 +58,9 @@ Notes:
 - Claude inside a container never uses `internal.`; it uses its owner's
   identifier.
 - `jj git push --change` would create `push-<id>`. Ticket and task-agent
-  containers set `templates.git_push_bookmark` in their jj user config to
+  containers set `templates.git_push_bookmark` in their jj workspace config
+  (`cld_set_push_bookmark_template` in `vcs-lib.sh`; the value is a TOML
+  literal string, as jj does not parse a bare one that starts with a quote) to
   `"<id>.mr-" ++ change_id.short()`.
 
 ## Chain names
@@ -83,9 +85,9 @@ result bookmark. New rule:
   in the table was created and exported to git cleanly.
 - **jj revsets:** dotted names work as bare symbols, including inside
   functions (`descendants(t.us)`) and with `@<remote>`. Verified. Workspace
-  names with dots were not tested (the container guard blocks
-  `jj workspace add`); only the similar `<name>@<remote>` form was. The
-  implementation must confirm `<name>@` on the host first.
+  names with dots work too: `jj workspace add --name t.x-y` and
+  `jj log -r 't.x-y@'` are covered by `TestDottedNames` in
+  `tests/test_vcs_integration.py`.
 - **docker:** names allow `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so identifiers fit.
   `docker ps --filter name=^<id>$` treats the value as a regex: every call
   must escape the dots, or `t.us` also matches `tXus`.

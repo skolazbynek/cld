@@ -26,7 +26,6 @@ from cld.docker import (
     allocate_task_agent_name,
     assert_task_agent_capacity,
     build_container_args,
-    build_session_name,
     build_ticket_container_args,
     container_has_store_mounts,
     docker_occupant_list,
@@ -42,11 +41,8 @@ from cld.docker import (
     stage_broker,
     stage_ssh_agent,
     store_mount_args,
-    task_agent_container_name,
     ticket_anchor_resolver,
-    ticket_container_name,
     ticket_repo_bootstrap,
-    ticket_slug,
     to_host_path,
     warn_skipped_workspace_files,
     refuse_unprotected_containers,
@@ -62,20 +58,6 @@ from cld.vcs.jj import COMMONDIR_PLACEHOLDER, JJ_ID_FILES, check_git_dir, check_
 
 def _ps(names: str, rc: int = 0):
     return type("R", (), {"returncode": rc, "stdout": names, "stderr": ""})()
-
-
-class TestBuildSessionName:
-    def test_explicit_suffix(self):
-        assert build_session_name("agent", "feature") == "agent_feature"
-
-    def test_auto_suffix_is_hex(self):
-        prefix, _, suffix = build_session_name("cld").partition("_")
-        assert prefix == "cld"
-        assert len(suffix) == 6 and all(c in "0123456789abcdef" for c in suffix)
-
-    def test_auto_suffix_varies(self):
-        # secrets.token_hex(3) -> 6 hex chars; collisions in 20 picks are astronomical
-        assert len({build_session_name("x") for _ in range(20)}) > 1
 
 
 class TestFindJjRoot:
@@ -759,12 +741,12 @@ class TestDockerKindList:
         assert "index .Labels" not in _INSPECT_FORMAT
 
     def test_records_carry_kind_parent_task(self):
-        inspect = _ps("/home/u/repoA|cld_agent_repoA_add-oauth|task-agent|cld_master_repoA_ab12|add-oauth||\n")
-        with patch("cld.docker.subprocess.run", side_effect=[_ps("cld_agent_repoA_add-oauth\n"), inspect]):
+        inspect = _ps("/home/u/repoA|a.repoA.add-oauth|task-agent|cld_master_repoA_ab12|add-oauth||\n")
+        with patch("cld.docker.subprocess.run", side_effect=[_ps("a.repoA.add-oauth\n"), inspect]):
             assert docker_task_agent_list() == [{
-                "name": "cld_agent_repoA_add-oauth",
+                "name": "a.repoA.add-oauth",
                 "repo_root": "/home/u/repoA",
-                "session": "cld_agent_repoA_add-oauth",
+                "session": "a.repoA.add-oauth",
                 "kind": "task-agent",
                 "parent": "cld_master_repoA_ab12",
                 "task": "add-oauth",
@@ -809,35 +791,28 @@ class TestDockerKindList:
             assert [c["name"] for c in docker_task_agent_list()] == ["c2"]
 
 
-class TestTaskAgentContainerName:
-    def test_repo_and_slug(self, tmp_path):
-        assert task_agent_container_name(tmp_path / "myrepo", "add-oauth") == "cld_agent_myrepo_add-oauth"
-
-    def test_suffix_appended_from_two(self, tmp_path):
-        repo = tmp_path / "myrepo"
-        assert task_agent_container_name(repo, "x", 1) == "cld_agent_myrepo_x"
-        assert task_agent_container_name(repo, "x", 2) == "cld_agent_myrepo_x-2"
-
-    @pytest.mark.parametrize("slug", ["Add-OAuth", "add oauth", "-lead", "add_oauth", "", "add/oauth"])
-    def test_invalid_slug_rejected(self, tmp_path, slug):
-        with pytest.raises(ValueError, match="invalid task slug"):
-            task_agent_container_name(tmp_path / "r", slug)
-
-
 class TestAllocateTaskAgentName:
     def test_returns_base_when_free(self, tmp_path):
         with patch("cld.docker._docker_status", return_value="absent"):
-            assert allocate_task_agent_name(tmp_path / "r", "task") == "cld_agent_r_task"
+            assert allocate_task_agent_name("lide-1", "task") == "a.lide-1.task"
+
+    def test_no_ticket_is_host(self):
+        with patch("cld.docker._docker_status", return_value="absent"):
+            assert allocate_task_agent_name(None, "task") == "a._host.task"
+
+    def test_invalid_slug_rejected(self):
+        with pytest.raises(ValueError, match="invalid task slug"):
+            allocate_task_agent_name("lide-1", "Bad Slug")
 
     def test_skips_taken_names(self, tmp_path):
         with patch("cld.docker._docker_status", side_effect=["running", "stopped", "absent"]):
-            assert allocate_task_agent_name(tmp_path / "r", "task") == "cld_agent_r_task-3"
+            assert allocate_task_agent_name("lide-1", "task") == "a.lide-1.task-3"
 
 
 class TestTaskAgentSpec:
     def test_peers_env_encoding(self):
-        spec = TaskAgentSpec(slug="t", peers={"cld_agent_r_b": 5, "cld_agent_r_a": 15})
-        assert spec.peers_env() == "cld_agent_r_a:15,cld_agent_r_b:5"
+        spec = TaskAgentSpec(slug="t", peers={"a.r.b": 5, "a.r.a": 15})
+        assert spec.peers_env() == "a.r.a:15,a.r.b:5"
 
     def test_peers_env_empty(self):
         assert TaskAgentSpec(slug="t").peers_env() == ""
@@ -853,21 +828,21 @@ class TestBuildContainerArgsTaskAgent:
             slug="add-oauth",
             parent_master="cld_master_repoA_ab12",
             deliverable_branch="add-oauth-login",
-            peers={"cld_agent_repoA_contract": 15},
+            peers={"a.repoA.contract": 15},
             **kwargs,
         )
         return build_container_args(
-            tmp_path, "cld_agent_repoA_add-oauth", Config(mailbox_root=str(tmp_path / "mb")),
+            tmp_path, "a.repoA.add-oauth", Config(mailbox_root=str(tmp_path / "mb")),
             task_agent=spec,
         )
 
     def test_labels_and_name(self, tmp_path):
         args = self._args(tmp_path)
-        assert "--name" in args and "cld_agent_repoA_add-oauth" in args
+        assert "--name" in args and "a.repoA.add-oauth" in args
         assert "org.cld.kind=task-agent" in args
         assert "org.cld.task=add-oauth" in args
         assert "org.cld.parent-master=cld_master_repoA_ab12" in args
-        assert f"org.cld.session=cld_agent_repoA_add-oauth" in args
+        assert f"org.cld.session=a.repoA.add-oauth" in args
 
     def test_agent_mode_plus_task_modifier(self, tmp_path):
         args = self._args(tmp_path)
@@ -879,14 +854,14 @@ class TestBuildContainerArgsTaskAgent:
     def test_spawn_facts_in_env(self, tmp_path):
         args = self._args(tmp_path)
         assert "AGENT_DELIVERABLE_BRANCH=add-oauth-login" in args
-        assert "AGENT_PEERS=cld_agent_repoA_contract:15" in args
+        assert "AGENT_PEERS=a.repoA.contract:15" in args
         assert "AGENT_PARENT_MASTER=cld_master_repoA_ab12" in args
         assert "AGENT_TASK_SLUG=add-oauth" in args
 
     def test_turn_cap_propagated(self, tmp_path):
         """In-container Config.from_env() sees no host TOML, so the cap has to be passed."""
         args = build_container_args(
-            tmp_path, "cld_agent_r_t",
+            tmp_path, "a.r.t",
             Config(mailbox_root=str(tmp_path / "mb"), agent_max_turns=200),
             task_agent=TaskAgentSpec(slug="t"),
         )
@@ -895,7 +870,7 @@ class TestBuildContainerArgsTaskAgent:
     def test_budget_fallbacks_propagated(self, tmp_path):
         spec = TaskAgentSpec(slug="t")
         args = build_container_args(
-            tmp_path, "cld_agent_r_t",
+            tmp_path, "a.r.t",
             Config(mailbox_root=str(tmp_path / "mb"), peer_absolute_limit=3, root_ask_limit=5),
             task_agent=spec,
         )
@@ -915,7 +890,7 @@ class TestBuildContainerArgsTaskAgent:
         key = tmp_path / "broker_key"
         key.write_text("k")
         args = build_container_args(
-            tmp_path, "cld_agent_r_t",
+            tmp_path, "a.r.t",
             Config(mailbox_root=str(tmp_path / "mb"), broker_key=str(key)),
             task_agent=TaskAgentSpec(slug="t"),
         )
@@ -934,7 +909,7 @@ class TestBuildContainerArgsPluginMarketplaces:
         )
         repo = tmp_path / "repo"
         repo.mkdir()
-        args = build_container_args(repo, "cld_run_x", Config(mailbox_root=str(tmp_path / "mb")))
+        args = build_container_args(repo, "run.x", Config(mailbox_root=str(tmp_path / "mb")))
         assert _ro_mount(mp)[1] in _mount_values(args)
 
 
@@ -946,7 +921,7 @@ class TestBuildContainerArgsTicketNotes:
         monkeypatch.setenv("HOME", str(home))
         repo = tmp_path / "repo"
         repo.mkdir()
-        args = build_container_args(repo, "cld_run_x", Config(mailbox_root=str(tmp_path / "mb")))
+        args = build_container_args(repo, "run.x", Config(mailbox_root=str(tmp_path / "mb")))
         assert (home / ".ticket-notes").is_dir()
         assert f"{home}/.ticket-notes:/home/claude/.ticket-notes:rw" in args
 
@@ -964,19 +939,19 @@ class TestBuildContainerArgsBrokerWiring:
 
     def test_task_agent_role_gets_broker(self, tmp_path):
         args = build_container_args(
-            tmp_path, "cld_agent_r_t", self._cfg(tmp_path), task_agent=TaskAgentSpec(slug="t"),
+            tmp_path, "a.r.t", self._cfg(tmp_path), task_agent=TaskAgentSpec(slug="t"),
         )
         assert any("broker-key" in a for a in args)
 
     def test_run_role_gets_no_broker(self, tmp_path):
         """`cld run` (no persistent role) never gets the broker -- it's a
         one-shot, unattended container."""
-        args = build_container_args(tmp_path, "run_x", self._cfg(tmp_path))
+        args = build_container_args(tmp_path, "run.x", self._cfg(tmp_path))
         assert not any("broker-key" in a for a in args)
 
     def test_run_devcontainer_not_named(self, tmp_path):
         """Only the persistent roles get a name; `cld run` stays anonymous."""
-        args = build_container_args(tmp_path, "run_x", self._cfg(tmp_path))
+        args = build_container_args(tmp_path, "run.x", self._cfg(tmp_path))
         assert "--name" not in args
 
 
@@ -1039,7 +1014,7 @@ class TestResolveAnchorChecked:
         inside = resolve_anchor(jj_repo, "@-")
         return base, live_anchor, inside
 
-    def _fleet(self, tmp_path, jj_repo, anchor, name="cld_agent_r_live", anchor_mode="isolated", kind="task-agent"):
+    def _fleet(self, tmp_path, jj_repo, anchor, name="a.r.live", anchor_mode="isolated", kind="task-agent"):
         cfg = Config(mailbox_root=str(tmp_path / "mb"))
         records = _occupants((name, str(jj_repo.repo_root), anchor, anchor_mode), kind=kind)
         return cfg, records
@@ -1056,7 +1031,7 @@ class TestResolveAnchorChecked:
         with patch("cld.docker.docker_occupant_list", return_value=records):
             with pytest.raises(RuntimeError, match="inside the live reach") as e:
                 resolve_anchor_checked(cfg, jj_repo.repo_root, inside)
-        assert "cld_agent_r_live" in str(e.value)
+        assert "a.r.live" in str(e.value)
 
     def test_equal_to_live_anchor_refused(self, tmp_path, jj_repo):
         _, live_anchor, _ = self._commits(jj_repo)
@@ -1067,7 +1042,7 @@ class TestResolveAnchorChecked:
 
     def test_other_repo_agents_ignored(self, tmp_path, jj_repo):
         _, live_anchor, inside = self._commits(jj_repo)
-        elsewhere = _occupants(("cld_agent_r_live", "/some/other/repo", live_anchor, "isolated"))
+        elsewhere = _occupants(("a.r.live", "/some/other/repo", live_anchor, "isolated"))
         cfg = Config(mailbox_root=str(tmp_path / "mb"))
         with patch("cld.docker.docker_occupant_list", return_value=elsewhere):
             assert resolve_anchor_checked(cfg, jj_repo.repo_root, inside) == inside
@@ -1117,8 +1092,8 @@ class TestResolveAnchorChecked:
         with an unreadable manifest: no repo paths, so it must count against
         EVERY repo checked."""
         return {
-            "name": "cld_ticket_broken", "repo_root": "", "anchor_base": "",
-            "session": "cld_ticket_broken", "mode": "isolated", "kind": "ticket",
+            "name": "t.broken", "repo_root": "", "anchor_base": "",
+            "session": "t.broken", "mode": "isolated", "kind": "ticket",
             "manifest_error": "no label",
         }
 
@@ -1129,7 +1104,7 @@ class TestResolveAnchorChecked:
             with pytest.raises(RuntimeError, match="could not verify") as e:
                 resolve_anchor_checked(cfg, jj_repo.repo_root, inside, caller_kind="task-agent")
         assert "unreadable manifest" in str(e.value)
-        assert "cld_ticket_broken" in str(e.value)
+        assert "t.broken" in str(e.value)
 
     def test_unreadable_ticket_manifest_warns_ticket_caller(self, tmp_path, jj_repo, caplog):
         _, _, inside = self._commits(jj_repo)
@@ -1140,7 +1115,7 @@ class TestResolveAnchorChecked:
                 cfg, jj_repo.repo_root, inside, caller_kind="ticket",
             ) == inside
         assert "unreadable manifest" in caplog.text
-        assert "cld_ticket_broken" in caplog.text
+        assert "t.broken" in caplog.text
 
     def test_git_backend_skips_check(self, tmp_path, git_repo):
         head = git_repo.resolve_revision("HEAD")
@@ -1161,12 +1136,12 @@ class TestResolveAnchorChecked:
         own live reach -- exclude_session drops its own occupant record."""
         _, live_anchor, inside = self._commits(jj_repo)
         cfg, records = self._fleet(
-            tmp_path, jj_repo, live_anchor, name="cld_ticket_self", kind="ticket",
+            tmp_path, jj_repo, live_anchor, name="t.self", kind="ticket",
         )
         with patch("cld.docker.docker_occupant_list", return_value=records):
             assert resolve_anchor_checked(
                 cfg, jj_repo.repo_root, inside, caller_kind="ticket",
-                exclude_session="cld_ticket_self",
+                exclude_session="t.self",
             ) == inside
 
     def test_exclude_session_leaves_other_occupants_blocking(self, tmp_path, jj_repo):
@@ -1178,7 +1153,7 @@ class TestResolveAnchorChecked:
             with pytest.raises(RuntimeError, match="inside the live reach"):
                 resolve_anchor_checked(
                     cfg, jj_repo.repo_root, inside, caller_kind="ticket",
-                    exclude_session="cld_ticket_self",
+                    exclude_session="t.self",
                 )
 
     def test_exclude_session_leaves_run_container_blocking(self, tmp_path, jj_repo):
@@ -1188,7 +1163,7 @@ class TestResolveAnchorChecked:
             with pytest.raises(RuntimeError, match="inside the live reach"):
                 resolve_anchor_checked(
                     cfg, jj_repo.repo_root, inside, caller_kind="ticket",
-                    exclude_session="cld_ticket_self",
+                    exclude_session="t.self",
                 )
 
     def test_shared_refused_when_live_occupant_inside_tree(self, tmp_path, jj_repo):
@@ -1215,7 +1190,7 @@ class TestResolveAnchorChecked:
 
     def test_live_run_still_blocks(self, tmp_path, jj_repo):
         _, live_anchor, inside = self._commits(jj_repo)
-        cfg, records = self._fleet(tmp_path, jj_repo, live_anchor, name="cld_run_r", kind="run")
+        cfg, records = self._fleet(tmp_path, jj_repo, live_anchor, name="run.r", kind="run")
         with patch("cld.docker.docker_occupant_list", return_value=records):
             with pytest.raises(RuntimeError, match="inside the live reach"):
                 resolve_anchor_checked(cfg, jj_repo.repo_root, inside)
@@ -1225,7 +1200,7 @@ class TestEffectiveAnchorDerivation:
     """The occupant's editable boundary is scratch commit B, derived from the
     store at check time; the labeled base A is only the boot-window fallback."""
 
-    SESSION = "cld_agent_r_live"
+    SESSION = "a.r.live"
 
     def _staged(self, jj_repo):
         """base A, its staged scratch child B (session-marked), and B's child,
@@ -1285,7 +1260,7 @@ class TestEffectiveAnchorDerivation:
         """The derivation is session-scoped: a sibling's scratch child of the
         same base must not be mistaken for this occupant's boundary."""
         base, scratch, _ = self._staged(jj_repo)
-        records = _occupants((("cld_agent_r_other"), str(jj_repo.repo_root), base, "isolated"))
+        records = _occupants((("a.r.other"), str(jj_repo.repo_root), base, "isolated"))
         cfg = Config(mailbox_root=str(tmp_path / "mb"))
         # The other session has no scratch commit -> fallback to base A, whose
         # reach covers our session's scratch commit.
@@ -1343,12 +1318,12 @@ class TestOverlapKindMatrix:
 
     def test_ticket_vs_ticket_warns_and_proceeds(self, tmp_path, jj_repo, caplog):
         occupant_anchor, inside = self._commits(jj_repo)
-        cfg, records = self._fleet(tmp_path, jj_repo, occupant_anchor, "ticket", name="cld_ticket_other")
+        cfg, records = self._fleet(tmp_path, jj_repo, occupant_anchor, "ticket", name="t.other")
         with caplog.at_level("WARNING"), patch("cld.docker.docker_occupant_list", return_value=records):
             assert resolve_anchor_checked(
                 cfg, jj_repo.repo_root, inside, caller_kind="ticket",
             ) == inside
-        assert "cld_ticket_other" in caplog.text
+        assert "t.other" in caplog.text
         assert inside[:12] in caplog.text
 
     def test_ticket_vs_headless_blocks(self, tmp_path, jj_repo):
@@ -1395,7 +1370,7 @@ class TestOverlapKindMatrix:
     def test_shared_ticket_vs_ticket_still_warns(self, tmp_path, jj_repo, caplog):
         base = resolve_anchor(jj_repo, "@-")
         occupant_anchor, _ = self._commits(jj_repo)
-        cfg, records = self._fleet(tmp_path, jj_repo, occupant_anchor, "ticket", name="cld_ticket_other")
+        cfg, records = self._fleet(tmp_path, jj_repo, occupant_anchor, "ticket", name="t.other")
         with caplog.at_level("WARNING"), patch("cld.docker.docker_occupant_list", return_value=records):
             assert resolve_anchor_checked(
                 cfg, jj_repo.repo_root, base, "shared", caller_kind="ticket",
@@ -1412,21 +1387,21 @@ class TestDockerOccupantList:
             patch("cld.docker.subprocess.run", side_effect=inspects)
 
     def test_stopped_agent_included_stopped_run_excluded(self):
-        rows = [("cld_run_x", "exited"), ("cld_agent_y", "exited")]
+        rows = [("run.x", "exited"), ("a.t1.y", "exited")]
         inspects = [
-            _ps("/r|aaa|isolated|run|cld_run_x\n"),
-            _ps("/r|bbb|isolated|agent|cld_agent_y\n"),
+            _ps("/r|aaa|isolated|run|run.x\n"),
+            _ps("/r|bbb|isolated|agent|a.t1.y\n"),
         ]
         names_patch, run_patch = self._v1(rows, inspects)
         with names_patch, run_patch:
             records = docker_occupant_list()
-        assert [r["name"] for r in records] == ["cld_agent_y"]
+        assert [r["name"] for r in records] == ["a.t1.y"]
         assert records[0]["anchor_base"] == "bbb"
-        assert records[0]["session"] == "cld_agent_y"
+        assert records[0]["session"] == "a.t1.y"
 
     def test_running_run_included(self):
         names_patch, run_patch = self._v1(
-            [("cld_run_x", "running")], [_ps("/r|aaa|isolated|run|cld_run_x\n")],
+            [("run.x", "running")], [_ps("/r|aaa|isolated|run|run.x\n")],
         )
         with names_patch, run_patch:
             assert [r["kind"] for r in docker_occupant_list()] == ["run"]
@@ -1449,12 +1424,12 @@ class TestDockerOccupantList:
                               anchor_base="b" * 40, anchor_mode="shared"),
         ))
         with patch("cld.docker._docker_names_with_state",
-                   side_effect=[[], [("cld_ticket_lide-2600", "exited")]]), \
+                   side_effect=[[], [("t.lide-2600", "exited")]]), \
              patch("cld.docker.read_manifest", return_value=manifest):
             records = docker_occupant_list()
         assert len(records) == 2
         assert all(r["kind"] == "ticket" for r in records)
-        assert all(r["name"] == r["session"] == "cld_ticket_lide-2600" for r in records)
+        assert all(r["name"] == r["session"] == "t.lide-2600" for r in records)
         assert records[0]["repo_root"] == "/host/repos/lide-api"
         assert (records[1]["anchor_base"], records[1]["mode"]) == ("b" * 40, "shared")
 
@@ -1463,10 +1438,10 @@ class TestDockerOccupantList:
         unknown) trees: fail-closed means a record the check must trip over,
         not a warn-and-skip that hides the ticket entirely."""
         with patch("cld.docker._docker_names_with_state",
-                   side_effect=[[], [("cld_ticket_broken", "running")]]), \
+                   side_effect=[[], [("t.broken", "running")]]), \
              patch("cld.docker.read_manifest", side_effect=RuntimeError("no label")):
             [record] = docker_occupant_list()
-        assert record["name"] == record["session"] == "cld_ticket_broken"
+        assert record["name"] == record["session"] == "t.broken"
         assert record["kind"] == "ticket"
         assert record["repo_root"] == "" and record["anchor_base"] == ""
         assert "no label" in record["manifest_error"]
@@ -1539,7 +1514,7 @@ class TestTicketAnchorResolver:
 
 class TestParsePeersEnv:
     def test_round_trip(self):
-        peers = {"cld_agent_r_a": 15, "cld_agent_r_b": 5}
+        peers = {"a.r.a": 15, "a.r.b": 5}
         assert parse_peers_env(TaskAgentSpec(slug="t", peers=peers).peers_env()) == peers
 
     def test_empty_is_empty_dict(self):
@@ -1552,28 +1527,6 @@ class TestParsePeersEnv:
     def test_malformed_raises(self, value):
         with pytest.raises(ValueError, match="malformed peer spec"):
             parse_peers_env(value)
-
-
-class TestTicketSlug:
-    def test_lowercases_and_keeps_kebab(self):
-        assert ticket_slug("LIDE-2600") == "lide-2600"
-
-    def test_free_form_sanitized(self):
-        assert ticket_slug("My Ticket_v2!") == "my-ticket-v2"
-
-    def test_leading_trailing_junk_stripped(self):
-        assert ticket_slug("--x--") == "x"
-
-    def test_idempotent_on_a_slug(self):
-        assert ticket_slug("lide-2600") == "lide-2600"
-
-    @pytest.mark.parametrize("ticket", ["", "___", "!!"])
-    def test_empty_slug_rejected(self, ticket):
-        with pytest.raises(ValueError, match="empty slug"):
-            ticket_slug(ticket)
-
-    def test_container_name(self):
-        assert ticket_container_name("LIDE-2600") == "cld_ticket_lide-2600"
 
 
 def _env_value(args, key):
@@ -1625,7 +1578,7 @@ class TestBuildTicketContainerArgs:
     def test_name_and_no_workdir(self, tmp_path, monkeypatch):
         manifest, cfg = self._setup(tmp_path, monkeypatch)
         args = build_ticket_container_args(manifest, cfg)
-        assert args[:2] == ["--name", "cld_ticket_lide-2600"]
+        assert args[:2] == ["--name", "t.lide-2600"]
         # No -w: the daemon would pre-create the ticket root as root:root,
         # breaking the entrypoint's mkdir; `docker exec -w` sets it post-boot.
         assert "-w" not in args
@@ -1654,7 +1607,7 @@ class TestBuildTicketContainerArgs:
         args = build_ticket_container_args(manifest, cfg)
         assert "org.cld.kind=ticket" in args
         assert "org.cld.ticket=lide-2600" in args
-        assert "org.cld.session=cld_ticket_lide-2600" in args
+        assert "org.cld.session=t.lide-2600" in args
         assert f"org.cld.repo.lide-api={tmp_path}/lide-api" in args
         assert f"org.cld.repo.diskuze-api={tmp_path}/diskuze-api" in args
 
@@ -1668,7 +1621,7 @@ class TestBuildTicketContainerArgs:
         manifest, cfg = self._setup(tmp_path, monkeypatch)
         args = build_ticket_container_args(manifest, cfg)
         assert "TICKET_MODE=1" in args
-        assert _env_value(args, "SESSION_NAME") == "cld_ticket_lide-2600"
+        assert _env_value(args, "SESSION_NAME") == "t.lide-2600"
         assert _env_value(args, "CLD_TICKET_MANIFEST") == manifest.to_json()
 
     def test_path_map_covers_both_prefixes_and_home(self, tmp_path, monkeypatch):
@@ -2064,14 +2017,14 @@ class TestLaunchWiring:
                 build_container_args(tmp_path, "cld_x", cfg)
 
     def test_refusal_names_containers_without_the_label(self):
-        listing = f"cld_ticket_old\t\ncld_ticket_new\t{ORIGIN_MOUNT_VALUE}\nrunner\t\npins\tstore-pins-v1\n"
+        listing = f"t.old\t\nt.new\t{ORIGIN_MOUNT_VALUE}\nrunner\t\npins\tstore-pins-v1\n"
         with patch("cld.docker.subprocess.run", return_value=_ps(listing)) as run, \
              pytest.raises(SystemExit) as refused:
             refuse_unprotected_containers("api", "/home/u/api")
         assert "volume=/home/u/api" in run.call_args.args[0]
         message = str(refused.value)
-        assert message.startswith("cld: repo 'api': container(s) cld_ticket_old, runner, pins mount")
-        assert "cld_ticket_new" not in message
+        assert message.startswith("cld: repo 'api': container(s) t.old, runner, pins mount")
+        assert "t.new" not in message
         assert "cld restart <ticket>" in message
 
     @pytest.mark.parametrize(
@@ -2081,8 +2034,8 @@ class TestLaunchWiring:
     )
     def test_only_the_store_v1_label_counts(self, label, has_store_mounts):
         with patch("cld.docker._image_label", return_value=label) as read:
-            assert container_has_store_mounts("cld_ticket_t") is has_store_mounts
-        assert read.call_args.args == ("cld_ticket_t", "org.cld.origin-mount")
+            assert container_has_store_mounts("t.t") is has_store_mounts
+        assert read.call_args.args == ("t.t", "org.cld.origin-mount")
 
     def test_no_refusal_when_every_container_has_the_label(self):
         with patch("cld.docker.subprocess.run", return_value=_ps(f"a\t{ORIGIN_MOUNT_VALUE}\n")):
@@ -2640,7 +2593,7 @@ class TestCldHostJjNeedsIds:
     jj call would migrate a planted legacy config into the host jj config. The fake jj
     logs each call, so a refused repo leaves the log empty."""
 
-    SESSION = "cld_ticket_t"
+    SESSION = "t.t"
 
     @pytest.fixture
     def repo(self, tmp_path, jj_home, fake_jj):

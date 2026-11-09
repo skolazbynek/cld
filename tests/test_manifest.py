@@ -61,14 +61,14 @@ class TestJsonCodec:
 class TestManifestLabels:
     def test_json_label_round_trips(self):
         m = _manifest(_entry("lide-api"), _entry("diskuze-api", path="/host/d"))
-        labels = manifest_labels(m, "cld_ticket_lide-2600")
+        labels = manifest_labels(m, "t.lide-2600")
         assert TicketManifest.from_json(labels[MANIFEST_LABEL]) == m
 
     def test_kind_ticket_session_labels(self):
-        labels = manifest_labels(_manifest(_entry("r")), "cld_ticket_lide-2600")
+        labels = manifest_labels(_manifest(_entry("r")), "t.lide-2600")
         assert labels["org.cld.kind"] == "ticket"
         assert labels["org.cld.ticket"] == "lide-2600"
-        assert labels["org.cld.session"] == "cld_ticket_lide-2600"
+        assert labels["org.cld.session"] == "t.lide-2600"
 
     def test_flat_repo_labels_carry_host_paths(self):
         m = _manifest(_entry("lide-api", path="/host/lide"), _entry("db", path="/host/db"))
@@ -80,12 +80,12 @@ class TestManifestLabels:
         """The redundant flat labels must stay readable by cld.registry's
         ticket_repo_mounts, which the broker-facing helpers key on."""
         m = _manifest(_entry("lide-api", path="/host/lide"))
-        labels = manifest_labels(m, "cld_ticket_lide-2600")
-        ps = type("R", (), {"returncode": 0, "stdout": "cld_ticket_lide-2600\n", "stderr": ""})()
+        labels = manifest_labels(m, "t.lide-2600")
+        ps = type("R", (), {"returncode": 0, "stdout": "t.lide-2600\n", "stderr": ""})()
         inspect = type("R", (), {"returncode": 0, "stdout": json.dumps(labels), "stderr": ""})()
         with patch("cld.registry.subprocess.run", side_effect=[ps, inspect]):
             assert ticket_repo_mounts() == {
-                "cld_ticket_lide-2600": {"lide-api": "/host/lide"},
+                "t.lide-2600": {"lide-api": "/host/lide"},
             }
 
 
@@ -257,11 +257,11 @@ class TestReadManifest:
 
     def test_reads_manifest_back_from_labels(self):
         m = _manifest(_entry("lide-api"))
-        labels = manifest_labels(m, "cld_ticket_lide-2600")
+        labels = manifest_labels(m, "t.lide-2600")
         with patch(
             "cld.manifest.subprocess.run", return_value=self._inspect(json.dumps(labels)),
         ):
-            assert read_manifest("cld_ticket_lide-2600") == m
+            assert read_manifest("t.lide-2600") == m
 
     def test_missing_container_raises(self):
         with patch(
@@ -269,7 +269,7 @@ class TestReadManifest:
             return_value=self._inspect("", rc=1, stderr="No such object"),
         ):
             with pytest.raises(RuntimeError, match="cannot inspect container"):
-                read_manifest("cld_ticket_gone")
+                read_manifest("t.gone")
 
     def test_non_ticket_container_raises(self):
         with patch(
@@ -277,4 +277,4 @@ class TestReadManifest:
             return_value=self._inspect('{"org.cld.kind": "task-agent"}'),
         ):
             with pytest.raises(RuntimeError, match="no org.cld.manifest label"):
-                read_manifest("cld_agent_x_t")
+                read_manifest("a.x.t")

@@ -35,12 +35,13 @@ from cld.docker import (
     run_extra_paths,
     stage_home_ro,
     stage_ssh_agent,
-    ticket_container_name,
     to_host_path,
 )
 from cld.agent_runtime import format_age
 from cld.cli_msg import handle_errors as _handle_errors, msg_app
+from cld import names
 from cld.messenger import mailbox
+from cld.names import ticket_id
 from cld.registry import add_repo, remove_repo, ticket_repo_mounts, tickets_referencing
 from cld.run import launch_run
 from cld.log import get_logger, setup_logging
@@ -72,7 +73,7 @@ from cld.task_agent import (
     task_agent_rows,
 )
 from cld.vcs import get_backend
-from cld.vcs.anchor import resolve_anchor
+from cld.vcs.anchor import assert_deliverable_free, resolve_anchor
 
 log = get_logger(__name__)
 
@@ -241,9 +242,9 @@ _REAP_WAIT_SECONDS = 10
 @_handle_errors
 def task_agent_start(
     refs: Optional[list[str]] = typer.Argument(None, help="Prompt refs in order: @<ref> from prompts/ (e.g. @personas/implementer), or a file path"),
-    name: str = typer.Option("", "-n", "--name", help="Task slug, kebab-case (default: --branch)"),
+    name: str = typer.Option("", "-n", "--name", help="Task slug, kebab-case (default: --branch, when it has no dot)"),
     prompt: str = typer.Option("", "-p", "--prompt", help="Inline task description, appended after the refs"),
-    branch: str = typer.Option("", "--branch", help="Deliverable branch name (default: the task slug)"),
+    branch: str = typer.Option("", "--branch", help="Deliverable bookmark (default: <agent id>.mr). Without a dot it is appended to the agent id; with a dot it is used as is"),
     model: str = typer.Option("", "-m", "--model", help="Claude model (e.g. opus, sonnet)"),
     revision: str = typer.Option("", "-r", "--revision", help="Anchor revision (default: current change)"),
     peer: list[str] = typer.Option([], "--peer", help="A peer this agent may message: <container-name>[:<hops>]. Repeatable."),
@@ -263,21 +264,21 @@ def task_agent_start(
     # Display only: the roster's Persona column and the launch banner. A task-agent with
     # no persona ref is coherent -- the lifecycle preamble is always layered in.
     role = next((p.stem for p, kind in resolved if kind == "persona"), "")
-    slug = name or branch
+    slug = name or ("" if names.SEP in branch else branch)
     if not slug:
         typer.echo(
             "Error: a task slug is required -- pass -n/--name <slug> (short, kebab-case, "
-            "naming the task) or --branch, which it falls back to",
+            "naming the task) or --branch without a dot, which it falls back to",
             err=True,
         )
         raise typer.Exit(1)
-    branch = branch or slug
     peers = parse_peer_specs(peer, cfg.peer_absolute_limit)
 
     # Validates the slug shape, and settles the name before the refusals so every
     # input error surfaces ahead of them. Allocation reserves nothing -- it only
     # probes docker for a free name.
-    session = allocate_task_agent_name(repo_root, slug)
+    session = allocate_task_agent_name(names.ticket_of(parent), slug)
+    branch = names.deliverable(session, branch)
     if session in peers:
         raise ValueError(f"--peer {session} names this agent itself")
     unknown = sorted(set(peers) - known_task_agent_names(cfg))
@@ -295,6 +296,7 @@ def task_agent_start(
     assert_task_agent_capacity(cfg, parent)
     mode = _anchor_mode(shared_anchor)
     anchor = resolve_anchor_checked(cfg, repo_root, revision, mode, caller_kind="task-agent")
+    assert_deliverable_free(get_backend(repo_root), branch, anchor)
 
     ensure_image(
         cfg.devcontainer_image,
@@ -348,7 +350,7 @@ def task_agent_start(
 
     # The handle every read verb takes, which is not always the slug: a live-name
     # collision appends a suffix, and the hints have to point at *this* agent.
-    handle = session.rsplit("_", 1)[-1]
+    handle = session.rsplit(names.SEP, 1)[-1]
 
     if not _wait_for_container_ready(session, _READY_SENTINEL):
         typer.echo(
@@ -623,7 +625,7 @@ def start(
         ticket = repo_root.name
         # `@` moves with host work, so an existing ticket is not re-resolved
         # against it -- that would offer a recreate on every working-copy move.
-        if _docker_status(ticket_container_name(ticket)) == "absent":
+        if _docker_status(ticket_id(ticket)) == "absent":
             repos = [f"{repo_root}@@"]
     start_ticket(cfg, ticket, repos or [], shared_anchor)
 
@@ -873,7 +875,7 @@ def chain_run(
     chain_file: str = typer.Argument(..., help="Path to chain YAML file or @<name>"),
     refs: Optional[list[str]] = typer.Argument(None, help="Prompt refs for the initial task, in order: @<ref> or a file path"),
     prompt: str = typer.Option("", "-p", "--prompt", help="Inline initial task description, appended after the refs"),
-    name: str = typer.Option("", "-n", "--name", help="Chain session name suffix"),
+    name: str = typer.Option("", "-n", "--name", help="Chain name (required, must be unused)"),
     model: str = typer.Option("", "-m", "--model", help="Override default model"),
     revision: str = typer.Option("", "-r", "--revision", help="Starting revision"),
     no_detach: bool = typer.Option(
@@ -896,10 +898,15 @@ def chain_run(
 
     log.info(
         "chain run: file=%s, name=%s, model=%s, no_detach=%s",
-        chain_file, name or "<auto>", model or "<default>", no_detach,
+        chain_file, name or "<none>", model or "<default>", no_detach,
     )
 
+    if not name:
+        typer.echo("Error: a chain name is required -- pass -n/--name <chain>", err=True)
+        raise typer.Exit(1)
+
     if no_detach:
+        _refuse_chain_name_in_use(get_backend(), name)
         if model:
             os.environ["CLD_CHAIN_DEFAULT_MODEL"] = model
             cfg = Config.from_env()
@@ -923,14 +930,15 @@ def chain_run(
 
     state_dir = chain_state_dir(repo_root, chain.name)
     _gc_or_refuse(state_dir, chain.name)
+    _refuse_chain_name_in_use(get_backend(), chain.name)
     state_dir.mkdir(parents=True, exist_ok=True)
 
     initial_state = ChainState(
         schema_version=1,
         kind="chain",
         chain_name=chain.name,
-        chain_session=f"chain_{chain.name}",
-        chain_branch=f"chain_{chain.name}",
+        chain_session=names.chain_id(chain.name),
+        chain_branch=names.chain_id(chain.name),
         chain_file=str(chain_path.resolve()),
         anchor_hash=anchor_hash,
         pid=0,
@@ -1296,6 +1304,38 @@ def _gc_or_refuse(state_dir: Path, chain_name: str) -> None:
             f"Use 'cld chain status' to inspect or kill it first."
         )
     _rename_to_prev(state_dir)
+
+
+def _running_chain_containers(chain: str) -> list[str]:
+    """Names of the running step containers of the chain identifier *chain*."""
+    ps = subprocess.run(
+        ["docker", "ps", "--filter", names.docker_prefix_filter(chain + names.SEP), "--format", "{{.Names}}"],
+        capture_output=True, text=True,
+    )
+    if ps.returncode != 0:
+        raise RuntimeError(f"could not check for running chains: {ps.stderr.strip()}")
+    return ps.stdout.split()
+
+
+def _refuse_chain_name_in_use(vcs, chain_name: str) -> None:
+    """Refuse a chain name that is running on this host (container names are host-wide, so
+    any repo) or whose result bookmark exists in the target repo (it would be overwritten)."""
+    chain = names.chain_id(chain_name)
+    if running := _running_chain_containers(chain):
+        raise RuntimeError(
+            f"chain name '{chain_name}' is in use: {', '.join(running)} is running. Pick another -n."
+        )
+    if vcs.name == "jj":
+        listed = vcs.run(["bookmark", "list", "-T", 'name ++ "\\n"', f"exact:{chain}"])
+    else:
+        listed = vcs.run(["branch", "--list", chain, "--format=%(refname:short)"])
+    if listed.returncode != 0:
+        raise RuntimeError(f"could not look up bookmark '{chain}': {listed.stderr.strip()}")
+    if chain in listed.stdout.split():
+        raise RuntimeError(
+            f"chain name '{chain_name}' is in use: the bookmark '{chain}' already exists and "
+            f"would be overwritten. Pick another -n, or delete the bookmark."
+        )
 
 
 def _rename_to_prev(state_dir: Path) -> None:

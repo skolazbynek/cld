@@ -4,6 +4,7 @@ The brief is composed host-side (cld.prompts.compose_brief) and ships inside the
 anchor scratch envelope, so launch_run has no prompt mounts left to build.
 """
 
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -39,8 +40,6 @@ class TestLaunchAgentExtensions:
 
     def _capture_docker_cmd(self, brief="do the thing", **kwargs):
         """Patch all externals; return the full docker-run command list."""
-        session = "agent_testxx"
-
         docker_result = MagicMock()
         docker_result.returncode = 0
         docker_result.stdout = "abc123def\n"
@@ -51,7 +50,6 @@ class TestLaunchAgentExtensions:
             patch("cld.run.find_target_repo", return_value=Path("/fake/repo")),
             patch("cld.run.prepare_store_mounts") as preflight,
             patch("cld.run.ensure_image"),
-            patch("cld.run.build_session_name", return_value=session),
             patch("cld.run.build_container_args", return_value=[]),
             patch("cld.run.get_backend") as backend,
             patch("cld.run.resolve_anchor", return_value="cafef00d1234") as resolve,
@@ -95,3 +93,16 @@ class TestLaunchAgentExtensions:
         assert "/config/task.md" not in cmd_str
         assert "AGENT_INLINE_PROMPT" not in cmd_str
         assert "AGENT_SYSTEM_PROMPT_FILE" not in cmd_str
+
+    def _session(self, **kwargs):
+        cmd = self._capture_docker_cmd(**kwargs)
+        return cmd[cmd.index("--name") + 1]
+
+    def test_session_is_run_dot_name(self):
+        assert self._session(name="nightly") == "run.nightly"
+
+    def test_default_session_is_run_dot_random_hex(self):
+        assert re.fullmatch(r"run\.[0-9a-f]{6}", self._session())
+
+    def test_explicit_session_name_wins(self):
+        assert self._session(name="nightly", session_name="chain.c.s") == "chain.c.s"

@@ -16,8 +16,8 @@ processes like any other; there is no special phase.
 ## Step 1: Instruct wrap-up
 
 `send()` the agent an explicit instruction: squash or rebase its work into its
-deliverable branch (`cld task-agent status <slug>` shows the name), then report what
-landed.
+deliverable branch (`<agent id>.mr` unless `--branch` said otherwise;
+`cld task-agent status <slug>` shows the name), then report what landed.
 
 **If the agent worked in a repo not mounted in this ticket, ask it to push:**
 

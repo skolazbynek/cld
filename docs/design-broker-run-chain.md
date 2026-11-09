@@ -16,14 +16,14 @@ File references are paths in this repo.
 - The broker already relays one launcher: `action_task_agent` in `broker/cld-broker.py`
   re-runs `cld task-agent start` on the host with a checked argv (only `@refs` as
   positionals, `--force` and `--parent` denied, `--` denied).
-- The jj store is shared. A run's work lands as the bookmark `run_<name>`, a chain's as
-  `chain_<name>`. A ticket mounting the same repo sees both at once.
+- The jj store is shared. A run's work lands as the bookmark `run.<name>`, a chain's as
+  `chain.<name>` (see `docs/design-bookmark-naming.md`). A ticket mounting the same repo sees both at once.
 - `launch_run` calls `resolve_anchor_checked`. That check refuses a base inside any live
   container's editable tree, including a ticket's. Every chain step goes through
   `launch_run`, so every step runs the check again.
 - A run leaves its scratch commit (`.cld-run/brief.md`) and an `agent-output-<session>/`
   folder in history. A chain also commits `chain-outputs/<chain>/<step>.md`.
-- Chain state lives on the host in `<repo>/.cld/chains/chain_<name>/state.json`. A
+- Chain state lives on the host in `<repo>/.cld/chains/chain.<name>/state.json`. A
   detached runner process owns it. The host has `cld chain status`, but no way to cancel
   a chain.
 
@@ -66,7 +66,7 @@ cld run start @refs -r R -p ...  --> action_run start
 cld run status|wait|cancel ...   --> action_run status|cancel
                                        read the launch record (own jobs only)
                                        docker / jj / state.json probes
-jj log -r run_<name>             (local: the store is shared)
+jj log -r run.<name>             (local: the store is shared)
 jj rebase / squash / new ...     (local: the ticket integrates on its own)
 ```
 
@@ -94,7 +94,7 @@ Effects to keep in mind:
 
 A host user needs it too, so it goes in `cld/cli.py`, not in the broker.
 
-- Read `<repo>/.cld/chains/chain_<name>/state.json`. Refuse if the status is not
+- Read `<repo>/.cld/chains/chain.<name>/state.json`. Refuse if the status is not
   `running`.
 - Send SIGINT to the runner's process group (`start_new_session=True` makes the pid a
   group leader). `run_chain` already turns `KeyboardInterrupt` into
@@ -161,12 +161,14 @@ host workspace):
   parallel starts cannot both pass the cap.
 - Count the live jobs among this caller's records (§5.6). At 2 or more: deny, naming
   the live jobs.
-- Pick the name before launch: `run_<-n or random hex>`, or the chain's name after `-n`.
-  Deny if a record or a live container/chain already has that name.
+- Pick the name before launch: `run.<-n or random hex>`, or the chain's name after `-n`
+  (a chain start without `-n` is denied). Deny if a record or a live container/chain
+  already has that name. `cld chain run` itself also refuses a name whose bookmark
+  `chain.<name>` exists.
 - Write the record, release the lock, then `chdir <repo>` and exec the host command
   with the change id from §5.3:
   - run: `cld run <@refs> -n <suffix> -r <change id> [-m] [-p]`
-  - chain: `cld chain run @<name> <@refs> [-n] -r <change id> [-m] [-p]`
+  - chain: `cld chain run @<name> <@refs> -n <name> -r <change id> [-m] [-p]`
 - If the host command fails, the record stays, but it never counts as live (§5.6), so
   the failure costs no slot.
 
@@ -181,7 +183,7 @@ name (it must be one of the caller's records): a detail block.
 | Field | Run | Chain |
 |---|---|---|
 | state | `running` if the container `<session>` is running. Otherwise from `agent-output-<session>/summary.json` on the bookmark `<session>`: `success`, `failed`, `no_changes` and so on. No container and no summary: `gone`. | `status` from `state.json`. If `running` but the pid is dead: `stale`. |
-| bookmark | `<session>` | `chain_<name>` |
+| bookmark | `<session>` | `chain.<name>` |
 | cost, duration | From `result.json` / `summary.json`, when they exist. | `total_cost_usd`, plus started and finished times. |
 | where to look | `agent-output-<session>/` on the bookmark | `chain-outputs/<name>/` on the chain bookmark, and the step list from `completed_steps` |
 | failure | The first lines of `AGENT-FAILURE.md` | `failure_reason` |

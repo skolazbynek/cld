@@ -18,7 +18,8 @@ from pathlib import Path
 
 from cld.broker import list_cld_containers
 from cld.config import Config
-from cld.docker import MAILBOX_MOUNT, host_identity_name, ticket_container_name
+from cld.docker import MAILBOX_MOUNT, host_identity_name
+from cld.names import ticket_id
 from cld.vcs import get_backend
 
 
@@ -31,7 +32,7 @@ def resolve_self(ticket: str = "") -> tuple[str, Path]:
     ticket = ticket or os.environ.get("CLD_TICKET", "")
     tickets = list_cld_containers("ticket")
     if ticket:
-        container = ticket_container_name(ticket)
+        container = ticket_id(ticket)
         if container not in {c["name"] for c in tickets}:
             listing = ", ".join(sorted(c["name"] for c in tickets)) or "none"
             raise RuntimeError(

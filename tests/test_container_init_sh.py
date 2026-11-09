@@ -168,6 +168,21 @@ class TestTicketClaudeMdBrokerSection:
         assert "cld broker" not in self._claude_md(tmp_path, broker_wired=True, known_hosts=False)
 
 
+class TestTicketClaudeMdBookmarkNames:
+    def test_names_the_ticket_bookmarks(self, tmp_path):
+        root = tmp_path / "ticket"
+        root.mkdir()
+        _source_container_init(tmp_path, f"write_ticket_claude_md {root} lide-1 '| cld | abc | isolated | jj |\n'",
+                               broker_wired=False)
+        text = (root / "CLAUDE.md").read_text()
+        assert "## Bookmark names" in text
+        assert "`t.lide-1` is the session bookmark: never move or delete it." in text
+        assert "`t.lide-1.mr`" in text
+        assert "`t.lide-1.mr-<word>`" in text
+        assert "`t.lide-1.<word>`" in text
+        assert "Never use `internal.`" in text
+
+
 class TestTicketClaudeMdOriginLine:
     """Origin is only the store now, and the generated CLAUDE.md says so."""
 
@@ -211,7 +226,7 @@ class _RealJjOrigin:
     as the container mounts them. Read-only is simulated with chmod, which blocks new
     files in a directory but not an atomic replace of a file."""
 
-    BOOKMARK = "cld_ticket_ro"
+    BOOKMARK = "t.ro"
 
     @pytest.fixture
     def env(self, tmp_path, monkeypatch):
