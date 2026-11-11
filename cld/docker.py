@@ -961,7 +961,10 @@ def _docker_status(name: str) -> str:
         ["docker", "inspect", "--format", "{{.State.Status}}", name],
         capture_output=True, text=True,
     )
-    log_subprocess(log, ["docker", "inspect", name], result)
+    # A missing container is a valid state; only other failures (a down
+    # daemon, say) are worth an error log.
+    if "No such object" not in result.stderr:
+        log_subprocess(log, ["docker", "inspect", name], result)
     if result.returncode != 0:
         return "absent"
     return "running" if result.stdout.strip() == "running" else "stopped"

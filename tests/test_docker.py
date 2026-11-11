@@ -23,6 +23,7 @@ from cld.docker import (
     ORIGIN_MOUNT_VALUE,
     StoreLayout,
     TaskAgentSpec,
+    _docker_status,
     allocate_task_agent_name,
     assert_task_agent_capacity,
     build_container_args,
@@ -807,6 +808,27 @@ class TestAllocateTaskAgentName:
     def test_skips_taken_names(self, tmp_path):
         with patch("cld.docker._docker_status", side_effect=["running", "stopped", "absent"]):
             assert allocate_task_agent_name("lide-1", "task") == "a.lide-1.task-3"
+
+
+class TestDockerStatus:
+    @pytest.mark.parametrize(
+        ("returncode", "stdout", "stderr", "expected", "logs_error"),
+        [
+            (0, "running\n", "", "running", False),
+            (0, "exited\n", "", "stopped", False),
+            (1, "", "Error: No such object: a.x.y\n", "absent", False),
+            (1, "", "Cannot connect to the Docker daemon\n", "absent", True),
+        ],
+        ids=["running", "stopped", "missing-is-quiet", "other-failure-logged"],
+    )
+    def test_status_and_error_log(
+        self, returncode, stdout, stderr, expected, logs_error, caplog,
+    ):
+        result = subprocess.CompletedProcess([], returncode, stdout, stderr)
+        with patch("cld.docker.subprocess.run", return_value=result), \
+                caplog.at_level(logging.ERROR, logger="cld.docker"):
+            assert _docker_status("a.x.y") == expected
+        assert bool(caplog.records) is logs_error
 
 
 class TestTaskAgentSpec:
