@@ -22,6 +22,7 @@ import tomlkit
 import typer
 
 from cld.log import get_logger, log_subprocess
+from cld.vcs.anchor import default_anchor_revision
 
 log = get_logger(__name__)
 
@@ -255,6 +256,9 @@ def pick_repos(repos: dict[str, RepoEntry]) -> list[tuple[str, RepoEntry, str]]:
     for num in picked:
         name = names[num - 1]
         entry = repos[name]
-        revision = typer.prompt(f"{name} anchor", default=entry.default_rev or "trunk()")
+        revision = typer.prompt(
+            f"{name} anchor",
+            default=entry.default_rev or default_anchor_revision(Path(entry.path).expanduser()),
+        )
         selection.append((name, entry, revision))
     return selection

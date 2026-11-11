@@ -21,7 +21,7 @@ from pathlib import Path
 from cld.log import get_logger, log_subprocess
 from cld.registry import RepoEntry, resolve_repo_specs
 from cld.vcs import get_backend
-from cld.vcs.anchor import resolve_anchor
+from cld.vcs.anchor import default_anchor_revision, resolve_anchor
 
 log = get_logger(__name__)
 
@@ -160,7 +160,7 @@ def resolve_manifest(
 
     Each spec is a registry name or ad-hoc path with an optional ``@rev``
     anchor override; without one the registry ``default_rev`` applies, falling
-    back to ``trunk()``. *shared* names the repos launched with
+    back to ``trunk()`` (jj) or the remote HEAD branch / ``HEAD`` (git). *shared* names the repos launched with
     ``--shared-anchor``. *resolver* pins each ``(path, revision, mode)`` to a
     change id (jj) --- the launch path passes the overlap-checking resolver here.
     """
@@ -179,15 +179,15 @@ def resolve_manifest(
         )
     entries: list[RepoManifestEntry] = []
     for (name, entry), override in zip(resolved.items(), overrides, strict=True):
+        # Expanded exactly like registry.tickets_referencing expands for its
+        # comparison, so `repos rm` protection matches the labeled path.
+        path = str(Path(entry.path).expanduser())
         if override:
             revision, source = override, "arg"
         elif entry.default_rev:
             revision, source = entry.default_rev, "registry"
         else:
-            revision, source = "trunk()", "trunk"
-        # Expanded exactly like registry.tickets_referencing expands for its
-        # comparison, so `repos rm` protection matches the labeled path.
-        path = str(Path(entry.path).expanduser())
+            revision, source = default_anchor_revision(Path(path)), "trunk"
         mode = "shared" if name in shared_set else "isolated"
         entries.append(RepoManifestEntry(
             name=name,

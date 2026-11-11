@@ -14,10 +14,36 @@ bookmarks + watchman snapshots against the origin's `.jj/repo/store` provide
 persistence across `docker rm && docker run`.
 """
 
+from pathlib import Path
+
 from cld.log import get_logger
-from cld.vcs import VcsBackend
+from cld.vcs import VcsBackend, get_backend
 
 log = get_logger(__name__)
+
+JJ_DEFAULT_ANCHOR = "trunk()"
+
+
+def default_anchor_revision(path: Path) -> str:
+    """The anchor revision offered when a repo has no ``default_rev``.
+
+    jj keeps ``trunk()``. git has no such revset: it gets the remote HEAD
+    branch (``origin/<branch>``) when that resolves, else ``HEAD``. A path
+    with no repo keeps ``trunk()``; the resolver reports the real error.
+    """
+    try:
+        vcs = get_backend(path)
+    except RuntimeError:
+        return JJ_DEFAULT_ANCHOR
+    if vcs.name == "jj":
+        return JJ_DEFAULT_ANCHOR
+    remote_head = vcs.run(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    branch = remote_head.stdout.strip()
+    if remote_head.returncode == 0 and branch and vcs.run(
+        ["rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"],
+    ).returncode == 0:
+        return branch
+    return "HEAD"
 
 
 def resolve_anchor(vcs: VcsBackend, revision: str) -> str:

@@ -108,6 +108,38 @@ class TestResolveManifest:
         assert m.repos[0].anchor_base == "hash(trunk())"
         assert m.repos[0].rev_source == "trunk"
 
+    def test_git_repo_without_remote_falls_back_to_head(self, git_repo):
+        m = resolve_manifest(
+            "t", ["lide-api"], {"lide-api": RepoEntry(path=str(git_repo.repo_root))},
+            resolver=_fake_resolver,
+        )
+        assert m.repos[0].anchor_base == "hash(HEAD)"
+        assert m.repos[0].rev_source == "trunk"
+
+    def test_git_repo_with_remote_head_uses_that_branch(self, git_repo):
+        git_repo.run(["update-ref", "refs/remotes/origin/main", "HEAD"])
+        git_repo.run(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
+        m = resolve_manifest(
+            "t", ["lide-api"], {"lide-api": RepoEntry(path=str(git_repo.repo_root))},
+            resolver=_fake_resolver,
+        )
+        assert m.repos[0].anchor_base == "hash(origin/main)"
+
+    def test_git_repo_with_dangling_remote_head_falls_back_to_head(self, git_repo):
+        git_repo.run(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"])
+        m = resolve_manifest(
+            "t", ["lide-api"], {"lide-api": RepoEntry(path=str(git_repo.repo_root))},
+            resolver=_fake_resolver,
+        )
+        assert m.repos[0].anchor_base == "hash(HEAD)"
+
+    def test_jj_repo_keeps_trunk(self, jj_repo):
+        m = resolve_manifest(
+            "t", ["lide-api"], {"lide-api": RepoEntry(path=str(jj_repo.repo_root))},
+            resolver=_fake_resolver,
+        )
+        assert m.repos[0].anchor_base == "hash(trunk())"
+
     def test_at_rev_override_wins_over_default_rev(self):
         repos = self._registry(default_rev="main")
         m = resolve_manifest("t", ["lide-api@xyz"], repos, resolver=_fake_resolver)

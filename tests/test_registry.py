@@ -222,6 +222,13 @@ class TestPickRepos:
         anchor_defaults = [c.kwargs["default"] for c in prompt.call_args_list[1:]]
         assert anchor_defaults == ["main", "trunk()"]
 
+    def test_git_repo_anchor_prompt_offers_head_not_trunk(self, git_repo):
+        registry = {"g-repo": RepoEntry(path=str(git_repo.repo_root))}
+        prompt = MagicMock(side_effect=["1", "HEAD"])
+        with patch("cld.registry.typer.prompt", prompt):
+            pick_repos(registry)
+        assert prompt.call_args_list[1].kwargs["default"] == "HEAD"
+
     def test_empty_selection_aborts(self):
         with patch("cld.registry.typer.prompt", return_value=""):
             with pytest.raises(typer.Abort):
