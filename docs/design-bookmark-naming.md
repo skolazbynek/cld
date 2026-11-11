@@ -106,6 +106,8 @@ result bookmark. New rule:
 | Mailbox folder, messenger address, `--peer`, mailbox meta (`parent`, peers) | `<id>` |
 | Broker caller id, `~/.cld/broker-jobs/<id>/`, `gql-<id>` | `<id>` |
 | Anchor marker `cld anchor: <id> mode=...` | `<id>` |
+| git anchor pin, hidden ref (`names.anchor_ref`; copied in `vcs-lib.sh`) | `refs/cld/anchor/<id>` |
+| git archive of the session branch tip at shutdown (`names.ended_ref`) | `refs/cld/ended/<id>/<UTC stamp>`; detached-HEAD work `.../<stamp>-detached` |
 | Telemetry `service.name` | `<id>` (history restarts under the new name) |
 | `agent-output-<id>/` in run and chain commits | `<id>` |
 | `.cld/chains/<id>/` state folder, `chain-outputs/<chain>/` | chain `<id>` / `<chain>` |
@@ -113,6 +115,13 @@ result bookmark. New rule:
 Session bookmark, workspace name and container name stay one string, as
 today, so the code that relies on that stays as it is. Only how the string is
 built changes.
+
+The two git refs sit outside `refs/heads` on purpose: no branch list shows
+them and `git push --all` skips them. A git ticket's session branch `<id>` is
+the worktree branch and moves with the work, so the anchor ref, not the
+branch, finds the scratch commit again. The `ended` refs hold work that
+shutdown would otherwise lose to gc; the id has no `/`, so it is a folder of
+its own and never collides with another ticket's refs.
 
 ## No backwards compatibility
 

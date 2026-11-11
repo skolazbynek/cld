@@ -49,6 +49,9 @@ cld broker run-tests --repo api -k login tests/    # multi-repo ticket
 
 - Your workspace tip, uncommitted edits included: the client snapshots the
   working copy right before the call. No commit is needed.
+- **Git repo: committed work only.** A git workspace is not snapshotted. The
+  broker tests the tip of your session branch (`t.<ticket>`), so `git add` and
+  `git commit` before every run. Edits in the working tree are not seen.
 - Only files under version control. Ignored files (local fixtures, caches,
   your workspace's `.env` link) do not exist in the test checkout.
 - Runs are independent: several can run at the same time.
@@ -75,7 +78,7 @@ cld broker run-tests --repo api -k login tests/    # multi-repo ticket
 | `denied: ... mounts N repos -- pass --repo <name>` | Add `--repo <name>` as the first argument. |
 | `denied: repo '<x>' is not mounted` | Use a name from `cld repos`. |
 | `denied: --repo is only for ticket containers` | Drop `--repo`; a task-agent has one repo. |
-| `cannot resolve revision for workspace ...` | The repo is not jj-backed, or this workspace is gone. Tell the user. |
+| `cannot resolve revision for workspace ...` | This workspace is gone, or (git repo) the session branch `t.<ticket>` does not exist. Tell the user. |
 | `no cld container for session ...` | Host-side state problem. Tell the user. |
 | ssh `Connection refused` / `timed out` | The broker is not running on the host. Ask the user to run `cld-brokerctl start`. |
 | ssh `Host key verification failed` | The pinned broker host key does not match. Tell the user. |

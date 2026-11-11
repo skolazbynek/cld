@@ -7,13 +7,13 @@ Docker container orchestration for Claude Code with jujutsu/git workspace isolat
 - **cld task-agent** — bounded task-scoped with peer messaging
 - **cld run** — one-shot autonomous headless agent
 
-Prefers jujutsu; falls back to git.
+Prefers jujutsu; falls back to git. Git tickets get the scratch commit (pinned by `refs/cld/anchor/<id>`), the guard's file-write and drift checks, `--reanchor`, and broker tests/GraphQL on committed work. Still jj only: overlap check, watchman snapshots, commit immutability and git command parsing in the guard, task-agents, broker run/chain. See README *Git users*.
 
 ## Core Contracts
 
 **Anchor + descendant tree:** Containers can only edit changes descending from anchor (`-r`, default `@`). Works in isolated `/workspace/current`; origin at `/workspace/origin` holds only the jj/git store (never the host checkout), with host-trusted settings read-only. See `docs/design-secrets-containment.md`.
 
-**Persistence:** Sessions survive restart via jj bookmarks. Watchman snapshots autonomously.
+**Persistence:** Sessions survive restart via jj bookmarks (git: the session branch). Watchman snapshots autonomously (jj only; on git only commits persist). Git shutdown archives the branch tip under `refs/cld/ended/<id>/...`.
 
 **Config:** defaults → `~/.config/cld/config.toml` → repo `.cld/config.toml` → `.env` → `CLD_*` env vars. Key: `mailbox_root`, `agent_max_turns`, `max_task_agents`, `broker_*`.
 
@@ -24,7 +24,7 @@ Prefers jujutsu; falls back to git.
 - **Isolated (default):** Edit one branch only. No touching siblings.
 - **Shared (`--shared-anchor`):** Edit entire subtree. Needs approval.
 
-No overlap: live anchor trees checked host-wide.
+No overlap: live anchor trees checked host-wide (jj repos only).
 
 ## Subsystems
 

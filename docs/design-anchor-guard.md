@@ -21,6 +21,11 @@ Per repo workspace, with `A` = the recorded anchor change id:
 `change_id()` is used instead of a commit hash so a host-side rebase of the
 anchor (new hash, same change id) keeps the rules valid.
 
+Git workspaces have no change ids: the anchor is a commit hash (the scratch
+commit, pinned by `refs/cld/anchor/<id>`) and the tree is `A::`, anchor
+included. The rule is on `HEAD`, not on the working copy: `HEAD` must be `A`
+or a descendant of it (§6.1 rule 3, §7).
+
 ## 2. Three layers
 
 No single place catches everything. The agent can reach jj through tools,
@@ -191,7 +196,12 @@ name unconfirmed in the docs, read both). Resolve with `realpath`.
 2. Path inside a registered **jj** workspace → check
    `@ & change_id(A)+::` is non-empty; else **deny**.
 3. Path inside a registered **git** workspace → check
-   `git merge-base --is-ancestor A HEAD` and `HEAD != A`; else **deny**.
+   `git merge-base --is-ancestor A HEAD`; else **deny**. `HEAD == A` passes:
+   the anchor is the scratch commit a git worktree starts at, and a file
+   write lands in the working tree, never in `HEAD`, so `HEAD` in `A::` is
+   the analogue of jj's `@` in `A+::`. (Before, a strict descendant was
+   required and every first edit was refused.) A `HEAD` or anchor that does
+   not resolve (an amended or dropped scratch commit) also denies.
 4. Anything else (scratchpad, `~/.claude`, `/tmp`, the host mount via a
    symlink) → allow. The host repo mount is out of scope by decision.
 
@@ -255,6 +265,9 @@ reports that.
 
 After every Bash call, for each registered jj workspace, check that
 `change_id(A)` still resolves and that `@ & change_id(A)+::` is non-empty.
+For each registered git workspace, check the same ancestry as §6.1 rule 3
+(`A` is an ancestor of `HEAD`, or `HEAD == A`); an anchor or `HEAD` that no
+longer resolves is reported too, as "stop and report, do not write files".
 If not, return `{"decision": "block", "reason": …}` so Claude sees which
 repo drifted and how to get back. It cannot undo the call; it stops the
 next file write from landing outside the tree, and layer 2's file check
@@ -273,8 +286,10 @@ Cost: one jj call per repo per Bash call, with no snapshot.
 - This is a guard against mistakes, not a security boundary. The agent
   owns `/tmp` and `/opt/cld` and could edit the registry or the hook. The
   container remains the trust boundary.
-- Git-backend repos: file writes only (§6.1 rule 3). No git command
-  parsing yet.
+- Git-backend repos: file writes (§6.1 rule 3) and drift (§7) only. No
+  layer 1 (git has no immutability to configure) and no git command
+  parsing yet, so `git reset`, `git checkout` or `git commit` that move
+  `HEAD` out of the tree are reported after the call, not blocked.
 - Writes to the host repo mount: out of scope. Since the store-only mounts
   (`docs/design-secrets-containment.md`), `/workspace/origin/<repo>` holds only
   the jj/git store. Its `working_copy` is read-only, so plain jj there fails;
@@ -313,6 +328,7 @@ Cost: one jj call per repo per Bash call, with no snapshot.
 ## 11. Decisions
 
 - Operation-log commands: allowed; layer 3 reports drift.
-- Git-backend repos: file-write check only for now.
+- Git-backend repos: file-write and drift checks only for now; no
+  immutability layer, no command parsing.
 - Host repo mount writes (linked files such as `.env`): out of scope.
 - Failure mode: fail open; layer 1 is the floor.

@@ -27,8 +27,10 @@ cld repos          # list
 cld start LIDE-2600 lide-api diskuze-api    # or bare `cld start LIDE-2600` for a picker
 ```
 
-Each repo anchors on its registry `default_rev` (fallback `trunk()`); override
-per repo with `lide-api@<rev>`.
+Each repo anchors on its registry `default_rev` (fallback `trunk()`; on a git
+repo the remote HEAD branch, else `HEAD`); override per repo with
+`lide-api@<rev>`. A git repo works too, with differences (commit before
+broker tests, no snapshots): see README *Git users*.
 
 ## 3. Work
 
@@ -55,7 +57,7 @@ map and behavior changes: README, "Ticket containers (v2)".
 # Quick start: task-agents
 
 Hand one bounded task to one agent, on the host. Design and details:
-`docs/design-task-agents.md`.
+`docs/design-task-agents.md`. jj repos only: a git repo is refused.
 
 ## 1. Spawn
 

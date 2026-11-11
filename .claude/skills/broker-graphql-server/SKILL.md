@@ -24,13 +24,15 @@ and wait otherwise.
 ## The loop
 
 1. `start_server` -- starts the server at your workspace tip, uncommitted
-   edits included, and waits until it answers. The first start after a
+   edits included, and waits until it answers. On a git repo it serves the
+   tip of your session branch (`t.<ticket>`): commit first, working-tree edits
+   are not seen. The first start after a
    dependency change installs every package (minutes); later starts reuse a
    cached environment. Calling it again while it runs only returns status.
 2. `introspect` -- fetches and caches the schema, returns a summary.
    `describe_type` then gives one type's details from the cache.
 3. `query` -- runs a query or mutation, with optional `variables`.
-4. Edit code, then `restart_server`. The server serves the code as it was
+4. Edit code (git repo: commit it), then `restart_server`. The server serves the code as it was
    at start: `server_status` reports `stale: true` once your workspace has
    moved on.
 5. `get_server_logs` (optional `filter_pattern` regex) for tracebacks.

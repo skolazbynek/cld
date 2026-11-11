@@ -468,7 +468,12 @@ without a fresh discussion):**
   got tested (or served) something else. Blast radius of getting this wrong:
   every broker action that resolves a revision silently serves stale code
   with no error, the single easiest way for this feature to look like it
-  works while actually testing the wrong thing.
+  works while actually testing the wrong thing. On a git-only repo there is
+  no workspace tip to read: the revision is the commit of
+  `refs/heads/<session>`, read with host `git` after the same store checks,
+  and the runner and server images check it out through a detached
+  `git worktree`. Only committed work is tested or served there
+  (`broker/README.md`).
 - **Slow path only.** Every `start`/`restart` pays a fresh `docker run` +
   `poetry install` — no fast-restart path (e.g. reusing a warm container and
   just re-checking-out the revision) is built. Simplicity over server startup

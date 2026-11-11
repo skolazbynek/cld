@@ -18,6 +18,16 @@
 > -- is editable. An earlier revision of this note claimed the anchor is
 > always `A`; that contradicted the entrypoint's actual behavior and is the
 > documented contradiction the v2 spec settles.
+>
+> **Note (git):** a git ticket now gets the same scratch commit `B`. The
+> container commits it (`stage_in_workspace`, `git commit --allow-empty`) in
+> the worktree at `A` and pins it by the hidden ref `refs/cld/anchor/<id>`;
+> the anchor is a commit hash, so `B`'s identity does not survive a rewrite
+> as a jj change id does. The session branch `<id>` is the worktree branch
+> and moves with the work, so the ref, not the branch, is how a restart finds
+> `B`. The default anchor on git is the remote HEAD branch when it resolves,
+> else `HEAD` (jj keeps `trunk()`). `--reanchor` works on git too (docs/design-ticket-containers.md §2.4). The
+> git entries in the §2 table describe the v1 state.
 
 ## 1. Goal & invariant
 
@@ -269,7 +279,9 @@ Mechanics:
 - `stage_anchor_with_scratch(vcs, anchor_hash, session, scratch_files:
   dict[str, bytes]) -> str` in `cld/vcs/scratch.py` implements the
   sequence above. It is **jj-only**: the git backend raises
-  `NotImplementedError`.
+  `NotImplementedError`. (Superseded: the container-side `stage_in_workspace`
+  stages `B` on git as well, see the git note in the header; this host-side
+  sequence is the jj design only.)
 - On any failure between step 1 and step 3, the function best-effort
   restores the pre-staging op via `jj op restore` and deletes the host
   scratch files, logging the exact `jj op restore <op-id>` command the

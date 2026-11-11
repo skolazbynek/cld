@@ -10,7 +10,7 @@ action (see `docs/design-cld-broker.md` §16 and
 `docs/impl-graphql-broker-plan.md`), not as a subprocess inside this
 container. That means: the server runs from the repo's jj/git store (never
 the checkout) with a private copy of the real `.env` secrets, on the exact jj revision the calling container is on
-(the client snapshots its workspaces first, so uncommitted edits count) --
+(the client snapshots its workspaces first, so uncommitted edits count; a git repo has no snapshot, so the server runs the tip of the session branch: commit first) --
 and this container never holds a database password or an API token. The
 tradeoff is speed: every start/restart is a fresh container + `poetry
 install` (dependencies come from the venv cache after the first run), there

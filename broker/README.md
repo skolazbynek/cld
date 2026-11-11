@@ -16,7 +16,7 @@ A container asks over SSH; a dedicated, single-purpose `sshd` answers with a
 forced command (`cld-broker.py`). It serves **any repo that has a running
 agent, task-agent or ticket container** -- no whitelist: it resolves the target repo
 from the calling container's `org.cld.repo-root` label, resolves which change
-that session is on (reading the jj store, never touching the working copy),
+that session is on (reading the jj store, or the session branch of a git repo; never touching the working copy),
 and for `run-tests` runs the standalone [`runtests`](../runtests/) container
 against it, mounting only the repo's jj/git store (no checkout) and a private
 copy of its `.env` into that ephemeral runner. Every host `jj` call goes through
@@ -33,7 +33,8 @@ container: cld broker run-tests -k login -x tests/
    └─ssh (restricted key)─▶ dedicated sshd ─ForceCommand▶ cld-broker.py
         ├─ validate: action=run-tests, session=a.<ticket>.<agent> or t.<ticket>
         ├─ REPO = docker inspect <session> -> org.cld.repo-root label
-        ├─ REV  = jj -R <repo> --ignore-working-copy log -r "<session>@"   (workspace tip, store-reading only)
+        ├─ REV  = jj -R <repo> --ignore-working-copy log -r "<session>@"   (workspace tip, store-reading only;
+        │         git repo: the commit of refs/heads/<session>, committed work only)
         ├─ .env = <repo>/.env  (or under pyproject_dir from <repo>/.cld/config.toml)
         └─ docker run --rm runtests -e REVISION=REV <store rows> <.env copy> -- -k login -x tests/
    ◀───────────────── stdout / stderr / exit code ─────────────────┘
@@ -209,6 +210,9 @@ after the same store checks as the mount), and the runner checks it out through 
 tree are not seen. A git session without that branch gets `cannot resolve revision` (exit 3).
 `graphql`'s read-only ops (`status`/`logs`/`stop`/`endpoints`) do not need a revision at all.
 The host route (`cld-brokerctl run`, `CliCaller`) takes a jj revset and still works on jj repos only.
+`task-agent start` refuses a git repo (`denied: task-agents need a jj repo`, exit 3) before any
+container starts, and `run` / `chain` still refuse one: task-agents and their reach check have no
+git version.
 
 `task-agent` is the only action that creates a container with a caller-chosen file
 mounted inside it, so it also polices its argv: `--force` is denied (overriding a

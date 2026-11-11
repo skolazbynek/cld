@@ -146,7 +146,12 @@ scratch anchor commit onto a new revision instead of leaving it where first
 launch put it -- see the anchor-move design doc, sections 3 to 5, for the jj
 rebase mechanics, the overlap-check exclusion, the stop/move/rm/relaunch
 ordering and its undo. A bare `<repo>` (or `<repo>@`) means `<repo>@@`: the
-revision defaults to `@`, the repo's working copy on the host. `jj` only; refuses on a live claude session.
+revision defaults to `@`, the repo's working copy on the host. Refuses on a live claude session. On git
+the scratch commit is immutable, so a new empty one is committed on the target host-side (`git commit-tree`),
+and `refs/cld/anchor/<id>` moves onto it with a compare-and-swap; it refuses a scratch commit that carries
+changes and a ticket with no anchor ref. The session branch follows only when it still points at the old
+scratch commit. A branch with work stays on it, and `cld restart` prints the `git rebase --onto <new> <old>
+<branch>` to run in the container. Unlike jj, the other children of the target are not moved.
 
 ## 3. The effective-anchor problem
 
@@ -199,8 +204,9 @@ Why this beats the two channels the spec named:
   seconds, and the check-then-launch race is a carried gap regardless (§7).
 - The check needs read access to each target repo's store. It has it: the
   check runs host-side and manifest `path` is the host path.
-- Git repos have no scratch commit; effective = A there (the git backend is
-  skipped by the check today anyway, and stays weaker per spec gap 8).
+- Git repos have the same scratch commit, found through `refs/cld/anchor/<id>` (isolated: S, shared: S's
+  parent), but the overlap check still skips the git backend (no `merge-base` reach model), so no
+  effective anchor is derived there. Git stays weaker for that (spec gap 8, narrowed).
 
 ## 4. Boot contract
 
@@ -243,15 +249,28 @@ For each manifest entry, in manifest order:
    bookmark `t.<slug>`: warm restart (workspace dir exists in the
    container layer) / reattach (bookmark exists in the store) / first launch
    (`jj workspace add --name t.<slug> -r <anchor_base> …`).
+   On git the same three branches run over a *locked* worktree (`git worktree add --lock --reason t.<slug>`)
+   whose branch is `t.<slug>`. Warm restart is the existing worktree directory. Reattach is the anchor ref
+   or the branch existing in the store: the worktree is re-added on the branch (or the detached HEAD) of
+   this session's own stale registration, else on the branch, else on a new branch at the anchor ref. There is
+   no blanket `git worktree prune` -- the store is shared with other tickets whose worktree paths do not
+   exist in this container -- only this session's own stale registration is removed. First launch resolves
+   `<anchor_base>` to a commit, adds the worktree and stages S (below). A ticket with a branch but no anchor
+   ref (from before the scratch commit) reattaches with the base as anchor and a warning.
 3. First launch only: stage scratch B via
    `python3 -m cld.vcs.scratch --default-payload`, a new flag that synthesizes
    `{"session": …}` locally instead of requiring `AGENT_SCRATCH`
    (`stage_from_env`, `scratch.py:103-128`, keeps its env path for v1 kinds).
    v2 tickets have no brief, so the envelope wire is dead weight for them; B's
    shape (payload file + `cld anchor: <session> mode=<mode>` description) is
-   unchanged, per the §8 ruling.
+   unchanged, per the §8 ruling. On git the same module commits S in the worktree (`git commit
+   --allow-empty --no-verify`, signing off) and pins it with `refs/cld/anchor/<session>` (created only if
+   absent). The ref lives outside `refs/heads` on purpose, so no branch list shows it and `git push --all`
+   skips it; the session branch moves with the work, so the ref is how a restart finds S. If staging fails
+   the worktree and branch are removed, so the next boot is a clean first launch.
 4. Set the bookmark on the anchor (static, see the per-repo identities paragraph in PRODUCT_DESIGN.md); enable watchman fsmonitor + snapshot trigger per
-   workspace (v1 `:130-134`).
+   workspace (v1 `:130-134`). Git has neither: the session branch is the worktree branch and moves with
+   each commit, and nothing snapshots uncommitted edits.
 5. ~~Per-repo workspace-file symlinks~~ — removed with the store-only mounts
    (§12); origin holds no working-tree file to link.
 6. Optional bootstrap: registry `bootstrap = true` runs `poetry install` in
@@ -273,7 +292,10 @@ failing repo is named.
    `/workspace/<slug>/CLAUDE.md`: ticket name, one row per repo (name,
    anchor short-hash, mode, backend), the anchor contract sentence, and a note
    that each repo's own CLAUDE.md governs its subtree. Regenerated on every
-   boot — it is derived state, never edited.
+   boot — it is derived state, never edited. When a row has the git backend
+   the file adds a "Git repos" section (branch not bookmark, `git add` /
+   `git commit`, the anchor ref, push `HEAD:t.<ticket>.mr`) and, with the
+   broker wired, a note that broker tests see committed work only.
 2. `build_claude_config` + `copy_host_configs` as today.
 3. Generate the claude wrapper **without** a baked `AGENT_MODEL`
    (v1 `:172-182`); `--dangerously-skip-permissions --add-dir /opt/cld` stay
@@ -294,7 +316,14 @@ failing repo is named.
    stop` is the *pause* verb (spec §5), so in-container TERM must not tear
    down. All forgetting moves host-side into `cld shutdown` (per-repo
    `jj bookmark forget` + `jj workspace forget` over the manifest, the
-   `_forget_session_state` pattern, `cli.py:635-672`). This also removes the
+   `_forget_session_state` pattern, `cli.py:635-672`). On a git repo the
+   same host-side step ends the lifecycle in this order: drop the ticket's
+   worktree registration (after archiving a detached HEAD that holds its own
+   commits as `refs/cld/ended/<id>/<stamp>-detached`), archive the branch tip as
+   `refs/cld/ended/<id>/<stamp>` when it holds work above the scratch commit,
+   delete the branch, delete `refs/cld/anchor/<id>` last. The anchor ref is the
+   lifecycle-alive marker, so a partial failure leaves it and the next start
+   reattaches; each failure is a warning naming the manual command. This also removes the
    v1 asymmetry where restart needed a special USR1 signal to *avoid*
    cleanup.
 
@@ -385,7 +414,8 @@ dependency.
 - **Interactive picker** (TTY `cld start <ticket>` with no repos): numbered
   multi-select over the registry via `typer.prompt` ("comma-separated numbers,
   empty to abort"), then a per-selection anchor line offering
-  `default_rev`/`trunk()` with an override prompt. Plain prompts, no new TUI
+  `default_rev`/`trunk()` (git: the remote HEAD branch if it resolves, else
+  `HEAD`) with an override prompt. Plain prompts, no new TUI
   dependency (nothing interactive exists in the codebase beyond typer
   prompts; a fuzzy-finder is a later nicety, not a launch requirement).
   Non-TTY with no repos: hard error naming the picker and the positional
@@ -537,9 +567,11 @@ receives the repo name explicitly. Inside the container it cannot read
      (at warn strength for stopped tickets); `run` corpses stay excluded
      (`--rm`, they cannot return).
    - *Git backends skipped* (`docker.py:962-964`): **carried.** Fixing it
-     means a parallel `merge-base --is-ancestor` reach model with no scratch
-     commit; git repos keep weaker guarantees everywhere (spec gap 8) and
-     the user-facing docs say so.
+     means a parallel `merge-base --is-ancestor` reach model over the git
+     scratch commit and its anchor ref, which the check does not read yet; git
+     repos keep a weaker overlap guarantee (spec gap 8, narrowed: git now has
+     the scratch commit, the guard's file and drift checks and `--reanchor`)
+     and the user-facing docs say so.
    - *Check-then-launch race*: **carried.** A host-wide lock around
      check+launch is the fix; it is orthogonal to this rework and the §3
      boot-race fallback keeps the window's behavior no worse than v1.

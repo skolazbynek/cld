@@ -27,7 +27,7 @@ poetry run cld --help
 cld build [--no-cache]
 ```
 
-The v1 verbs (`cld task-agent`, `cld run`, `cld chain`) must be run from within a VCS repository (jj or git) -- they operate on the cwd repo. The ticket verbs (`cld start`, `cld claude`, ...) run from anywhere: their repos come from the registry or from explicit paths.
+The v1 verbs (`cld task-agent`, `cld run`, `cld chain`) must be run from within a VCS repository (jj or git) -- they operate on the cwd repo. `cld task-agent start` refuses a git repo up front (task-agents are jj only, see *Git users* below). The ticket verbs (`cld start`, `cld claude`, ...) run from anywhere: their repos come from the registry or from explicit paths.
 
 ## Usage
 
@@ -95,9 +95,9 @@ Each entry is a `[repos.<name>]` TOML table: `path`, optional `default_rev` (anc
 | `cld claude [<ticket>] [-- args...]` | The daily verb: exec the harness at the ticket root. Everything after `--` passes to claude (`--model`, `--continue`, `--resume`, `-p`). One live session per container (POC): a second `cld claude` is refused, naming the holder. |
 | `cld shell [<ticket>]` | Escape hatch: interactive bash in the container, for debugging the sandbox itself. |
 | `cld stop [<ticket>]` | Pause (`docker stop`). Workspaces stay in place; `cld start` on a stopped ticket is a warm start. |
-| `cld restart [<ticket>] [--reanchor repo@rev]...` | Recreate the container from its persisted launch manifest (labels, read back before removal -- no argument drop). Workspaces reattach at their bookmarks; venvs and caches in the container layer are lost. `--reanchor` (repeatable, jj only) moves a repo's anchor commit onto a new revision first; the revision defaults to `@`, the repo's working copy on the host. |
-| `cld shutdown [<ticket>] [--all]` | End of ticket: teardown, forget the ticket's bookmark and workspace in every mounted repo. Commits always survive in the repo stores. |
-| `cld status [<ticket>]` | Roster (repos, state, live session) or one-ticket detail (per-repo anchors, modes, bookmark tips, session, uptime). |
+| `cld restart [<ticket>] [--reanchor repo@rev]...` | Recreate the container from its persisted launch manifest (labels, read back before removal -- no argument drop). Workspaces reattach at their bookmarks (git: branches); venvs and caches in the container layer are lost. `--reanchor` (repeatable, jj and git) moves a repo's anchor commit onto a new revision first; the revision defaults to `@`, the repo's working copy on the host. On git a session branch holding work stays on the old anchor commit and cld prints a `git rebase --onto` to run in the container. |
+| `cld shutdown [<ticket>] [--all]` | End of ticket: teardown, forget the ticket's bookmark and workspace in every mounted repo. Commits always survive in the repo stores. On git: the worktree is removed, the session branch tip (and any detached-HEAD work) is archived under `refs/cld/ended/<id>/...`, then the branch and the anchor ref are deleted. |
+| `cld status [<ticket>]` | Roster (repos, state, live session) or one-ticket detail (per-repo anchors, modes, bookmark tips (git: session branch tips), session, uptime). |
 | `cld logs [<ticket>] [-n N]` | Entrypoint/boot logs. |
 
 Without a ticket, `claude`, `shell`, `stop`, `restart`, `shutdown` and `logs` target the ticket bare `cld start` creates: the one named after the cwd repo's directory. Bare `cld status` stays the roster.
@@ -106,21 +106,29 @@ Resume: transcripts land on the host under the per-ticket cwd slug, so `cld clau
 
 ### Anchors per repo
 
-At first launch, each repo's anchor revision resolves as: explicit `@rev` from the launch args, else the registry `default_rev`, else `trunk()`. Bare `cld start` passes `@` as that explicit rev. In isolated mode (default), a scratch commit is staged as a child of the anchor and the ticket may edit only its descendants; `--shared-anchor <repo>` (repeatable, per repo) widens the editable tree to every descendant of the anchor itself. The anchor is pinned by its jj change ID (a commit hash on git), so a host-side rebase of the anchor keeps it the same anchor; no container ever rewrites, moves or rebases it. The contract is policy, enforced by prompt and convention, not mechanism.
+At first launch, each repo's anchor revision resolves as: explicit `@rev` from the launch args, else the registry `default_rev`, else `trunk()` (jj) or, on git, the remote HEAD branch (`origin/HEAD`) when it resolves and `HEAD` when it does not. Bare `cld start` passes `@` as that explicit rev. In isolated mode (default), a scratch commit is staged as a child of the anchor and the ticket may edit only its descendants; `--shared-anchor <repo>` (repeatable, per repo) widens the editable tree to every descendant of the anchor itself. The anchor is pinned by its jj change ID, so a host-side rebase of the anchor keeps it the same anchor; on git the anchor is a commit hash and a host rebase makes a different commit. No container ever rewrites, moves or rebases it. The contract is policy, enforced by prompt and convention, not mechanism.
 
 When a new ticket's anchor lies inside another live ticket's editable tree in the same repo, cld **warns and proceeds** (stacked tickets are legitimate). Anchoring inside a headless container's tree (`task-agent`, `run`) still blocks, in both directions.
 
-**Git-backed repos get weaker guarantees:** no scratch commit (the effective anchor is the base itself), no overlap check, no watchman snapshots -- worktree semantics only.
+**Git-backed repos get weaker guarantees.** Git has the scratch commit, the anchor guard's file-write and drift checks, and `--reanchor`. These are still jj only:
+
+- the overlap check between live tickets (a git anchor is never compared with other tickets);
+- autonomous watchman snapshots (uncommitted edits live in the container layer only);
+- the commit immutability layer and the guard's parsing of git commands (only file writes and drift are checked: `HEAD` must be the anchor or a descendant of it);
+- task-agents, and broker `run` / `chain` jobs (both refuse a git repo);
+- the host route `cld-brokerctl run` (it takes a jj revset).
+
+See *Git users* below for the daily differences.
 
 ### Persistence
 
-Commits, the op log, and the per-repo ticket bookmark live in each host repo's store and survive everything short of `shutdown` (which forgets the bookmark; commits remain). Uncommitted edits are watchman-snapshotted into the store. Workspace dirs, venvs and caches live in the container layer: they survive `stop`, are rebuilt (workspaces) or lost (venvs) on `restart`/recreate, and are gone after `shutdown`.
+Commits, the op log, and the per-repo ticket bookmark live in each host repo's store and survive everything short of `shutdown` (which forgets the bookmark; commits remain). Uncommitted edits are watchman-snapshotted into the store (jj only: on git only committed work reaches the store). Workspace dirs, venvs and caches live in the container layer: they survive `stop`, are rebuilt (workspaces) or lost (venvs) on `restart`/recreate, and are gone after `shutdown`.
 
 ### Changes from v1 behavior
 
 Verified deliberate differences from the v1 roles:
 
-- **Default anchor is `default_rev` -> `trunk()`, not `@`.** A v2 launch happens from anywhere, so each repo's `@` is invisible and may be unrelated WIP. Stacked work uses an explicit `repo@rev`. (v1 kinds and bare `cld start`, which launches from inside the repo, keep defaulting to `@`.)
+- **Default anchor is `default_rev` -> `trunk()` (git: remote HEAD branch, else `HEAD`), not `@`.** A v2 launch happens from anywhere, so each repo's `@` is invisible and may be unrelated WIP. Stacked work uses an explicit `repo@rev`. (v1 kinds and bare `cld start`, which launches from inside the repo, keep defaulting to `@`.)
 - **Host-side `cld msg` prefers a single running ticket.** Identity resolution is: explicit `--ticket` flag or `CLD_TICKET` env, else the one running ticket container if exactly one exists, else the cwd repo's own host identity (the mailbox the v1 master used to own). cwd is deliberately not mapped to tickets -- several tickets can mount one repo.
 - **Parallel same-base siblings need no placeholder commits.** The overlap check now derives each occupant's *effective* anchor (the scratch commit in isolated mode) from the jj store at check time, for v1 headless kinds too, so two isolated containers anchored on the same base no longer over-block each other.
 - **A kept repo whose anchor changed on a repo-set change reattaches at its old bookmark.** `cld start <ticket> <new set>` recreates the container, but a kept repo's bookmark survives, and the boot's reattach branch wins over the new `anchor_base` -- the new anchor takes effect only after `cld shutdown` forgets the bookmark.
@@ -248,6 +256,29 @@ This detection runs both on the host (CLI commands) and inside containers (entry
 | Commit | `jj commit` (auto-tracks) | `git add -A && git commit` |
 | Read file from revision | `jj file show -r <rev> <path>` | `git show <rev>:<path>` |
 | Common ancestor | `fork_point(A \| B)` | `git merge-base A B` |
+| Default ticket anchor | `trunk()` | remote HEAD branch if it resolves, else `HEAD` |
+| Anchor pin (tickets) | change ID of the scratch commit, found by its description | commit hash of the scratch commit, pinned by the hidden ref `refs/cld/anchor/<id>` |
+| Session ref | bookmark `<id>` on the anchor, moved by `jj` as work lands | worktree branch `<id>`, moves with every commit |
+| Uncommitted edits | snapshotted into the store by watchman | container layer only; lost on restart / recreate |
+| On shutdown | bookmark and workspace forgotten; commits stay | worktree removed; branch tip archived under `refs/cld/ended/<id>/<stamp>` (detached-HEAD work: `<stamp>-detached`); branch and anchor ref deleted |
+| Hooks | never run | turned off in every container (`core.hooksPath` is an empty dir) |
+| Broker tests / GraphQL server | tip of `<id>@`, uncommitted edits included | tip of branch `<id>`, committed work only |
+| Task-agents, broker `run` / `chain` | supported | refused |
+
+### Git users
+
+A git ticket works like a jj one with these differences:
+
+- **Commit before you test.** The broker (`cld broker run-tests`, the `graphql-tester` tools) runs the tip of the session branch `t.<ticket>`, not your working tree. Uncommitted edits are never seen.
+- **Commit to keep work.** Nothing snapshots edits for you. Use `git add` and `git commit`; the session branch moves with each commit. Uncommitted edits die with the container layer on `cld restart`.
+- **Stay on the session branch.** `t.<ticket>` is the worktree branch: do not delete it or switch the worktree off it. Other branches start with `t.<ticket>` (merge request branch: `t.<ticket>.mr`; push with `git push origin HEAD:t.<ticket>.mr`).
+- **Anchor ref.** The scratch commit `cld anchor: <id> mode=<mode>` is pinned by `refs/cld/anchor/<id>`. The ref lives outside `refs/heads`, so no branch list shows it and `git push --all` skips it. Never move or delete it. A host rebase of the anchor does not move it; `cld restart --reanchor` does.
+- **Guard.** File writes are allowed while `HEAD` is the anchor or a descendant of it. After every Bash call the guard reports a `HEAD` that left the anchor tree, or an anchor that no longer resolves.
+- **Hooks are off.** Git commit hooks of the host repo never run in a container.
+- **Identity.** `git` author comes from the host `~/.gitconfig`, copied read-only into ticket and devcontainer containers. A host that keeps it only in `~/.config/git/config` gets none: the container has no git identity.
+- **Shutdown keeps the work.** `cld shutdown` archives the branch tip (and detached-HEAD commits) under `refs/cld/ended/<id>/...` before it deletes the branch; list them with `git for-each-ref refs/cld/ended`. A failed step prints the manual command and keeps the anchor ref, so the next `cld start` reattaches.
+- **`--reanchor` on a branch with work.** The anchor ref moves to a new scratch commit on the target; a branch holding work stays on the old one. Run the printed `git rebase --onto <new> <old> <branch>` in the container (`cld shell <ticket>`).
+- **Old tickets.** A git ticket started before the scratch commit existed has no anchor ref: it reattaches on the base with a warning, and `--reanchor` refuses it. Shut it down and start it again.
 
 ## Messenger
 
@@ -259,7 +290,7 @@ Ticket containers get a mailbox named `t.<slug>` and can be addressed by the tic
 # Register for host use (user-scoped, works from any directory)
 claude mcp add -s user messenger -- /path/to/cld/scripts/mcp/run-messenger.sh
 
-# Spawn a headless task-agent for the current repo
+# Spawn a headless task-agent for the current repo (jj repos only; a git repo is refused)
 cld task-agent start @personas/implementer -n add-oauth -p "Add OAuth login."
 
 # From any other container (a ticket or another agent), message it by container name
@@ -326,13 +357,13 @@ prompts/                           Reusable task prompts for agents
 
 ### Workspace isolation
 
-Containers never mount the host checkout. They mount only the host repo's jj/git store at `/workspace/origin` (ticket containers: one store per repo at `/workspace/origin/<name>`), as the eleven-row mount set of `docs/design-secrets-containment.md` section 3.1. The store stays writable. The settings the host trusts stay read-only: the host default workspace's working-copy state, the jj config ids, `git_target`, and the git dir's `config`, `hooks` and `commondir`. So `.env` and other untracked host files never reach a container, and plain `jj` in origin fails. Before each launch a host preflight checks the store and refuses an unsafe one (host jj older than 0.38, a jj id missing next to a legacy config file, a `git_target` outside the repo, a foreign `commondir`, a git `modules/` folder, or another container that mounts the repo without the `org.cld.origin-mount=store-v1` label). The container's own entrypoint runs `jj workspace add` / `git worktree add` on boot, with `--ignore-working-copy` for every jj call in origin; the workspace directory lives in the container's own filesystem layer at `/workspace/current` (tickets: `/workspace/<slug>/<name>`), never on the host. The launcher refuses an image without the label `org.cld.boot-api=2` (rebuild with `cld build`). jj writes all store objects through the writable store rows, and watchman snapshots edits into the store autonomously, so work is durable and host-visible without a host-side workspace directory. The `-r` flag pins the anchor revision for v1 kinds (default: `@` for jj, `HEAD` for git; tickets default to the registry `default_rev`, falling back to `trunk()`). On shutdown, the session's bookmark and workspace registration are forgotten from the origin store host-side, by `cld shutdown` / `cld <role> shutdown`; committed work persists.
+Containers never mount the host checkout. They mount only the host repo's jj/git store at `/workspace/origin` (ticket containers: one store per repo at `/workspace/origin/<name>`), as the eleven-row mount set of `docs/design-secrets-containment.md` section 3.1. The store stays writable. The settings the host trusts stay read-only: the host default workspace's working-copy state, the jj config ids, `git_target`, and the git dir's `config`, `hooks` and `commondir`. So `.env` and other untracked host files never reach a container, and plain `jj` in origin fails. Before each launch a host preflight checks the store and refuses an unsafe one (host jj older than 0.38, a jj id missing next to a legacy config file, a `git_target` outside the repo, a foreign `commondir`, a git `modules/` folder, or another container that mounts the repo without the `org.cld.origin-mount=store-v1` label). The container's own entrypoint runs `jj workspace add` / `git worktree add` on boot, with `--ignore-working-copy` for every jj call in origin; the workspace directory lives in the container's own filesystem layer at `/workspace/current` (tickets: `/workspace/<slug>/<name>`), never on the host. The launcher refuses an image without the label `org.cld.boot-api=2` (rebuild with `cld build`). jj writes all store objects through the writable store rows, and watchman snapshots edits into the store autonomously, so work is durable and host-visible without a host-side workspace directory. The `-r` flag pins the anchor revision for v1 kinds (default: `@` for jj, `HEAD` for git; tickets default to the registry `default_rev`, falling back to `trunk()`). On shutdown, the session's bookmark and workspace registration are forgotten from the origin store host-side, by `cld shutdown` / `cld <role> shutdown`; committed work persists. On git the host removes the worktree, archives the branch tip (and detached-HEAD work) under `refs/cld/ended/<id>/<stamp>`, deletes the branch and deletes the anchor ref `refs/cld/anchor/<id>` last, so a partial failure leaves the ticket restartable. Boot never runs a blanket `git worktree prune` in the shared store: worktrees are added locked, and only the session's own stale registration is replaced.
 
 ### Host file protection
 
 Host `~/.claude.json` is mounted read-only. The entrypoint builds a container-local copy with MCP servers merged for the container's project path.
 
-All RO `$HOME` mounts (claude/anthropic/jj configs, `~/.claude.json`, plus devcontainer-only `~/.gitconfig`, `~/.bashrc`, and the nvim dirs `~/.config/nvim` / `~/.local/state/nvim` / `~/.cache/nvim`) are staged read-only under `/tmp/host-config/<rel>` and copied into `$HOME` on startup by `copy_host_configs`. Changes made inside the container do not persist to the host. The agent image has no editor and skips the devcontainer-only entries.
+All RO `$HOME` mounts (claude/anthropic/jj configs, `~/.claude.json`, plus devcontainer-only `~/.gitconfig`, `~/.bashrc`, and the nvim dirs `~/.config/nvim` / `~/.local/state/nvim` / `~/.cache/nvim`) are staged read-only under `/tmp/host-config/<rel>` and copied into `$HOME` on startup by `copy_host_configs`. Changes made inside the container do not persist to the host. The agent image has no editor and skips the devcontainer-only entries. `copy_host_configs` then sets `core.hooksPath` to an empty directory in the container's global git config (after the staged `~/.gitconfig` is copied, so the identity stays), in every container kind: a git worktree would run the host's read-only hooks, and jj never runs hooks.
 
 `~/.ticket-notes`, the notes folder of the ai-koutek `ticket-notes` plugin, is mounted read-write at the same `$HOME`-relative path, like `~/.claude`. The launcher creates it on the host when it is missing.
 

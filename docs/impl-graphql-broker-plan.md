@@ -78,8 +78,10 @@ independently of the graphql feature.
 
 - Residual watchman debounce (empirically < 6s). Forcing a snapshot would need
   `docker exec` into the session, reversing locked decision 5. Out of scope.
-- `jj -R` is unconditional, so a git-backed repo still exits 3. Pre-existing;
-  note it in `broker/README.md`.
+- `jj -R` was unconditional, so a git-backed repo exited 3. Superseded: both
+  resolvers now read `refs/heads/<session>` on a git-only repo (committed work
+  only; see `broker/README.md`). The host route (`cld-brokerctl run`) is still
+  jj only.
 - A missing workspace registration errors cleanly
   (`Workspace \`X\` doesn't have a working-copy commit`). Unreachable in
   practice -- the dispatcher already requires a live container carrying
@@ -568,6 +570,7 @@ sweep, an unknown alias, a denied raw URL, and a missing `graphql_command`.
 - **Forcing a watchman snapshot** before resolving `REV` (§1.2) -- reverses
   locked decision 5.
 - **A mechanical role gate** on `graphql` (ruling D).
-- **Git-backed repo support** in either resolver (§1.2).
+- ~~**Git-backed repo support** in either resolver (§1.2).~~ Done for the
+  session route, on committed work only; the host route stays jj only.
 - **Mutation blocking / a scratch-DB requirement** (ruling C): the human's
   `.env` is the control point.
