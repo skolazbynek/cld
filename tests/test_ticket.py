@@ -6,6 +6,7 @@ a daemon.
 """
 
 import json
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,7 @@ from cld.ticket import (
     stop_ticket,
     wait_ticket_ready,
 )
+from cld.vcs.scratch import stage_in_workspace
 
 
 def _res(rc=0, out="", err=""):
@@ -737,7 +739,8 @@ class TestForgetSessionState:
             ["workspace", "forget", "t.x"],
         ]
 
-    def test_git_backend_skips_forget(self, tmp_path):
+    def test_git_without_a_worktree_path_is_left_alone(self, tmp_path):
+        """The task-agent callers pass none."""
         backend = MagicMock()
         backend.name = "git"
         with patch("cld.ticket.get_backend", return_value=backend):
@@ -760,6 +763,106 @@ class TestForgetSessionState:
     def test_get_backend_failure_is_non_fatal(self, tmp_path):
         with patch("cld.ticket.get_backend", side_effect=RuntimeError("no vcs")):
             forget_session_state(str(tmp_path), "a.r.x")
+
+
+class TestForgetGitSessionState:
+    """Ticket shutdown on git: drop the worktree registration, archive the work, delete the
+    branch, and the anchor ref last (it is the lifecycle-alive marker)."""
+
+    SESSION = "t.x"
+
+    def _lifecycle(self, git_repo, tmp_path, work: bool) -> str:
+        """Boot-like state: a locked worktree on the session branch with a pinned scratch commit,
+        optionally one commit of work on top, and the worktree directory lost. Returns its path."""
+        workspace = tmp_path.resolve() / "ws"
+        base = git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
+        git_repo.run(["worktree", "add", "--lock", "--reason", self.SESSION, "--no-track", "-b", self.SESSION,
+                      str(workspace), base])
+        stage_in_workspace(workspace, self.SESSION, {})
+        if work:
+            (workspace / "work.txt").write_text("work\n")
+            git_repo.run(["-C", str(workspace), "add", "work.txt"])
+            git_repo.run(["-C", str(workspace), "commit", "-q", "-m", "work"])
+        shutil.rmtree(workspace)
+        return str(workspace)
+
+    def _refs(self, git_repo) -> dict[str, str]:
+        out = git_repo.run(["for-each-ref", "--format=%(refname) %(objectname)"]).stdout.splitlines()
+        return dict(line.split() for line in out)
+
+    def test_work_is_archived_before_the_branch_is_deleted(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        tip = git_repo.run(["rev-parse", f"refs/heads/{self.SESSION}"]).stdout.strip()
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        refs = self._refs(git_repo)
+        archived = [ref for ref in refs if ref.startswith(f"refs/cld/ended/{self.SESSION}/")]
+        assert len(archived) == 1
+        assert refs[archived[0]] == tip
+        assert f"refs/heads/{self.SESSION}" not in refs
+        assert f"refs/cld/anchor/{self.SESSION}" not in refs
+        assert workspace not in git_repo.run(["worktree", "list", "--porcelain"]).stdout
+
+    def test_a_branch_still_at_the_scratch_commit_is_just_deleted(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=False)
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        assert not [ref for ref in self._refs(git_repo) if ref.startswith("refs/cld/")]
+        assert f"refs/heads/{self.SESSION}" not in self._refs(git_repo)
+
+    def test_a_missing_ref_and_registration_are_tolerated(self, git_repo, tmp_path):
+        git_repo.run(["branch", self.SESSION])
+        forget_session_state(str(git_repo.repo_root), self.SESSION, str(tmp_path / "never-registered"))
+        assert f"refs/heads/{self.SESSION}" not in self._refs(git_repo)
+
+    def test_other_tickets_are_untouched(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        git_repo.run(["update-ref", "refs/cld/anchor/t.other", "HEAD"])
+        git_repo.run(["branch", "t.other"])
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        refs = self._refs(git_repo)
+        assert "refs/cld/anchor/t.other" in refs
+        assert "refs/heads/t.other" in refs
+
+    @staticmethod
+    def _scripted_backend(fail: str = "") -> MagicMock:
+        """A git backend whose rev-parse finds a branch tip above the scratch commit and which
+        fails the command that starts with *fail*."""
+        backend = MagicMock()
+        backend.name = "git"
+        backend.repo_root = Path("/repo")
+
+        def run(cmd):
+            out = ""
+            if cmd[0] == "worktree" and cmd[1] == "list":
+                out = "worktree /workspace/x/api\n"
+            elif cmd[0] == "rev-parse":
+                out = "a" * 40 if "refs/heads/t.x^{commit}" in cmd else "b" * 40
+            return MagicMock(returncode=1 if fail and " ".join(cmd).startswith(fail) else 0, stdout=out, stderr="boom")
+
+        backend.run.side_effect = run
+        return backend
+
+    def _commands(self, backend: MagicMock) -> list[str]:
+        return [" ".join(c.args[0]) for c in backend.run.call_args_list if c.args[0][0] != "rev-parse"]
+
+    def test_the_anchor_ref_goes_last(self, tmp_path):
+        backend = self._scripted_backend()
+        with patch("cld.ticket.get_backend", return_value=backend):
+            forget_session_state(str(tmp_path), self.SESSION, "/workspace/x/api")
+        prefixes = [
+            "worktree list", "worktree unlock", "worktree remove", "update-ref refs/cld/ended/t.x/",
+            "branch -D t.x", "update-ref -d refs/cld/anchor/t.x",
+        ]
+        commands = self._commands(backend)
+        assert len(commands) == len(prefixes)
+        assert all(command.startswith(prefix) for command, prefix in zip(commands, prefixes))
+
+    @pytest.mark.parametrize("fail", ["worktree remove", "update-ref refs/cld/ended", "branch -D"])
+    def test_a_failure_keeps_the_anchor_ref_and_names_the_command(self, tmp_path, caplog, fail):
+        backend = self._scripted_backend(fail)
+        with patch("cld.ticket.get_backend", return_value=backend), caplog.at_level("WARNING"):
+            forget_session_state(str(tmp_path), self.SESSION, "/workspace/x/api")
+        assert "update-ref -d refs/cld/anchor/t.x" not in self._commands(backend)
+        assert f"recover with: cd /repo && git {fail}" in caplog.text
 
 
 class TestExecVerbs:
@@ -876,7 +979,7 @@ class TestStatus:
 
 class TestGitBackendWording:
     """A git repo has a session branch and a worktree, no bookmark and workspace: tips and
-    messages say so. Shutdown itself leaves git state alone (forget_session_state)."""
+    messages say so."""
 
     def test_bookmark_tip_is_the_session_branch_tip(self, git_repo):
         git_repo.create_branch("t.lide-2600")
@@ -891,7 +994,7 @@ class TestGitBackendWording:
         entry = RepoManifestEntry(name="gone", path=str(git_repo.repo_root), anchor_base="c" * 40)
         _print_manifest_diff(MagicMock(added=(), removed=(entry,), changed=()))
         out = capsys.readouterr().out
-        assert "session branch and worktree stay in the repo" in out
+        assert "session branch and worktree forgotten" in out
         assert "bookmark" not in out
 
     def test_manifest_diff_keeps_the_jj_wording_for_a_jj_repo(self, capsys):
@@ -913,7 +1016,7 @@ class TestGitBackendWording:
             restart_ticket(Config(), "lide-2600")
         assert f"reattached at their {ref})" in capsys.readouterr().out
 
-    def test_shutdown_tells_that_a_git_repo_keeps_its_branch(self, git_repo, capsys):
+    def test_shutdown_tells_that_a_git_repo_archives_its_branch(self, git_repo, capsys):
         manifest = _manifest("lide-2600", ("lide-api", str(git_repo.repo_root)), ("jj-api", "/home/u/jj-api"))
         with patch("cld.ticket._docker_status", return_value="running"), \
              patch("cld.ticket.read_manifest", return_value=manifest), \
@@ -921,8 +1024,21 @@ class TestGitBackendWording:
              patch("cld.ticket.forget_session_state"):
             shutdown_ticket("lide-2600")
         out = capsys.readouterr().out
-        assert "lide-api (git): branch t.lide-2600 and its worktree registration stay in the repo" in out
+        assert "lide-api (git): branch t.lide-2600 and its worktree forgotten" in out
+        assert "kept under refs/cld/ended/t.lide-2600/" in out
         assert "jj-api" not in out
+
+    def test_shutdown_passes_the_container_side_worktree_of_a_git_repo_only(self, git_repo):
+        manifest = _manifest("lide-2600", ("lide-api", str(git_repo.repo_root)), ("jj-api", "/home/u/jj-api"))
+        with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.read_manifest", return_value=manifest), \
+             patch("cld.ticket._stop_and_remove"), \
+             patch("cld.ticket.forget_session_state") as forget:
+            shutdown_ticket("lide-2600")
+        assert forget.call_args_list == [
+            ((str(git_repo.repo_root), "t.lide-2600", "/workspace/lide-2600/lide-api"),),
+            (("/home/u/jj-api", "t.lide-2600"),),
+        ]
 
     def test_unreadable_manifest_hint_has_the_git_commands_too(self, caplog):
         with patch("cld.ticket._docker_status", return_value="stopped"), \

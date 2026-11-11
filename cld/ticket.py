@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -21,6 +22,7 @@ import typer
 from cld.agent_runtime import format_age
 from cld.config import Config
 from cld.docker import (
+    WORKSPACE_BASE,
     _docker_status,
     base_extra_paths,
     build_ticket_container_args,
@@ -42,9 +44,9 @@ from cld.manifest import (
     read_manifest,
     resolve_manifest,
 )
-from cld.names import ticket_id, ticket_slug
+from cld.names import anchor_ref, ended_ref, ticket_id, ticket_slug
 from cld.registry import pick_repos
-from cld.vcs import get_backend
+from cld.vcs import VcsBackend, get_backend
 from cld.vcs.anchor import find_anchor_commit, move_anchor_commit, revert_ops
 from cld.vcs.jj import check_jj_ids
 
@@ -218,7 +220,7 @@ def _print_manifest_diff(diff: ManifestDiff) -> None:
         typer.echo(f"  + {repo.name}  {repo.path}  {repo.anchor_base[:12]} ({repo.anchor_mode})")
     for repo in diff.removed:
         detail = (
-            "torn down: container unmounted, its session branch and worktree stay in the repo; commits survive"
+            "torn down: session branch and worktree forgotten, work on the branch archived; commits survive"
             if _is_git(repo.path)
             else "torn down: bookmark and workspace forgotten; commits survive"
         )
@@ -275,7 +277,7 @@ def start_ticket(cfg: Config, ticket: str, specs: list[str], shared: list[str]) 
                 raise typer.Abort()
             _stop_and_remove(container)
             for repo in diff.removed:
-                forget_session_state(repo.path, container)
+                _forget_repo(repo, container, slug)
             # Kept repos reattach at their bookmarks, so the launched manifest
             # keeps their old anchors -- the newly resolved ones only become
             # real after shutdown + start (see keep_attached_anchors).
@@ -516,20 +518,21 @@ def _teardown(container: str) -> None:
             "cannot read the manifest of '%s': %s. The container is removed "
             "anyway; forget its per-repo state manually with "
             "`jj bookmark forget %s && jj workspace forget %s` in each mounted jj repo "
-            "(in a git repo the session branch and worktree registration are not forgotten "
-            "by shutdown: `git worktree list`, then `git branch -D %s`).",
-            container, e, container, container, container,
+            "(in a git repo: `git worktree list`, unlock and remove this ticket's worktree, "
+            "`git branch -D %s`, then `git update-ref -d %s`).",
+            container, e, container, container, container, anchor_ref(container),
         )
     _stop_and_remove(container)
     for repo in manifest.repos if manifest else ():
-        forget_session_state(repo.path, container)
+        _forget_repo(repo, container, manifest.ticket)
     typer.echo(
         f"Shut down ticket container: {container} (commits survive in every repo store)"
     )
     for repo in manifest.repos if manifest else ():
         if _is_git(repo.path):
             typer.echo(
-                f"  {repo.name} (git): branch {container} and its worktree registration stay in the repo"
+                f"  {repo.name} (git): branch {container} and its worktree forgotten; "
+                f"work on the branch is kept under {ended_ref(container, '<time>')}"
             )
 
 
@@ -552,7 +555,16 @@ def shutdown_all_tickets() -> None:
         _teardown(name)
 
 
-def forget_session_state(repo_root_str: str, session: str) -> None:
+def _forget_repo(repo: RepoManifestEntry, container: str, ticket: str) -> None:
+    """``forget_session_state`` for one manifest repo; a git repo also needs the container-side
+    path of its worktree, which the host cannot derive from the repo."""
+    if _is_git(repo.path):
+        forget_session_state(repo.path, container, f"{WORKSPACE_BASE}/{ticket}/{repo.name}")
+    else:
+        forget_session_state(repo.path, container)
+
+
+def forget_session_state(repo_root_str: str, session: str, worktree_path: str = "") -> None:
     """Drop the session's bookmark and workspace registration from a repo's jj store.
 
     Shared by the v1 agent/task-agent teardown and per-repo ticket
@@ -560,6 +572,9 @@ def forget_session_state(repo_root_str: str, session: str) -> None:
     commit pointer, workspace = registered working-copy path). A workspace
     left behind makes the next first-launch `jj workspace add --name <session>`
     fail with "Workspace named X already exists", leaving the workspace empty.
+
+    A git repo is forgotten only when *worktree_path* (the ticket's worktree inside the
+    container) is given; the task-agent callers have none and leave git alone.
     """
     repo_root = Path(repo_root_str)
     if not repo_root.is_dir():
@@ -581,6 +596,8 @@ def forget_session_state(repo_root_str: str, session: str) -> None:
         )
         return
     if backend.name != "jj":
+        if worktree_path:
+            _forget_git_session_state(backend, session, worktree_path)
         return
     if reason := check_jj_ids(backend.repo_root):
         log.warning(
@@ -599,6 +616,50 @@ def forget_session_state(repo_root_str: str, session: str) -> None:
                 " ".join(cmd), result.returncode, result.stderr.strip(),
                 repo_root, " ".join(cmd),
             )
+
+
+def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: str) -> None:
+    """git shutdown: end the session's lifecycle, keeping the work.
+
+    Order matters: git refuses to delete a checked-out branch, so the worktree
+    registration goes first; the branch tip is archived before the branch is
+    deleted (when it holds work above the scratch commit); the anchor ref goes
+    last, because it is the lifecycle-alive marker -- a partial failure leaves
+    it, and the next start reattaches. Stops at the first failure with the
+    manual command, like the jj forget.
+    """
+    repo_root = backend.repo_root
+    anchor = anchor_ref(session)
+
+    def run(*cmd: str) -> bool:
+        result = backend.run(list(cmd))
+        if result.returncode != 0:
+            log.warning(
+                "git %s failed (rc=%d): %s. The next launch may reattach to stale state; "
+                "recover with: cd %s && git %s",
+                " ".join(cmd), result.returncode, result.stderr.strip(), repo_root, " ".join(cmd),
+            )
+        return result.returncode == 0
+
+    def rev(ref: str) -> str:
+        found = backend.run(["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"])
+        return found.stdout.strip() if found.returncode == 0 else ""
+
+    registered = backend.run(["worktree", "list", "--porcelain"]).stdout.splitlines()
+    if f"worktree {worktree_path}" in registered:
+        # A lock whose directory is gone is what keeps the registration (and a detached HEAD) alive.
+        backend.run(["worktree", "unlock", worktree_path])
+        if not run("worktree", "remove", "--force", worktree_path):
+            return
+    if tip := rev(f"refs/heads/{session}"):
+        if tip != rev(anchor):
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            if not run("update-ref", ended_ref(session, stamp), tip):
+                return
+        if not run("branch", "-D", session):
+            return
+    if rev(anchor):
+        run("update-ref", "-d", anchor)
 
 
 # --- Status / logs ----------------------------------------------------------------
