@@ -132,20 +132,25 @@ def _outside_tree_reason(anchor: Anchor) -> str:
     )
 
 
-def _git_head_vs_anchor(anchor: Anchor) -> tuple[bool, bool]:
-    """``(HEAD is the anchor or descends from it, HEAD is the anchor itself)`` in the workspace.
-    Raises CalledProcessError when HEAD or the anchor does not resolve."""
-    head = subprocess.run(
-        ["git", "-C", anchor.workspace, "rev-parse", "HEAD", anchor.anchor],
-        capture_output=True, text=True, timeout=JJ_TIMEOUT, check=True,
-    ).stdout.split()
+def _git_head_in_tree(anchor: Anchor) -> bool:
+    """True if HEAD is the anchor or descends from it. File writes land in the working tree,
+    never in HEAD, so HEAD in ``A::`` is the git analogue of jj's ``@`` in ``A+::``: the anchor
+    is the scratch commit a git workspace starts at. Raises RuntimeError when HEAD or the
+    anchor does not resolve (a missing anchor object: an amended or dropped scratch commit)."""
     ancestor = subprocess.run(
         ["git", "-C", anchor.workspace, "merge-base", "--is-ancestor", anchor.anchor, "HEAD"],
         capture_output=True, text=True, timeout=JJ_TIMEOUT,
     )
     if ancestor.returncode not in (0, 1):
         raise RuntimeError(f"git merge-base failed in {anchor.workspace}: {ancestor.stderr.strip()}")
-    return ancestor.returncode == 0, head[0] == head[1]
+    return ancestor.returncode == 0
+
+
+def _git_outside_tree_reason(anchor: Anchor) -> str:
+    return (
+        f"HEAD in {anchor.workspace} is outside the anchor tree: the anchor {anchor.anchor} is not "
+        "an ancestor of it. Check out the session branch, or any commit descending from the anchor, first."
+    )
 
 
 def check_file(path: str, anchors: list[Anchor]) -> str | None:
@@ -162,13 +167,9 @@ def check_file(path: str, anchors: list[Anchor]) -> str | None:
         if _log_ids(anchor.workspace, f"@ & change_id({anchor.anchor})+::"):
             return None
         return f"Rule 'file write outside anchor tree': {_outside_tree_reason(anchor)}"
-    in_tree, at_anchor = _git_head_vs_anchor(anchor)
-    if in_tree and not at_anchor:
+    if _git_head_in_tree(anchor):
         return None
-    return (
-        f"Rule 'file write outside anchor tree': HEAD in {anchor.workspace} is not a strict descendant "
-        f"of the anchor {anchor.anchor}. Check out a commit descending from it first."
-    )
+    return f"Rule 'file write outside anchor tree': {_git_outside_tree_reason(anchor)}"
 
 
 def _simple_commands(command: str, cwd: str) -> list[tuple[list[str], str]]:
@@ -377,21 +378,14 @@ def check_bash(command: str, cwd: str, anchors: list[Anchor]) -> str | None:
 
 
 def _git_drift(anchor: Anchor) -> list[str]:
-    """Unlike ``check_file``, HEAD at the anchor is no drift: a git workspace starts there
-    (no scratch commit), and only HEAD off the anchor's descendants is outside the tree."""
     try:
-        in_tree, _ = _git_head_vs_anchor(anchor)
-    except (subprocess.CalledProcessError, RuntimeError):
+        in_tree = _git_head_in_tree(anchor)
+    except RuntimeError:
         return [
             f"{anchor.repo}: HEAD or the anchor {anchor.anchor} no longer resolves. "
             "Stop and report this; do not write files."
         ]
-    if in_tree:
-        return []
-    return [
-        f"{anchor.repo}: HEAD in {anchor.workspace} is outside the anchor tree: the anchor "
-        f"{anchor.anchor} is not an ancestor of it. Check out a commit descending from it first."
-    ]
+    return [] if in_tree else [f"{anchor.repo}: {_git_outside_tree_reason(anchor)}"]
 
 
 def check_drift(anchors: list[Anchor]) -> str | None:

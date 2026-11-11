@@ -423,8 +423,26 @@ class TestGitFileRule:
         )
         return path, git
 
-    def test_head_is_anchor_denied(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
-        assert repo.file(git_repo[0] / "a.txt") == "deny"
+    def test_head_is_anchor_allowed(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
+        """A git workspace starts at its anchor (the scratch commit): the first edit must pass."""
+        assert repo.file(git_repo[0] / "a.txt") is None
+
+    def test_head_before_the_anchor_denied(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
+        path, git = git_repo
+        git("commit", "-q", "--allow-empty", "-m", "two")
+        repo.register(
+            {"repo": "g", "workspace": str(path), "anchor": git("rev-parse", "HEAD"), "mode": "isolated", "backend": "git"},
+        )
+        git("checkout", "-q", "--detach", "HEAD~1")
+        assert repo.file(path / "a.txt") == "deny"
+
+    def test_detached_head_inside_the_tree_allowed(
+        self, repo: Repo, git_repo: tuple[Path, Callable[..., str]],
+    ) -> None:
+        path, git = git_repo
+        git("checkout", "-q", "--detach")
+        git("commit", "-q", "--allow-empty", "-m", "detached work")
+        assert repo.file(path / "a.txt") is None
 
     def test_descendant_allowed(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
         path, git = git_repo
@@ -439,8 +457,14 @@ class TestGitFileRule:
 
 
     def test_drift_silent_at_the_anchor(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
-        """A git workspace starts at its anchor (no scratch commit): that is no drift."""
         assert repo.post() is None
+
+    def test_drift_blocks_after_the_anchor_commit_is_amended(
+        self, repo: Repo, git_repo: tuple[Path, Callable[..., str]],
+    ) -> None:
+        """The anchor object stays, but HEAD (the amended commit) no longer descends from it."""
+        git_repo[1]("commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+        assert repo.post() == "block"
 
     def test_drift_silent_on_a_descendant(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
         git_repo[1]("commit", "-q", "--allow-empty", "-m", "two")
