@@ -20,6 +20,7 @@ from cld.ticket import (
     _bookmark_tip,
     _echo_new_log_lines,
     _parse_reanchor,
+    _rebase_hint,
     _session_state,
     exec_claude,
     exec_shell,
@@ -529,16 +530,82 @@ class TestReanchorRestart:
         run.assert_not_called()
         launch.assert_not_called()
 
-    def test_git_repo_is_refused(self):
+    def test_git_repo_goes_through_the_same_helpers(self):
+        manifest = self._manifest()
+        patches, backend, move = self._patches(manifest, backend=self._jj_backend("git"))
+        with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
+             patches["get_backend"], patches["find_anchor"] as find, patches["resolver"], \
+             patches["move"], patches["revert"], patches["subprocess_run"], \
+             patches["launch"] as launch, patches["warm_start"]:
+            restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
+        find.assert_called_once_with(backend, "t.lide-2600")
+        move.assert_called_once_with(backend, "s" * 40, "d" * 40, "isolated", "t.lide-2600")
+        assert launch.call_args.args[1].repos[0].anchor_base == "d" * 40
+
+    def test_git_repo_without_an_anchor_ref_stops_nothing(self):
+        manifest = self._manifest()
+        patches, backend, move = self._patches(manifest, backend=self._jj_backend("git"))
+        with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
+             patches["get_backend"], patch("cld.ticket.find_anchor_commit", side_effect=RuntimeError("no anchor ref")), \
+             patches["resolver"], patches["move"] as move_mock, patches["subprocess_run"] as run, \
+             pytest.raises(RuntimeError, match="no anchor ref"):
+            restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
+        move_mock.assert_not_called()
+        run.assert_not_called()
+
+    def test_git_second_repo_failing_reverts_the_first_ref_entries(self):
+        manifest = self._manifest()
+        entries = ["refs/heads/t.lide-2600 " + "s" * 40 + " " + "n" * 40, "refs/cld/anchor/t.lide-2600 " + "s" * 40 + " " + "n" * 40]
+
+        def move_side_effect(backend, s_hash, target, mode, session):
+            if target == "d" * 40:
+                return entries
+            raise RuntimeError("git update-ref failed")
+
+        def fake_resolver(cfg, exclude_session=""):
+            def resolve(path, revision, mode):
+                return "d" * 40 if "lide-api" in path else "e" * 40
+            return resolve
+
+        with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.read_manifest", return_value=manifest), \
+             patch("cld.ticket._session_state", return_value="none"), \
+             patch("cld.ticket.get_backend", return_value=self._jj_backend("git")), \
+             patch("cld.ticket.find_anchor_commit", return_value="s" * 40), \
+             patch("cld.ticket.ticket_anchor_resolver", fake_resolver), \
+             patch("cld.ticket.move_anchor_commit", side_effect=move_side_effect), \
+             patch("cld.ticket.revert_ops") as revert, \
+             patch("cld.ticket.subprocess.run", return_value=_res()), \
+             patch("cld.ticket._launch") as launch, \
+             patch("cld.ticket._warm_start") as warm, \
+             pytest.raises(RuntimeError, match="reanchor failed"):
+            restart_ticket(Config(), "lide-2600", ["lide-api@feature-x", "diskuze-api@feature-y"])
+        revert.assert_called_once_with(revert.call_args.args[0], entries)
+        warm.assert_called_once()
+        launch.assert_not_called()
+
+    def test_hint_for_a_branch_that_kept_its_work_is_printed(self, capsys):
         manifest = self._manifest()
         patches, backend, move = self._patches(manifest, backend=self._jj_backend("git"))
         with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
              patches["get_backend"], patches["find_anchor"], patches["resolver"], \
-             patches["move"] as move_mock, patches["subprocess_run"] as run, \
-             pytest.raises(RuntimeError, match="needs jj"):
+             patches["move"], patches["revert"], patches["subprocess_run"], \
+             patch("cld.ticket._rebase_hint", return_value="git rebase --onto N S t.lide-2600"), \
+             patches["launch"], patches["warm_start"]:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
-        move_mock.assert_not_called()
-        run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "lide-api: branch t.lide-2600 keeps its work on the old anchor commit" in out
+        assert "git rebase --onto N S t.lide-2600" in out
+
+    def test_no_hint_line_for_jj(self, capsys):
+        manifest = self._manifest()
+        patches, backend, move = self._patches(manifest)
+        with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
+             patches["get_backend"], patches["find_anchor"], patches["resolver"], \
+             patches["move"], patches["revert"], patches["subprocess_run"], \
+             patches["launch"], patches["warm_start"]:
+            restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
+        assert "keeps its work" not in capsys.readouterr().out
 
     @pytest.mark.parametrize(
         ("spec", "expect"),
@@ -656,6 +723,43 @@ class TestReanchorRestart:
              patches["launch"], patches["warm_start"]:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
         assert rc[0][3] == "t.lide-2600"
+
+
+class TestRebaseHint:
+    """The hint is for a git session branch that kept its work above the old anchor commit."""
+
+    SESSION = "t.x"
+
+    def _setup(self, git_repo, *, branch_follows: bool) -> tuple[str, str]:
+        old = git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
+        git_repo.run(["commit", "-q", "--allow-empty", "-m", "new anchor"])
+        new = git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
+        git_repo.run(["update-ref", f"refs/cld/anchor/{self.SESSION}", new])
+        git_repo.run(["update-ref", f"refs/heads/{self.SESSION}", new if branch_follows else old])
+        return old, new
+
+    def test_branch_that_kept_its_work_gets_the_rebase_command(self, git_repo):
+        old, new = self._setup(git_repo, branch_follows=False)
+        assert _rebase_hint(git_repo, self.SESSION, old) == f"git rebase --onto {new} {old} {self.SESSION}"
+
+    def test_branch_that_followed_the_anchor_needs_none(self, git_repo):
+        old, _new = self._setup(git_repo, branch_follows=True)
+        assert _rebase_hint(git_repo, self.SESSION, old) == ""
+
+    def test_anchor_that_did_not_move_needs_none(self, git_repo):
+        _old, new = self._setup(git_repo, branch_follows=False)
+        assert _rebase_hint(git_repo, self.SESSION, new) == ""
+
+    def test_missing_branch_needs_none(self, git_repo):
+        old, _new = self._setup(git_repo, branch_follows=False)
+        git_repo.run(["update-ref", "-d", f"refs/heads/{self.SESSION}"])
+        assert _rebase_hint(git_repo, self.SESSION, old) == ""
+
+    def test_jj_needs_none(self):
+        backend = MagicMock()
+        backend.name = "jj"
+        assert _rebase_hint(backend, self.SESSION, "s" * 40) == ""
+        backend.run.assert_not_called()
 
 
 class TestStopTicket:

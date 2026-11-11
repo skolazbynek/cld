@@ -416,7 +416,7 @@ def _reanchor_restart(
 ) -> None:
     """The ``--reanchor`` path of ``restart_ticket`` (design section 5).
 
-    Validates everything -- parsing, the live-session refusal, jj-only, S
+    Validates everything -- parsing, the live-session refusal, S
     found, T resolved -- before touching the container, so a rejected request
     stops nothing. Then stops (not removes) a running container, moves each
     repo's anchor commit, and only removes + relaunches once every move has
@@ -435,8 +435,6 @@ def _reanchor_restart(
     for name, revision in targets.items():
         repo = by_name[name]
         backend = get_backend(Path(repo.path))
-        if backend.name != "jj":
-            raise RuntimeError(f"'{name}': --reanchor needs jj, this repo is '{backend.name}'")
         s_hash = find_anchor_commit(backend, container)
         target = resolver(repo.path, revision, repo.anchor_mode)
         plan.append((name, backend, s_hash, target))
@@ -447,12 +445,14 @@ def _reanchor_restart(
 
     done: list[tuple[object, list[str]]] = []
     moved: dict[str, tuple[str, str]] = {}
+    hints: dict[str, str] = {}
     try:
         for name, backend, s_hash, target in plan:
             repo = by_name[name]
             ops = move_anchor_commit(backend, s_hash, target, repo.anchor_mode, container)
             done.append((backend, ops))
             moved[name] = (repo.anchor_base, target)
+            hints[name] = _rebase_hint(backend, container, s_hash)
     except RuntimeError as e:
         for backend, ops in reversed(done):
             revert_ops(backend, ops)
@@ -473,7 +473,28 @@ def _reanchor_restart(
             f"  {name}: anchor {old_base[:12]} -> {new_base[:12]} "
             f"(undo: cld restart {slug} --reanchor {name}@{old_base})"
         )
+        if hints[name]:
+            typer.echo(
+                f"  {name}: branch {container} keeps its work on the old anchor commit; carry it over "
+                f"where it is checked out (`cld shell {slug}`, then cd to {name}): {hints[name]}"
+            )
     typer.echo(f"Ticket '{slug}' recreated with {len(moved)} repo anchor(s) moved.")
+
+
+def _rebase_hint(backend: VcsBackend, container: str, old_anchor: str) -> str:
+    """git only: the ``git rebase --onto`` that moves the session branch onto the moved anchor
+    commit, when the branch did not follow it because it holds work above the old one."""
+    if backend.name != "git":
+        return ""
+
+    def rev(ref: str) -> str:
+        found = backend.run(["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"])
+        return found.stdout.strip() if found.returncode == 0 else ""
+
+    new_anchor, tip = rev(anchor_ref(container)), rev(f"refs/heads/{container}")
+    if not tip or new_anchor in (old_anchor, tip):
+        return ""
+    return f"git rebase --onto {new_anchor} {old_anchor} {container}"
 
 
 def restart_ticket(cfg: Config, ticket: str, reanchor: tuple[str, ...] = ()) -> None:

@@ -11,12 +11,16 @@ Anchor staging (creating a child commit B of the resolved anchor A containing
 `.cld-run/*`) lives in :mod:`cld.vcs.scratch`. The container ephemeral
 workspace layout means no host-side workspace directory is ever created; jj
 bookmarks + watchman snapshots against the origin's `.jj/repo/store` provide
-persistence across `docker rm && docker run`.
+persistence across `docker rm && docker run`. A git ticket gets the same
+commit, pinned by the hidden ref ``refs/cld/anchor/<session>`` instead of a
+bookmark; the ``--reanchor`` helpers below (``find_anchor_commit``,
+``move_anchor_commit``, ``revert_ops``) handle both backends.
 """
 
 from pathlib import Path
 
 from cld.log import get_logger
+from cld.names import anchor_ref
 from cld.vcs import VcsBackend, get_backend
 
 log = get_logger(__name__)
@@ -109,16 +113,34 @@ def assert_deliverable_free(vcs: VcsBackend, bookmark: str, anchor_hash: str) ->
         )
 
 
-def find_anchor_commit(vcs: VcsBackend, session: str) -> str:
-    """Find the change id of a ticket's own scratch commit S: the commit at or below the
-    *session* bookmark (which sits on the anchor) carrying its own ``cld anchor: <session> mode=<mode>`` staging
-    description (the same revset ``cld_recover_anchor`` and ``_effective_anchor``
-    use to find it -- see ``imgs/claude-devcontainer/vcs-lib.sh`` and
-    ``cld/docker.py``). jj-only.
+def _git_rev(vcs: VcsBackend, rev: str) -> str:
+    """Commit hash *rev* resolves to, empty when it does not."""
+    result = vcs.run(["rev-parse", "--verify", "-q", f"{rev}^{{commit}}"])
+    return result.stdout.strip() if result.returncode == 0 else ""
 
-    Raises RuntimeError if zero or more than one commit matches -- either
+
+def find_anchor_commit(vcs: VcsBackend, session: str) -> str:
+    """Find a ticket's own scratch commit S: its change id on jj, its commit hash on git.
+
+    jj: the commit at or below the *session* bookmark (which sits on the anchor) carrying its own
+    ``cld anchor: <session> mode=<mode>`` staging description (the same revset ``cld_recover_anchor``
+    and ``_effective_anchor`` use to find it -- see ``imgs/claude-devcontainer/vcs-lib.sh`` and
+    ``cld/docker.py``). Raises RuntimeError if zero or more than one commit matches -- either
     means the caller cannot safely identify which commit is S.
+
+    git: the commit ``refs/cld/anchor/<session>`` points at, which must carry that same
+    description. Raises RuntimeError when the ref is missing (a ticket from before the scratch commit).
     """
+    if vcs.name == "git":
+        ref = anchor_ref(session)
+        found = _git_rev(vcs, ref)
+        if not found:
+            raise RuntimeError(
+                f"no anchor ref {ref} for session {session!r}; shut the ticket down and start it once to stage one"
+            )
+        if not vcs.get_description(found).startswith(f"cld anchor: {session} "):
+            raise RuntimeError(f"{ref} points at {found[:12]}, which is not a scratch commit of {session!r}")
+        return found
     revset = (
         f"heads(descendants({session}) & description(glob:'cld anchor: {session} *'))"
     )
@@ -167,8 +189,16 @@ def _conflicted_change_ids(vcs: VcsBackend) -> set[str]:
 
 def revert_ops(vcs: VcsBackend, op_ids: list[str]) -> None:
     """``jj op revert`` every id in *op_ids*, newest first (the order they are
-    already recorded in by ``move_anchor_commit``)."""
+    already recorded in by ``move_anchor_commit``). On git an entry is
+    ``<ref> <old> <new>`` and is undone by ``git update-ref <ref> <old> <new>``,
+    which refuses when the ref has moved on meanwhile."""
     for op_id in op_ids:
+        if vcs.name == "git":
+            ref, old, new = op_id.split()
+            result = vcs.run(["update-ref", ref, old, new])
+            if result.returncode != 0:
+                raise RuntimeError(f"git update-ref {ref} {old} {new} failed: {(result.stderr or '').strip()}")
+            continue
         result = vcs.run(["op", "revert", op_id])
         if result.returncode != 0:
             raise RuntimeError(
@@ -176,11 +206,45 @@ def revert_ops(vcs: VcsBackend, op_ids: list[str]) -> None:
             )
 
 
+def _move_anchor_commit_git(vcs: VcsBackend, anchor: str, target: str, session: str) -> list[str]:
+    target_commit = _git_rev(vcs, target)
+    if not target_commit:
+        raise RuntimeError(f"could not resolve the reanchor target {target!r}")
+    if _git_rev(vcs, f"{anchor}^") == target_commit:
+        return []
+    changed = vcs.run(["diff", "--quiet", f"{anchor}^", anchor])
+    if changed.returncode != 0:
+        raise RuntimeError(
+            f"anchor commit {anchor[:12]} carries changes (a brief), which cannot be moved on git"
+            if changed.returncode == 1
+            else f"could not compare anchor commit {anchor[:12]} with its parent: {(changed.stderr or '').strip()}"
+        )
+    # Host-side commit-tree: no working tree is involved, and S' is a plain child of the target.
+    created = vcs.run([
+        "commit-tree", f"{target_commit}^{{tree}}", "-p", target_commit, "-m", vcs.get_description(anchor),
+    ])
+    if created.returncode != 0:
+        raise RuntimeError(f"git commit-tree failed: {(created.stderr or '').strip()}")
+    new_anchor = created.stdout.strip()
+
+    refs = [anchor_ref(session)]
+    if _git_rev(vcs, f"refs/heads/{session}") == anchor:
+        refs.append(f"refs/heads/{session}")
+    ops: list[str] = []
+    for ref in refs:
+        result = vcs.run(["update-ref", ref, new_anchor, anchor])
+        if result.returncode != 0:
+            revert_ops(vcs, ops)
+            raise RuntimeError(f"git update-ref {ref} failed: {(result.stderr or '').strip()}")
+        ops.insert(0, f"{ref} {anchor} {new_anchor}")
+    return ops
+
+
 def move_anchor_commit(
     vcs: VcsBackend, anchor: str, target: str, mode: str, session: str,
 ) -> list[str]:
-    """Move a ticket's scratch commit S onto *target* (design section 3). Both
-    are change ids, so S keeps its id across the move:
+    """Move a ticket's scratch commit S onto *target* (design section 3). On jj
+    both are change ids, so S keeps its id across the move:
 
     - isolated: ``jj rebase -r S -o target`` -- only S moves; S's own old
       children stay behind on S's old parent.
@@ -195,11 +259,20 @@ def move_anchor_commit(
     Already-in-place rule: if S's current parent already is *target*, no
     jj command runs at all (this is what makes undo idempotent).
 
+    git (*mode* is not used): S is immutable, so a new S' with the same message is
+    committed as a plain child of *target*, and the anchor ref is moved onto it
+    with a compare-and-swap. The session branch follows only when it still points
+    at S; work above S stays on the old S (the caller prints the ``git rebase
+    --onto`` that carries it over). S must be empty, and unlike jj the other
+    children of *target* are not moved. Undo entries are ``<ref> <old> <new>``.
+
     Returns the op ids this call created, newest first, so a caller that
     fails on a later repo can revert them with ``revert_ops``. Raises
     RuntimeError -- after reverting its own ops -- on a jj command failure or
     on a new conflict appearing that was not there before.
     """
+    if vcs.name == "git":
+        return _move_anchor_commit_git(vcs, anchor, target, session)
     current_parent = vcs.run(
         ["log", "-r", f"parents({anchor})", "--no-graph", "-T", "change_id", "-n", "1"],
     ).stdout.strip()

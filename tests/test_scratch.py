@@ -580,3 +580,115 @@ class TestRevertOps:
         assert _rev(jj_repo, f"parents({s_hash})") == base
         # The bookmark should have followed the revert back onto S.
         assert _rev(jj_repo, session) == _rev(jj_repo, s_hash)
+
+
+# --- git: the same helpers over the hidden anchor ref --------------------------
+
+
+GIT_SESSION = "t.mv"
+
+
+def _git_stage(git_repo, tmp_path, files=None, work=False):
+    """Stage S (as the container entrypoint would) in a worktree on branch GIT_SESSION, and
+    create a target commit T next to the base A. Returns (base, s_hash, target, peer)."""
+    base = _git(git_repo, "rev-parse", "HEAD")
+    peer = _make_git_peer(git_repo, base, tmp_path, branch=GIT_SESSION)
+    s_hash = stage_in_workspace(peer, GIT_SESSION, files or {})
+    if work:
+        (peer / "work.txt").write_text("work\n")
+        _git(git_repo, "-C", str(peer), "add", "work.txt")
+        _git(git_repo, "-C", str(peer), "commit", "-q", "-m", "C")
+    (git_repo.repo_root / "t.txt").write_text("target\n")
+    _git(git_repo, "add", "t.txt")
+    _git(git_repo, "commit", "-q", "-m", "T")
+    return base, s_hash, _git(git_repo, "rev-parse", "HEAD"), peer
+
+
+class TestFindAnchorCommitGit:
+    def test_finds_the_pinned_scratch_commit(self, git_repo, tmp_path):
+        _base, s_hash, _t, _peer = _git_stage(git_repo, tmp_path, work=True)
+        assert find_anchor_commit(git_repo, GIT_SESSION) == s_hash
+
+    def test_a_missing_ref_raises_with_the_fix(self, git_repo):
+        with pytest.raises(RuntimeError, match="no anchor ref refs/cld/anchor/t.nope.*start it once"):
+            find_anchor_commit(git_repo, "t.nope")
+
+    def test_a_ref_on_a_foreign_commit_raises(self, git_repo):
+        _git(git_repo, "update-ref", anchor_ref("t.odd"), "HEAD")
+        with pytest.raises(RuntimeError, match="not a scratch commit"):
+            find_anchor_commit(git_repo, "t.odd")
+
+
+class TestMoveAnchorCommitGit:
+    @pytest.mark.parametrize("mode", ["isolated", "shared"])
+    def test_s_is_recommitted_as_a_child_of_the_target(self, git_repo, tmp_path, mode):
+        _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        message = _git(git_repo, "log", "-1", "--format=%B", s_hash)
+
+        ops = move_anchor_commit(git_repo, s_hash, target, mode, GIT_SESSION)
+
+        new = _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION))
+        assert new != s_hash
+        assert _git(git_repo, "rev-parse", f"{new}^") == target
+        assert _git(git_repo, "log", "-1", "--format=%B", new) == message
+        assert _git(git_repo, "rev-parse", f"{new}^{{tree}}") == _git(git_repo, "rev-parse", f"{target}^{{tree}}")
+        assert ops[-1] == f"{anchor_ref(GIT_SESSION)} {s_hash} {new}"
+        assert find_anchor_commit(git_repo, GIT_SESSION) == new
+
+    def test_a_branch_at_s_follows(self, git_repo, tmp_path):
+        _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        ops = move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        new = _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION))
+        assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == new
+        assert len(ops) == 2
+        assert ops[0].startswith(f"refs/heads/{GIT_SESSION} ")
+
+    def test_a_branch_with_work_stays_on_the_old_commit(self, git_repo, tmp_path):
+        _base, s_hash, target, peer = _git_stage(git_repo, tmp_path, work=True)
+        tip = _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}")
+        ops = move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == tip
+        assert _git(git_repo, "rev-parse", f"{tip}^") == s_hash
+        assert len(ops) == 1
+
+    def test_already_in_place_changes_nothing(self, git_repo, tmp_path):
+        base, s_hash, _target, _peer = _git_stage(git_repo, tmp_path)
+        assert move_anchor_commit(git_repo, s_hash, base, "isolated", GIT_SESSION) == []
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
+
+    def test_a_scratch_commit_with_a_brief_is_refused(self, git_repo, tmp_path):
+        _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path, files={"brief.md": b"x\n"})
+        with pytest.raises(RuntimeError, match="carries changes"):
+            move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
+
+    def test_an_unresolvable_target_is_refused(self, git_repo, tmp_path):
+        _base, s_hash, _target, _peer = _git_stage(git_repo, tmp_path)
+        with pytest.raises(RuntimeError, match="could not resolve the reanchor target"):
+            move_anchor_commit(git_repo, s_hash, "no-such-rev", "isolated", GIT_SESSION)
+
+    def test_a_ref_moved_meanwhile_fails_without_changes(self, git_repo, tmp_path):
+        base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        _git(git_repo, "update-ref", anchor_ref(GIT_SESSION), base)
+        with pytest.raises(RuntimeError, match="update-ref"):
+            move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == base
+        assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == s_hash
+
+
+class TestRevertOpsGit:
+    def test_restores_the_ref_and_the_branch(self, git_repo, tmp_path):
+        _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        ops = move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+
+        revert_ops(git_repo, ops)
+
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
+        assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == s_hash
+
+    def test_a_ref_moved_since_fails(self, git_repo, tmp_path):
+        base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        ops = move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        _git(git_repo, "update-ref", anchor_ref(GIT_SESSION), base)
+        with pytest.raises(RuntimeError, match="update-ref"):
+            revert_ops(git_repo, ops)

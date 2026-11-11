@@ -681,7 +681,8 @@ def restart(
         [], "--reanchor", metavar="REPO@REV",
         help="Move a repo's anchor commit onto REV before recreating "
         "(repeatable; REV defaults to '@', the host working copy; "
-        "bare REV allowed on a one-repo ticket).",
+        "bare REV allowed on a one-repo ticket). Works on jj and git repos; on git a session "
+        "branch holding work stays on the old anchor commit and a rebase command is printed.",
     ),
 ):
     """Recreate a ticket container from its persisted manifest; workspaces reattach at their bookmarks.
