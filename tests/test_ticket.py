@@ -16,6 +16,7 @@ from cld.config import Config
 from cld.manifest import RepoManifestEntry, TicketManifest, manifest_labels
 from cld.registry import RepoEntry
 from cld.ticket import (
+    _bookmark_tip,
     _echo_new_log_lines,
     _parse_reanchor,
     _session_state,
@@ -24,6 +25,7 @@ from cld.ticket import (
     forget_session_state,
     list_tickets,
     print_ticket_detail,
+    _print_manifest_diff,
     print_ticket_logs,
     print_ticket_roster,
     ready_timeout,
@@ -870,6 +872,72 @@ class TestStatus:
     def test_list_tickets_docker_failure_reads_as_none(self):
         with patch("cld.ticket.subprocess.run", return_value=_res(1)):
             assert list_tickets() == []
+
+
+class TestGitBackendWording:
+    """A git repo has a session branch and a worktree, no bookmark and workspace: tips and
+    messages say so. Shutdown itself leaves git state alone (forget_session_state)."""
+
+    def test_bookmark_tip_is_the_session_branch_tip(self, git_repo):
+        git_repo.create_branch("t.lide-2600")
+        tip = git_repo.run(["rev-parse", "--short=12", "refs/heads/t.lide-2600"]).stdout.strip()
+        assert _bookmark_tip(str(git_repo.repo_root), "t.lide-2600") == tip
+        assert len(tip) == 12
+
+    def test_bookmark_tip_is_a_dash_without_the_branch(self, git_repo):
+        assert _bookmark_tip(str(git_repo.repo_root), "t.lide-2600") == "-"
+
+    def test_manifest_diff_names_the_branch_not_a_bookmark(self, git_repo, capsys):
+        entry = RepoManifestEntry(name="gone", path=str(git_repo.repo_root), anchor_base="c" * 40)
+        _print_manifest_diff(MagicMock(added=(), removed=(entry,), changed=()))
+        out = capsys.readouterr().out
+        assert "session branch and worktree stay in the repo" in out
+        assert "bookmark" not in out
+
+    def test_manifest_diff_keeps_the_jj_wording_for_a_jj_repo(self, capsys):
+        entry = RepoManifestEntry(name="gone", path="/home/u/gone", anchor_base="c" * 40)
+        _print_manifest_diff(MagicMock(added=(), removed=(entry,), changed=()))
+        assert "torn down: bookmark and workspace forgotten; commits survive" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("path", "ref"), [("git", "branches"), ("/home/u/lide-api", "bookmarks")], ids=["git", "jj"],
+    )
+    def test_restart_message_names_what_it_reattaches_at(self, git_repo, capsys, path, ref):
+        repo_path = str(git_repo.repo_root) if path == "git" else path
+        manifest = _manifest("lide-2600", ("lide-api", repo_path))
+        with patch("cld.ticket._docker_status", return_value="stopped"), \
+             patch("cld.ticket.read_manifest", return_value=manifest), \
+             patch("cld.ticket.prepare_store_mounts"), \
+             patch("cld.ticket._stop_and_remove"), \
+             patch("cld.ticket._launch"):
+            restart_ticket(Config(), "lide-2600")
+        assert f"reattached at their {ref})" in capsys.readouterr().out
+
+    def test_shutdown_tells_that_a_git_repo_keeps_its_branch(self, git_repo, capsys):
+        manifest = _manifest("lide-2600", ("lide-api", str(git_repo.repo_root)), ("jj-api", "/home/u/jj-api"))
+        with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.read_manifest", return_value=manifest), \
+             patch("cld.ticket._stop_and_remove"), \
+             patch("cld.ticket.forget_session_state"):
+            shutdown_ticket("lide-2600")
+        out = capsys.readouterr().out
+        assert "lide-api (git): branch t.lide-2600 and its worktree registration stay in the repo" in out
+        assert "jj-api" not in out
+
+    def test_unreadable_manifest_hint_has_the_git_commands_too(self, caplog):
+        with patch("cld.ticket._docker_status", return_value="stopped"), \
+             patch("cld.ticket.read_manifest", side_effect=RuntimeError("no label")), \
+             patch("cld.ticket._stop_and_remove"), \
+             caplog.at_level("WARNING"):
+            shutdown_ticket("lide-2600")
+        assert "jj bookmark forget t.lide-2600 && jj workspace forget t.lide-2600" in caplog.text
+        assert "git branch -D t.lide-2600" in caplog.text
+
+    def test_forget_hint_for_a_missing_repo_has_the_git_commands_too(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            forget_session_state(str(tmp_path / "gone"), "t.x")
+        assert "jj bookmark forget t.x && jj workspace forget t.x" in caplog.text
+        assert "git branch -D t.x" in caplog.text
 
 
 class TestLogs:

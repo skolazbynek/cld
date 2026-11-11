@@ -204,14 +204,25 @@ def _entry_change(old, new) -> str:
     return ", ".join(parts)
 
 
+def _is_git(path: str) -> bool:
+    """True when the repo at *path* is driven through git (no jj backend); a path
+    with no repo reads as jj, the default wording."""
+    try:
+        return get_backend(Path(path)).name == "git"
+    except RuntimeError:
+        return False
+
+
 def _print_manifest_diff(diff: ManifestDiff) -> None:
     for repo in diff.added:
         typer.echo(f"  + {repo.name}  {repo.path}  {repo.anchor_base[:12]} ({repo.anchor_mode})")
     for repo in diff.removed:
-        typer.echo(
-            f"  - {repo.name}  {repo.path}  "
-            "(torn down: bookmark and workspace forgotten; commits survive)"
+        detail = (
+            "torn down: container unmounted, its session branch and worktree stay in the repo; commits survive"
+            if _is_git(repo.path)
+            else "torn down: bookmark and workspace forgotten; commits survive"
         )
+        typer.echo(f"  - {repo.name}  {repo.path}  ({detail})")
     for old, new in diff.changed:
         typer.echo(f"  ~ {new.name}  {_entry_change(old, new)}")
 
@@ -487,9 +498,10 @@ def restart_ticket(cfg: Config, ticket: str, reanchor: tuple[str, ...] = ()) -> 
         return
     _stop_and_remove(container)
     _launch(cfg, manifest)
+    ref = " or ".join(sorted({"branches" if _is_git(repo.path) else "bookmarks" for repo in manifest.repos}))
     typer.echo(
         f"Ticket '{slug}' recreated from its manifest "
-        f"({len(manifest.repos)} repo(s) reattached at their bookmarks)."
+        f"({len(manifest.repos)} repo(s) reattached at their {ref})."
     )
 
 
@@ -503,8 +515,10 @@ def _teardown(container: str) -> None:
         log.warning(
             "cannot read the manifest of '%s': %s. The container is removed "
             "anyway; forget its per-repo state manually with "
-            "`jj bookmark forget %s && jj workspace forget %s` in each mounted repo.",
-            container, e, container, container,
+            "`jj bookmark forget %s && jj workspace forget %s` in each mounted jj repo "
+            "(in a git repo the session branch and worktree registration are not forgotten "
+            "by shutdown: `git worktree list`, then `git branch -D %s`).",
+            container, e, container, container, container,
         )
     _stop_and_remove(container)
     for repo in manifest.repos if manifest else ():
@@ -512,6 +526,11 @@ def _teardown(container: str) -> None:
     typer.echo(
         f"Shut down ticket container: {container} (commits survive in every repo store)"
     )
+    for repo in manifest.repos if manifest else ():
+        if _is_git(repo.path):
+            typer.echo(
+                f"  {repo.name} (git): branch {container} and its worktree registration stay in the repo"
+            )
 
 
 def shutdown_ticket(ticket: str) -> None:
@@ -546,8 +565,9 @@ def forget_session_state(repo_root_str: str, session: str) -> None:
     if not repo_root.is_dir():
         log.warning(
             "Cannot clean up session state for %s: repo_root %s no longer exists. "
-            "Recover manually with: cd <repo> && jj bookmark forget %s && jj workspace forget %s",
-            session, repo_root, session, session,
+            "Recover manually with: cd <repo> && jj bookmark forget %s && jj workspace forget %s "
+            "(a git repo: `git worktree list`, then `git branch -D %s`)",
+            session, repo_root, session, session, session,
         )
         return
     try:
@@ -555,8 +575,9 @@ def forget_session_state(repo_root_str: str, session: str) -> None:
     except RuntimeError as e:
         log.warning(
             "Cannot clean up session state for %s in %s: %s. "
-            "Recover manually with: cd %s && jj bookmark forget %s && jj workspace forget %s",
-            session, repo_root, e, repo_root, session, session,
+            "Recover manually with: cd %s && jj bookmark forget %s && jj workspace forget %s "
+            "(a git repo: `git worktree list`, then `git branch -D %s`)",
+            session, repo_root, e, repo_root, session, session, session,
         )
         return
     if backend.name != "jj":
@@ -627,8 +648,9 @@ def _uptime(container: str) -> str:
 
 
 def _bookmark_tip(repo_path: str, bookmark: str) -> str:
-    """Current commit of the ticket's bookmark in *repo_path*'s store; '-'
-    where it cannot be read (git backend, forgotten bookmark, missing repo)."""
+    """Current commit of the ticket's bookmark (jj) or session branch (git) in
+    *repo_path*'s store; '-' where it cannot be read (forgotten bookmark or
+    branch, missing repo)."""
     path = Path(repo_path)
     if not path.is_dir():
         return "-"
@@ -637,7 +659,9 @@ def _bookmark_tip(repo_path: str, bookmark: str) -> str:
     except RuntimeError:
         return "-"
     if backend.name != "jj":
-        return "-"
+        result = backend.run(["rev-parse", "--short=12", f"refs/heads/{bookmark}"])
+        tip = (result.stdout or "").strip()
+        return tip if result.returncode == 0 and tip else "-"
     if reason := check_jj_ids(backend.repo_root):
         log.warning("No bookmark lookup in %s: %s", backend.repo_root, reason)
         return "-"
