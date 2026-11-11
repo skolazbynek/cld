@@ -1,12 +1,62 @@
 """Git backend implementation -- fallback when jujutsu is not available."""
 
+import errno
+import os
+import re
+import stat
 import subprocess
 from pathlib import Path
 
 from cld.log import get_logger
 from cld.vcs.base import VcsBackend
+from cld.vcs.jj import check_git_dir
 
 log = get_logger(__name__)
+
+# Put in front of a host git command that changes refs: no hook runs, whatever a config the
+# container could write says (defense in depth next to ``check_git_store``).
+NO_HOOKS = ("-c", "core.hooksPath=/dev/null")
+
+# ``extensions.worktreeConfig`` makes git also read ``<git dir>/config.worktree`` and
+# ``<git dir>/worktrees/*/config.worktree``, which the container can write and which can
+# set ``core.hooksPath`` or ``core.fsmonitor``. The pattern finds the key in any letter
+# case, also right behind a section header on one line; a lookalike only refuses too much.
+WORKTREE_CONFIG_KEY = re.compile(rb"(?:^|\])[ \t]*worktreeconfig(?![\w-])", re.IGNORECASE | re.MULTILINE)
+_CONFIG_MAX_BYTES = 1 << 20
+
+
+def check_worktree_config(repo: Path) -> str | None:
+    """Why no host git may run on the git-only repo *repo*, None when it may: ``.git/config``
+    sets ``extensions.worktreeConfig``, or cannot be read as a regular file. A missing
+    config is left to the mount row check. Creates nothing and runs no tool."""
+    try:
+        # O_NONBLOCK keeps a FIFO planted in place of the file from blocking the open.
+        fd = os.open(repo / ".git/config", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f".git/config cannot be read: {'a symlink' if e.errno == errno.ELOOP else e.strerror}"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ".git/config is not a regular file"
+        with os.fdopen(fd, "rb", closefd=False) as file:
+            data = file.read(_CONFIG_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > _CONFIG_MAX_BYTES:
+        return ".git/config is larger than 1024 KiB"
+    if WORKTREE_CONFIG_KEY.search(data):
+        return (
+            ".git/config sets extensions.worktreeConfig: host git would read config.worktree files "
+            "the container can write (hooks, fsmonitor). Check them, then unset it"
+        )
+    return None
+
+
+def check_git_store(repo: Path) -> str | None:
+    """Why no host git may run on the git-only repo *repo*, None when it may: the git dir
+    fails ``check_git_dir`` or ``check_worktree_config``."""
+    return check_git_dir(repo, ".git") or check_worktree_config(repo)
 
 
 class GitBackend(VcsBackend):

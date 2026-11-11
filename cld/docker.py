@@ -18,6 +18,7 @@ from cld.config import Config, _load_toml
 from cld.manifest import TicketManifest, manifest_labels, read_manifest
 from cld.log import get_logger, log_subprocess, mask_secrets
 from cld.vcs import get_backend
+from cld.vcs.git import check_worktree_config
 from cld.vcs.jj import COMMONDIR_PLACEHOLDER, check_git_dir
 
 log = get_logger(__name__)
@@ -528,8 +529,10 @@ def prepare_store_mounts(host_repo: Path, name: str = "") -> StoreLayout:
 
     Finds the layout, checks the jj version and the settings the read-only
     rows protect, and creates what may be created: the two jj ids, an empty
-    ``hooks`` folder and the ``commondir`` placeholder. Exits with a refusal
-    rather than mount an unsafe store.
+    ``hooks`` folder and the ``commondir`` placeholder. A git-only store that
+    sets ``extensions.worktreeConfig`` is refused as well: host git would read
+    the ``config.worktree`` files no row protects. Exits with a refusal rather
+    than mount an unsafe store.
     """
     name = name or host_repo.name
     if _kind(host_repo / ".jj") is not None:
@@ -557,6 +560,8 @@ def prepare_store_mounts(host_repo: Path, name: str = "") -> StoreLayout:
     if _kind(host_repo / commondir) is None:
         (host_repo / commondir).write_text(COMMONDIR_PLACEHOLDER)
     _check_rows(name, host_repo, layout)
+    if not layout.jj and (reason := check_worktree_config(host_repo)):
+        _refuse_store(name, reason)
     return layout
 
 

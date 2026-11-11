@@ -54,6 +54,7 @@ from cld.run import launch_run
 from cld.ticket import _bookmark_tip, forget_session_state, restart_ticket, start_ticket
 from cld.vcs import get_backend
 from cld.vcs.anchor import resolve_anchor
+from cld.vcs.git import check_worktree_config
 from cld.vcs.jj import COMMONDIR_PLACEHOLDER, JJ_ID_FILES, check_git_dir, check_jj_ids
 
 
@@ -2176,6 +2177,68 @@ class TestStorePreflight:
         (repo / _GIT_DIRS[layout_id] / "modules/lib").mkdir(parents=True)
         message = _refusal(repo)
         assert f"{_GIT_DIRS[layout_id]}/modules exists: git submodules are not supported yet" in message
+
+    WORKTREE_CONFIGS = [
+        "[extensions]\n\tworktreeConfig = true\n",
+        "[extensions]\n\tworktreeconfig\n",
+        "[extensions] WorktreeConfig=yes\n",
+        "[extensions]\n\tworktreeConfig = false\n",
+    ]
+
+    @pytest.mark.parametrize("config", WORKTREE_CONFIGS, ids=["true", "bare-key", "same-line", "false"])
+    def test_worktree_config_refused_on_a_git_only_store(self, store_repo, config):
+        """With the extension on, host git reads config.worktree files the container can write
+        (a core.hooksPath there ran a planted hook on host update-ref)."""
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        with (repo / ".git/config").open("a") as file:
+            file.write(config)
+        message = _refusal(repo)
+        assert ".git/config sets extensions.worktreeConfig" in message
+        assert message.startswith("cld: repo 'api': ")
+
+    @pytest.mark.parametrize("layout_id", ["colocated", "internal"])
+    def test_worktree_config_is_left_alone_on_a_jj_store(self, bare_repo, fake_jj, layout_id):
+        """jj runs no git hooks, and jj repos must keep working as before."""
+        found, repo = bare_repo
+        if found != layout_id:
+            pytest.skip("other layout")
+        (repo / ".jj/repo/config-id").write_text("id")
+        (repo / ".jj/workspace-config-id").write_text("id")
+        with (repo / _GIT_DIRS[layout_id] / "config").open("a") as file:
+            file.write("[extensions]\n\tworktreeConfig = true\n")
+        assert prepare_store_mounts(repo).jj
+
+    @pytest.mark.parametrize(
+        "config", ["# worktreeConfig = true\n", "[core]\n\tfoo = worktreeConfigs\n", "[extensions]\n\tnoop = 1\n"],
+        ids=["comment", "longer-word", "other-extension"],
+    )
+    def test_lookalikes_do_not_refuse(self, store_repo, config):
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store is checked")
+        with (repo / ".git/config").open("a") as file:
+            file.write(config)
+        assert prepare_store_mounts(repo).git_dir == ".git"
+
+    @pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
+    def test_a_config_that_is_not_a_regular_file_is_a_reason(self, tmp_path, kind):
+        """The host-side git calls after shutdown have no mount-row check behind this one."""
+        (tmp_path / ".git").mkdir()
+        config = tmp_path / ".git/config"
+        match kind:
+            case "symlink":
+                config.symlink_to("/etc/hostname")
+            case "fifo":
+                os.mkfifo(config)
+            case "directory":
+                config.mkdir()
+        assert check_worktree_config(tmp_path)
+
+    def test_a_missing_config_is_left_to_the_row_check(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        assert check_worktree_config(tmp_path) is None
 
     def test_refusal_format_names_the_repo(self, store_repo):
         layout_id, repo = store_repo

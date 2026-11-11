@@ -25,6 +25,7 @@ from typing import NamedTuple
 import pytest
 
 from cld import docker as cld_docker
+from cld.vcs import git as cld_git
 from cld.vcs import jj as cld_jj
 
 BROKER_PY = Path(__file__).resolve().parent.parent / "broker" / "cld-broker.py"
@@ -1691,6 +1692,33 @@ class TestStoreMountParity:
         assert broker._COMMONDIR_PLACEHOLDER == cld_jj.COMMONDIR_PLACEHOLDER
         assert broker._JJ_MIN_VERSION == cld_docker._JJ_MIN_VERSION
 
+    def test_worktree_config_rules_match_the_launchers(self):
+        assert broker._WORKTREE_CONFIG_KEY.pattern == cld_git.WORKTREE_CONFIG_KEY.pattern
+        assert broker._WORKTREE_CONFIG_KEY.flags == cld_git.WORKTREE_CONFIG_KEY.flags
+
+    @pytest.mark.parametrize("config", ["[extensions]\n\tworktreeConfig = true\n", "[extensions] worktreeconfig\n"],
+                             ids=["key", "same-line"])
+    def test_both_refuse_worktree_config_on_a_git_only_store(self, tmp_path, monkeypatch, config):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        with (repo / ".git/config").open("a") as file:
+            file.write(config)
+        _fakebin(tmp_path, monkeypatch, jj='echo "jj 0.45.1"\n')
+        with pytest.raises(SystemExit, match="extensions.worktreeConfig"):
+            cld_docker.prepare_store_mounts(repo)
+        with pytest.raises(broker.StoreRefused, match="extensions.worktreeConfig"):
+            broker.store_layout(str(repo))
+        with pytest.raises(broker.StoreRefused, match="extensions.worktreeConfig"):
+            broker.store_mounts(str(repo), "/repo")
+
+    @pytest.mark.parametrize("layout", ["colocated", "internal"])
+    def test_neither_refuses_worktree_config_on_a_jj_store(self, tmp_path, monkeypatch, layout):
+        repo = _make_store(tmp_path / "repo", layout)
+        git_dir = ".git" if layout == "colocated" else ".jj/repo/store/git"
+        (repo / git_dir / "config").write_text("[extensions]\n\tworktreeConfig = true\n")
+        _fakebin(tmp_path, monkeypatch, jj='echo "jj 0.45.1"\n')
+        assert cld_docker.prepare_store_mounts(repo).jj
+        assert broker.store_layout(str(repo)).jj
+
     GIT_DIR_DAMAGE = [
         ("colocated", _break_commondir_redirect), ("internal", _break_commondir_redirect),
         ("git-only", _break_commondir_redirect), ("colocated", _break_commondir_newline),
@@ -2017,6 +2045,18 @@ class TestGitTicketRevision:
 
     def test_a_missing_session_branch_is_unresolved(self, git_store):
         assert broker.LabelCaller("t.other", "ticket", "").revision(str(git_store)) is None
+
+    def test_worktree_config_is_a_denial_and_runs_no_git(self, git_store, tmp_path, monkeypatch, capsys):
+        """With the extension on, host git would read a config.worktree the container can write."""
+        monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))
+        _fakebin(tmp_path, monkeypatch, git='echo "$*" >> "$FAKE_GIT_LOG"\n')
+        with (git_store / ".git/config").open("a") as file:
+            file.write("[extensions]\n\tworktreeConfig = true\n")
+        with pytest.raises(SystemExit) as excinfo:
+            broker.LabelCaller(self.SESSION, "ticket", "").revision(str(git_store))
+        assert _exit_code(excinfo) == 3
+        assert "extensions.worktreeConfig" in capsys.readouterr().err
+        assert not (tmp_path / "git.log").exists()
 
     def test_a_refused_store_is_a_denial_and_runs_no_git(self, git_store, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))

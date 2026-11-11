@@ -38,6 +38,7 @@ from cld.ticket import (
     stop_ticket,
     wait_ticket_ready,
 )
+from cld.vcs.git import NO_HOOKS
 from cld.vcs.scratch import stage_in_workspace
 
 
@@ -984,6 +985,54 @@ class TestForgetGitSessionState:
         assert "refs/heads/t.other" in refs
 
     @staticmethod
+    def _plant_worktree_hook(git_repo, tmp_path) -> Path:
+        """The container-side attack: with the extension on, a config.worktree sets core.hooksPath
+        to a folder holding a reference-transaction hook. Returns the marker the hook creates."""
+        marker = tmp_path / "hook-ran"
+        hooks = tmp_path / "evil-hooks"
+        hooks.mkdir()
+        hook = hooks / "reference-transaction"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        git_repo.run(["config", "extensions.worktreeConfig", "true"])
+        (git_repo.repo_root / ".git/config.worktree").write_text(f"[core]\n\thooksPath = {hooks}\n")
+        return marker
+
+    def test_the_planted_hook_works_on_a_plain_host_git(self, git_repo, tmp_path):
+        """Guards the two tests below: without them this attack really runs."""
+        marker = self._plant_worktree_hook(git_repo, tmp_path)
+        git_repo.run(["update-ref", "refs/cld/probe", "HEAD"])
+        assert marker.exists()
+
+    def test_a_store_with_worktree_config_is_not_touched_on_shutdown(self, git_repo, tmp_path, caplog):
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        marker = self._plant_worktree_hook(git_repo, tmp_path)
+        before = self._refs(git_repo)
+        with caplog.at_level("WARNING"):
+            forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        assert not marker.exists()
+        assert self._refs(git_repo) == before
+        assert "extensions.worktreeConfig" in caplog.text
+        assert "no host git runs there" in caplog.text
+
+    def test_no_hook_runs_even_when_the_check_lets_a_store_through(self, git_repo, tmp_path):
+        """Defense in depth: every ref-changing command of the shutdown disables hooks."""
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        marker = self._plant_worktree_hook(git_repo, tmp_path)
+        with patch("cld.ticket.check_git_store", return_value=None):
+            forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        assert not marker.exists()
+        assert f"refs/heads/{self.SESSION}" not in self._refs(git_repo)
+        assert [ref for ref in self._refs(git_repo) if ref.startswith(f"refs/cld/ended/{self.SESSION}/")]
+
+    def test_a_branch_lookup_in_such_a_store_runs_no_git(self, git_repo, tmp_path, caplog):
+        self._plant_worktree_hook(git_repo, tmp_path)
+        with patch.object(git_repo.__class__, "run") as run, caplog.at_level("WARNING"):
+            assert _bookmark_tip(str(git_repo.repo_root), self.SESSION) == "-"
+        run.assert_not_called()
+        assert "extensions.worktreeConfig" in caplog.text
+
+    @staticmethod
     def _scripted_backend(fail: str = "", detached: bool = False) -> MagicMock:
         """A git backend whose rev-parse finds a branch tip above the scratch commit and which
         fails the command that starts with *fail*. With *detached*, the worktree's HEAD is
@@ -993,6 +1042,7 @@ class TestForgetGitSessionState:
         backend.repo_root = Path("/repo")
 
         def run(cmd):
+            cmd = cmd[len(NO_HOOKS):] if cmd[:len(NO_HOOKS)] == list(NO_HOOKS) else cmd
             out = ""
             if cmd[0] == "worktree" and cmd[1] == "list":
                 out = "worktree /workspace/x/api\n" + ("HEAD " + "c" * 40 + "\ndetached\n" if detached else "")
@@ -1006,7 +1056,18 @@ class TestForgetGitSessionState:
         return backend
 
     def _commands(self, backend: MagicMock) -> list[str]:
-        return [" ".join(c.args[0]) for c in backend.run.call_args_list if c.args[0][0] != "rev-parse"]
+        """The commands run, without the hooks-off prefix, minus the read-only rev-parse calls."""
+        return [" ".join(c.args[0]).removeprefix(" ".join(NO_HOOKS) + " ")
+                for c in backend.run.call_args_list if c.args[0][0] != "rev-parse"]
+
+    def test_every_ref_changing_command_runs_with_hooks_off(self, tmp_path):
+        backend = self._scripted_backend()
+        with patch("cld.ticket.get_backend", return_value=backend):
+            forget_session_state(str(tmp_path), self.SESSION, "/workspace/x/api")
+        changing = [c.args[0] for c in backend.run.call_args_list
+                    if c.args[0][0] in ("update-ref", "branch", "worktree", "-c") and c.args[0][1] != "list"]
+        assert len(changing) == 5
+        assert all(cmd[:len(NO_HOOKS)] == list(NO_HOOKS) for cmd in changing)
 
     def test_the_anchor_ref_goes_last(self, tmp_path):
         backend = self._scripted_backend()

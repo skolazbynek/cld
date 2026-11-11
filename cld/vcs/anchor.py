@@ -22,6 +22,7 @@ from pathlib import Path
 from cld.log import get_logger
 from cld.names import anchor_ref
 from cld.vcs import VcsBackend, get_backend
+from cld.vcs.git import NO_HOOKS
 
 log = get_logger(__name__)
 
@@ -195,7 +196,7 @@ def revert_ops(vcs: VcsBackend, op_ids: list[str]) -> None:
     for op_id in op_ids:
         if vcs.name == "git":
             ref, old, new = op_id.split()
-            result = vcs.run(["update-ref", ref, old, new])
+            result = vcs.run([*NO_HOOKS, "update-ref", ref, old, new])
             if result.returncode != 0:
                 raise RuntimeError(f"git update-ref {ref} {old} {new} failed: {(result.stderr or '').strip()}")
             continue
@@ -221,7 +222,7 @@ def _move_anchor_commit_git(vcs: VcsBackend, anchor: str, target: str, session: 
         )
     # Host-side commit-tree: no working tree is involved, and S' is a plain child of the target.
     created = vcs.run([
-        "commit-tree", f"{target_commit}^{{tree}}", "-p", target_commit, "-m", vcs.get_description(anchor),
+        *NO_HOOKS, "commit-tree", f"{target_commit}^{{tree}}", "-p", target_commit, "-m", vcs.get_description(anchor),
     ])
     if created.returncode != 0:
         raise RuntimeError(f"git commit-tree failed: {(created.stderr or '').strip()}")
@@ -232,7 +233,7 @@ def _move_anchor_commit_git(vcs: VcsBackend, anchor: str, target: str, session: 
         refs.append(f"refs/heads/{session}")
     ops: list[str] = []
     for ref in refs:
-        result = vcs.run(["update-ref", ref, new_anchor, anchor])
+        result = vcs.run([*NO_HOOKS, "update-ref", ref, new_anchor, anchor])
         if result.returncode != 0:
             revert_ops(vcs, ops)
             raise RuntimeError(f"git update-ref {ref} failed: {(result.stderr or '').strip()}")

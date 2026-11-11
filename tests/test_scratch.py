@@ -676,6 +676,39 @@ class TestMoveAnchorCommitGit:
         assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == s_hash
 
 
+class TestHostRefChangesRunNoHooks:
+    """With extensions.worktreeConfig on, a config.worktree the container wrote sets core.hooksPath
+    for host git. The preflight refuses such a store; the ref changes also pass -c core.hooksPath."""
+
+    @staticmethod
+    def _plant(git_repo, tmp_path) -> Path:
+        marker = tmp_path / "hook-ran"
+        hooks = tmp_path / "evil-hooks"
+        hooks.mkdir()
+        hook = hooks / "reference-transaction"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        _git(git_repo, "config", "extensions.worktreeConfig", "true")
+        (git_repo.repo_root / ".git/config.worktree").write_text(f"[core]\n\thooksPath = {hooks}\n")
+        return marker
+
+    def test_the_move_and_its_revert_run_no_hook(self, git_repo, tmp_path):
+        _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        marker = self._plant(git_repo, tmp_path)
+
+        ops = move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        revert_ops(git_repo, ops)
+
+        assert not marker.exists()
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
+
+    def test_the_planted_hook_does_run_on_a_plain_update_ref(self, git_repo, tmp_path):
+        """Guards the test above: this attack works against an unprotected command."""
+        marker = self._plant(git_repo, tmp_path)
+        _git(git_repo, "update-ref", "refs/cld/probe", "HEAD")
+        assert marker.exists()
+
+
 class TestRevertOpsGit:
     def test_restores_the_ref_and_the_branch(self, git_repo, tmp_path):
         _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)

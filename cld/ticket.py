@@ -48,6 +48,7 @@ from cld.names import anchor_ref, ended_ref, ticket_id, ticket_slug
 from cld.registry import pick_repos
 from cld.vcs import VcsBackend, get_backend
 from cld.vcs.anchor import find_anchor_commit, move_anchor_commit, revert_ops
+from cld.vcs.git import NO_HOOKS, check_git_store
 from cld.vcs.jj import check_jj_ids
 
 log = get_logger(__name__)
@@ -617,8 +618,17 @@ def forget_session_state(repo_root_str: str, session: str, worktree_path: str = 
         )
         return
     if backend.name != "jj":
-        if worktree_path:
-            _forget_git_session_state(backend, session, worktree_path)
+        if not worktree_path:
+            return
+        if reason := check_git_store(backend.repo_root):
+            log.warning(
+                "Not cleaning up session state for %s in %s: %s, so no host git runs there. "
+                "Fix the repo, then end the session by hand: `git worktree list`, unlock and remove "
+                "this ticket's worktree, `git branch -D %s`, `git update-ref -d %s`",
+                session, repo_root, reason, session, anchor_ref(session),
+            )
+            return
+        _forget_git_session_state(backend, session, worktree_path)
         return
     if reason := check_jj_ids(backend.repo_root):
         log.warning(
@@ -654,7 +664,7 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
     anchor = anchor_ref(session)
 
     def run(*cmd: str) -> bool:
-        result = backend.run(list(cmd))
+        result = backend.run([*NO_HOOKS, *cmd])
         if result.returncode != 0:
             log.warning(
                 "git %s failed (rc=%d): %s. The next launch may reattach to stale state; "
@@ -680,7 +690,7 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
             if not run("update-ref", ended_ref(session, f"{stamp}-detached"), head):
                 return
         # A lock whose directory is gone is what keeps the registration (and a detached HEAD) alive.
-        backend.run(["worktree", "unlock", worktree_path])
+        backend.run([*NO_HOOKS, "worktree", "unlock", worktree_path])
         if not run("worktree", "remove", "--force", worktree_path):
             return
     if tip := rev(f"refs/heads/{session}"):
@@ -751,6 +761,9 @@ def _bookmark_tip(repo_path: str, bookmark: str) -> str:
     except RuntimeError:
         return "-"
     if backend.name != "jj":
+        if reason := check_git_store(backend.repo_root):
+            log.warning("No branch lookup in %s: %s", backend.repo_root, reason)
+            return "-"
         result = backend.run(["rev-parse", "--short=12", f"refs/heads/{bookmark}"])
         tip = (result.stdout or "").strip()
         return tip if result.returncode == 0 and tip else "-"

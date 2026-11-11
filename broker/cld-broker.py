@@ -468,6 +468,9 @@ def _require_kind(repo: str, rel: str, expected: str) -> None:
 # equal GIT_DIRS and COMMONDIR_PLACEHOLDER of cld/vcs/jj.py (TestStoreMountParity).
 _GIT_DIRS = (".git", ".jj/repo/store/git")
 _COMMONDIR_PLACEHOLDER = "."
+# The key `extensions.worktreeConfig` of a git-only repo, which makes host git read the
+# `config.worktree` files the agent can write: WORKTREE_CONFIG_KEY of cld/vcs/git.py.
+_WORKTREE_CONFIG_KEY = re.compile(rb"(?:^|\])[ \t]*worktreeconfig(?![\w-])", re.IGNORECASE | re.MULTILINE)
 
 
 def check_git_dir(repo: str, git_dir: str) -> None:
@@ -486,6 +489,19 @@ def check_git_dir(repo: str, git_dir: str) -> None:
                                       "from the folder it names. Check it, then delete it")
     if _kind(f"{repo}/{git_dir}/modules") is not None:
         raise _unsafe_store(repo, f"{git_dir}/modules exists: git submodules are not supported yet")
+
+
+def check_worktree_config(repo: str) -> None:
+    """The launcher's cld/vcs/git.py:check_worktree_config for a git-only repo: `.git/config`
+    must not set `extensions.worktreeConfig`, or host git would read `config.worktree` files
+    (hooks, fsmonitor) that the agent writes and no row protects. Raises StoreRefused."""
+    try:
+        data = read_repo_file(repo, ".git/config")
+    except SecretsRefused as e:
+        raise _unsafe_store(repo, f".git/config cannot be read: {e}") from None
+    if data is not None and _WORKTREE_CONFIG_KEY.search(data):
+        raise _unsafe_store(repo, ".git/config sets extensions.worktreeConfig: host git would read config.worktree "
+                                  "files the container can write (hooks, fsmonitor). Check them, then unset it")
 
 
 def check_jj_ids(repo: str) -> None:
@@ -613,6 +629,8 @@ def store_layout(repo: str) -> StoreLayout:
         if rel in (f"{layout.git_dir}/hooks", f"{layout.git_dir}/commondir") and _kind(f"{repo}/{rel}") is None:
             raise _not_prepared(repo)
         _require_kind(repo, rel, expected)
+    if not layout.jj:
+        check_worktree_config(repo)
     return layout
 
 
