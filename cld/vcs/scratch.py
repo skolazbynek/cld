@@ -48,6 +48,9 @@ log = get_logger(__name__)
 
 
 SCRATCH_DIR = ".cld-run"
+# Author of a git scratch commit when the container has no git identity.
+FALLBACK_NAME = "cld"
+FALLBACK_EMAIL = "cld@localhost"
 
 
 def stage_in_workspace(
@@ -63,7 +66,8 @@ def stage_in_workspace(
     session and mode, and jj keeps an empty commit that has a description (git
     gets ``--allow-empty``). The commit stays limited to ``.cld-run/`` either
     way, so no stray working-copy file lands in the anchor. On git B is then
-    pinned by ``refs/cld/anchor/<session>``, created only if absent.
+    pinned by ``refs/cld/anchor/<session>``, created only if absent, and a part of
+    the identity the container lacks (name or email) falls back to ``cld`` / ``cld@localhost``.
 
     Args:
         workspace_path: path to a jj secondary workspace or a git worktree
@@ -112,9 +116,16 @@ def _stage_git(workspace_path: Path, session: str, desc: str, has_files: bool) -
     vcs = GitBackend(workspace_path, workspace_path=workspace_path)
     if has_files and vcs.run(["add", "--", SCRATCH_DIR]).returncode != 0:
         raise RuntimeError(f"git add {SCRATCH_DIR} failed")
-    # Signing and the pre-commit hooks of a repo must not break the boot.
+    # Signing and the pre-commit hooks of a repo must not break the boot, nor a missing identity
+    # (one only in ~/.config/git/config, or behind an includeIf that does not match the worktree path).
+    # An identity the commit gets from GIT_AUTHOR_* or GIT_COMMITTER_* still wins over these.
+    identity = [
+        arg for key, fallback in (("user.name", FALLBACK_NAME), ("user.email", FALLBACK_EMAIL))
+        if not vcs.run(["config", "--default", "", key]).stdout.strip()
+        for arg in ("-c", f"{key}={fallback}")
+    ]
     result = vcs.run([
-        "-c", "commit.gpgsign=false", "commit", "--no-verify", "--allow-empty", "-m", desc,
+        "-c", "commit.gpgsign=false", *identity, "commit", "--no-verify", "--allow-empty", "-m", desc,
     ])
     if result.returncode != 0:
         raise RuntimeError(

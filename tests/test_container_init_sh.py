@@ -516,15 +516,26 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
     def test_git_staging_failure_leaves_a_clean_first_launch(self, tmp_path, env):
         origin = self._git_origin(tmp_path, env)
         workspace = tmp_path / "ws"
-        self._git(env, origin, "config", "user.useConfigOnly", "true")
-        no_identity = {k: v for k, v in env.items() if not k.startswith(("GIT_AUTHOR", "GIT_COMMITTER"))}
-        result = self._boot_git(no_identity, origin, workspace)
+        # The scratch module needs the session name: without it staging fails after the worktree exists.
+        no_session = {k: v for k, v in env.items() if k != "SESSION_NAME"}
+        result = self._boot(no_session, f"cld_boot_worktree {origin} {workspace} {self.BOOKMARK} origin/main isolated")
         assert result.returncode != 0
         assert "anchor staging failed" in result.stderr
         assert not workspace.exists()
         assert self._git(env, origin, "branch", "--list", self.BOOKMARK) == ""
-        self._git(env, origin, "config", "--unset", "user.useConfigOnly")
         assert self._boot_git(env, origin, workspace).returncode == 0
+
+    def test_git_first_launch_without_any_identity_uses_the_fallback(self, tmp_path, env):
+        """No GIT_AUTHOR_* variable, no global config and git not guessing one: the boot still stages."""
+        origin = self._git_origin(tmp_path, env)
+        self._git(env, origin, "config", "user.useConfigOnly", "true")
+        no_identity = {k: v for k, v in env.items() if not k.startswith(("GIT_AUTHOR", "GIT_COMMITTER"))}
+        no_identity |= {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        no_identity.pop("EMAIL", None)
+        result = self._boot_git(no_identity, origin, tmp_path / "ws")
+        assert result.returncode == 0, result.stderr
+        scratch = self._git(env, origin, "rev-parse", f"refs/cld/anchor/{self.BOOKMARK}")
+        assert self._git(env, origin, "log", "-1", "--format=%an <%ae>", scratch) == "cld <cld@localhost>"
 
     def test_git_warm_restart_recovers_the_anchor_from_the_ref(self, tmp_path, env):
         origin = self._git_origin(tmp_path, env)

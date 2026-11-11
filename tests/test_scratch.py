@@ -204,8 +204,10 @@ class TestStageInWorktree:
 
         stage_in_workspace(peer, "t.sess", {})
 
-    def test_no_identity_fails_loudly(self, git_repo, tmp_path, monkeypatch):
-        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+    @pytest.fixture
+    def no_identity(self, git_repo, monkeypatch):
+        """Nothing gives a commit an identity: no repo or global config, no GIT_* or EMAIL variable,
+        and git must not guess one."""
         _git(git_repo, "config", "--unset", "user.name")
         _git(git_repo, "config", "--unset", "user.email")
         _git(git_repo, "config", "user.useConfigOnly", "true")
@@ -214,8 +216,56 @@ class TestStageInWorktree:
         for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
             monkeypatch.delenv(var, raising=False)
 
-        with pytest.raises(RuntimeError, match="git commit failed"):
-            stage_in_workspace(peer, "t.sess", {})
+    def _author(self, git_repo, commit: str) -> str:
+        return _git(git_repo, "log", "-1", "--format=%an <%ae> / %cn <%ce>", commit)
+
+    def test_no_identity_gets_the_fallback(self, git_repo, tmp_path, no_identity):
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert self._author(git_repo, s_hash) == "cld <cld@localhost> / cld <cld@localhost>"
+
+    def test_only_the_missing_half_falls_back(self, git_repo, tmp_path, no_identity):
+        _git(git_repo, "config", "user.name", "Alice")
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert self._author(git_repo, s_hash) == "Alice <cld@localhost> / Alice <cld@localhost>"
+
+    def test_a_configured_identity_is_kept(self, git_repo, tmp_path, no_identity):
+        _git(git_repo, "config", "user.name", "Alice")
+        _git(git_repo, "config", "user.email", "alice@example.com")
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert self._author(git_repo, s_hash) == "Alice <alice@example.com> / Alice <alice@example.com>"
+
+    def test_an_identity_from_the_environment_wins(self, git_repo, tmp_path, no_identity, monkeypatch):
+        for who in ("AUTHOR", "COMMITTER"):
+            monkeypatch.setenv(f"GIT_{who}_NAME", "Env")
+            monkeypatch.setenv(f"GIT_{who}_EMAIL", "env@example.com")
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert self._author(git_repo, s_hash) == "Env <env@example.com> / Env <env@example.com>"
+
+    def test_an_identity_behind_an_include_that_does_not_match_falls_back(
+        self, git_repo, tmp_path, no_identity, monkeypatch,
+    ):
+        """The identity of the host's global config, under includeIf gitdir: of a host path."""
+        (tmp_path / "identity.conf").write_text("[user]\n\tname = Host\n\temail = host@example.com\n")
+        glob = tmp_path / "global.conf"
+        glob.write_text(f'[includeIf "gitdir:/home/host/work/"]\n\tpath = {tmp_path / "identity.conf"}\n')
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(glob))
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert self._author(git_repo, s_hash) == "cld <cld@localhost> / cld <cld@localhost>"
 
 
 _VCS_LIB =Path(__file__).resolve().parent.parent / "imgs/claude-devcontainer/vcs-lib.sh"
