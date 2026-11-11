@@ -645,6 +645,63 @@ class TestPlainJjInOriginFails(_RealJjOrigin):
         assert self._ops(env, jj_origin) == ops_before
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+class TestGitHooksOffAfterBoot:
+    """A worktree runs the hooks of the host repo (a read-only mount), and a host
+    hook may call a host-only path. Like jj, a container never runs git hooks."""
+
+    def _commit_in_worktree(self, tmp_path, boot: bool) -> tuple[subprocess.CompletedProcess, str]:
+        home = tmp_path / "home"
+        home.mkdir()
+        host_config = tmp_path / "faketmp" / "host-config"
+        host_config.mkdir(parents=True)
+        (host_config / ".gitconfig").write_text("[user]\n\tname = host-user\n\temail = host@localhost\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env |= {"HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"}
+        identity = ["-c", "user.name=t", "-c", "user.email=t@localhost"]
+        origin, workspace = tmp_path / "origin", tmp_path / "ws"
+        subprocess.run(["git", "init", "-q", str(origin)], env=env, check=True)
+        subprocess.run(["git", "-C", str(origin), *identity, "commit", "-q", "--allow-empty", "-m", "seed"],
+                       env=env, check=True)
+        subprocess.run(["git", "-C", str(origin), "worktree", "add", "-q", "-b", "t.hook", str(workspace)],
+                       env=env, check=True)
+        hooks = origin / ".git" / "hooks"
+        hook = hooks / "pre-commit"
+        hook.write_text("#!/bin/sh\nexec /nonexistent/host/venv/bin/pre-commit \"$@\"\n")
+        hook.chmod(0o755)
+        _make_read_only(hooks)
+        try:
+            if boot:
+                _source_container_init(tmp_path, "copy_host_configs", broker_wired=False)
+            (workspace / "work.txt").write_text("work\n")
+            subprocess.run(["git", "-C", str(workspace), "add", "work.txt"], env=env, check=True)
+            commit = subprocess.run(["git", "-C", str(workspace), "commit", "-m", "work"],
+                                    env=env, capture_output=True, text=True)
+            author = subprocess.run(["git", "-C", str(workspace), "log", "-1", "--format=%an"],
+                                    env=env, capture_output=True, text=True).stdout.strip()
+        finally:
+            _restore_writable(hooks)
+        return commit, author
+
+    def test_a_failing_host_hook_blocks_the_commit_without_the_boot_step(self, tmp_path):
+        commit, _ = self._commit_in_worktree(tmp_path, boot=False)
+        assert commit.returncode != 0
+
+    def test_a_failing_host_hook_does_not_block_the_commit_after_boot(self, tmp_path):
+        commit, author = self._commit_in_worktree(tmp_path, boot=True)
+        assert commit.returncode == 0, commit.stderr
+        assert author == "host-user"
+
+    def test_the_setting_is_written_without_any_staged_host_config(self, tmp_path):
+        _source_container_init(tmp_path, "copy_host_configs", broker_wired=False)
+        hooks_dir = subprocess.run(
+            ["git", "config", "--file", str(tmp_path / "home" / ".gitconfig"), "core.hooksPath"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        assert Path(hooks_dir).is_dir()
+        assert list(Path(hooks_dir).iterdir()) == []
+
+
 _JJ_COMMAND = re.compile(r"(?:^\s*|[;&|(]\s*|\b(?:then|do)\s+|\bif\s+!?\s*|\$\(\s*)jj\b")
 _BOOT_SCRIPTS = (
     VCS_LIB_SH,

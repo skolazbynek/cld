@@ -185,11 +185,25 @@ seed_known_hosts() {
 # Docker never creates $HOME subdirs as root.
 copy_host_configs() {
     local src_root="/tmp/host-config"
-    [ -d "$src_root" ] || return 0
-    cp -aT "$src_root" "$HOME"
-    # Only chmod the paths we just staged, not the whole $HOME (~635M of baked caches).
-    (cd "$src_root" && find . -mindepth 1 -print0) | \
-        (cd "$HOME" && xargs -0 -r chmod u+w) 2>/dev/null || true
+    if [ -d "$src_root" ]; then
+        cp -aT "$src_root" "$HOME"
+        # Only chmod the paths we just staged, not the whole $HOME (~635M of baked caches).
+        (cd "$src_root" && find . -mindepth 1 -print0) | \
+            (cd "$HOME" && xargs -0 -r chmod u+w) 2>/dev/null || true
+    fi
+    cld_disable_git_hooks
+}
+
+# Git hooks off in every container, as jj never runs them. A worktree takes its
+# hooks from the common dir, which is the host's hooks mounted read-only, and a
+# host hook may call a host-only path. The repo config is read-only too, so the
+# switch lives in the global config, written after the copy above so it lands on
+# top of the user's staged ~/.gitconfig and keeps its identity.
+cld_disable_git_hooks() {
+    local hooks_dir="$HOME/.cld-no-hooks"
+    mkdir -p "$hooks_dir" && git config --global core.hooksPath "$hooks_dir" ||
+        echo "[WARN] could not turn off git hooks: a host hook may block git commit" >&2
+    return 0
 }
 
 # Build container-local claude.json from read-only host config.
