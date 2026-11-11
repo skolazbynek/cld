@@ -438,6 +438,36 @@ class TestGitFileRule:
         assert repo.file(path / "a.txt") == "deny"
 
 
+    def test_drift_silent_at_the_anchor(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
+        """A git workspace starts at its anchor (no scratch commit): that is no drift."""
+        assert repo.post() is None
+
+    def test_drift_silent_on_a_descendant(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
+        git_repo[1]("commit", "-q", "--allow-empty", "-m", "two")
+        assert repo.post() is None
+
+    def test_drift_blocks_on_an_unrelated_head(self, repo: Repo, git_repo: tuple[Path, Callable[..., str]]) -> None:
+        path, git = git_repo
+        anchor = git("rev-parse", "HEAD")
+        git("checkout", "-q", "--orphan", "other")
+        git("commit", "-q", "--allow-empty", "-m", "unrelated")
+        result = repo.hook({
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "cwd": str(path), "tool_input": {"command": "git checkout --orphan other"},
+        })
+        out = json.loads(result.stdout)
+        assert out["decision"] == "block"
+        assert "g: HEAD" in out["reason"] and anchor in out["reason"]
+
+    def test_drift_blocks_when_the_anchor_no_longer_resolves(
+        self, repo: Repo, git_repo: tuple[Path, Callable[..., str]],
+    ) -> None:
+        repo.register(
+            {"repo": "g", "workspace": str(git_repo[0]), "anchor": "f" * 40, "mode": "isolated", "backend": "git"},
+        )
+        assert repo.post() == "block"
+
+
 @needs_jj
 class TestPostToolUse:
     def test_in_tree_silent(self, repo: Repo) -> None:
