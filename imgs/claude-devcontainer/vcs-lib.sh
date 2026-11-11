@@ -192,44 +192,150 @@ cld_boot_workspace() {
     return 0
 }
 
+cld_recover_git_anchor() {
+    # git counterpart of cld_recover_anchor: echo the effective anchor of a git
+    # ticket, nothing when no scratch commit is pinned. The hidden ref
+    # refs/cld/anchor/<session> points at the scratch commit S (cld.names.anchor_ref
+    # builds the same string; this file cannot import it); S's own message says
+    # which mode it was staged with. isolated: S is the anchor. shared: its
+    # parent is. Args: $1=origin $2=session.
+    local origin="$1" session="$2" s_hash desc
+    s_hash=$(git -C "$origin" rev-parse --verify -q "refs/cld/anchor/${session}^{commit}" 2>/dev/null) || return 0
+    desc=$(git -C "$origin" log -1 --format=%B "$s_hash" 2>/dev/null || true)
+    case "$desc" in
+        *"mode=shared"*) git -C "$origin" rev-parse --verify -q "${s_hash}^" 2>/dev/null || true ;;
+        *) echo "$s_hash" ;;
+    esac
+}
+
+cld_stale_worktree() {
+    # Print "<HEAD> <branch>" of the registration for the worktree path $2 in the
+    # origin store $1 (branch empty when detached); print nothing and return
+    # non-zero when that path is not registered.
+    local origin="$1" path head="" branch="" in_path=0 found=1 line
+    path=$(realpath -m "$2")
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                in_path=0
+                if [ "${line#worktree }" = "$path" ]; then
+                    in_path=1
+                    found=0
+                fi
+                ;;
+            "HEAD "*) if [ "$in_path" = 1 ]; then head="${line#HEAD }"; fi ;;
+            "branch refs/heads/"*) if [ "$in_path" = 1 ]; then branch="${line#branch refs/heads/}"; fi ;;
+        esac
+    done < <(git -C "$origin" worktree list --porcelain)
+    if [ "$found" = 0 ]; then
+        echo "$head $branch"
+    fi
+    return "$found"
+}
+
+_cld_git_boot_anchor() {
+    # Set CLD_BOOT_ANCHOR from the anchor ref of session $2, else keep the base
+    # $3 with a warning. Args: $1=origin $2=session $3=base_rev.
+    local anchor
+    anchor=$(cld_recover_git_anchor "$1" "$2")
+    if [ -n "$anchor" ]; then
+        CLD_BOOT_ANCHOR="$anchor"
+    else
+        echo "[WARN] no anchor ref for '$2' (a ticket from before the scratch commit): anchoring on the base ${3:0:12}" >&2
+        CLD_BOOT_ANCHOR="$3"
+    fi
+}
+
 # git counterpart of cld_boot_workspace for ticket repos on a git backend.
-# Same three branches over a git worktree with branch = $bookmark. Git repos
-# get weaker guarantees by design (PRODUCT_DESIGN.md gap 8): no scratch
-# commit, so the effective anchor is the base itself; no watchman snapshots.
+# Same three branches over a git worktree whose branch is $bookmark. The
+# branch moves with the work, so the anchor is pinned by the hidden ref
+# refs/cld/anchor/$bookmark on the scratch commit S, staged like the jj one
+# (cld.vcs.scratch; S's message names the mode). No watchman snapshots.
+# Sets CLD_BOOT_ANCHOR (S isolated, S's parent shared; the base itself, with a
+# warning, for a ticket booted before the scratch commit existed) and
+# CLD_BOOT_FIRST_LAUNCH. Args as cld_boot_workspace: $1=origin $2=workspace
+# $3=bookmark $4=base_rev $5=mode (default isolated).
+#
+# Worktrees are added locked (the reason names the session). The origin store
+# is shared with other tickets whose paths do not exist in this container, so
+# there is no blanket `git worktree prune`: only this session's own stale
+# registration is dropped, after its HEAD and branch are read, so a reattach
+# resumes where the lost worktree was.
 cld_boot_worktree() {
-    local origin="$1" workspace="$2" bookmark="$3" base_rev="$4"
+    local origin="$1" workspace="$2" bookmark="$3" base_rev="$4" mode="${5:-isolated}"
+    local ref="refs/cld/anchor/$bookmark"
     CLD_BOOT_ANCHOR="$base_rev"
     CLD_BOOT_FIRST_LAUNCH=0
 
     if [ -e "$workspace/.git" ]; then
         echo "[cld] warm restart: reusing existing worktree at $workspace"
+        _cld_git_boot_anchor "$origin" "$bookmark" "$base_rev"
         return 0
     fi
-    # The origin store is shared with other tickets whose worktree paths do not
-    # exist in this container, so never `git worktree prune` it. Worktrees are
-    # added locked (the lock reason names the session); a stale registration
-    # left by a recreate of THIS session is overridden below by its own path.
-    local add_flags=(--lock --reason "$bookmark")
-    if git -C "$origin" worktree list --porcelain \
-            | grep -Fxq "worktree $(realpath -m "$workspace")"; then
-        add_flags+=(-f -f)
+
+    local stale stale_head="" stale_branch="" have_ref=0 have_branch=0
+    if stale=$(cld_stale_worktree "$origin" "$workspace"); then
+        read -r stale_head stale_branch <<<"$stale"
+        # `remove -f -f` also drops a locked registration whose directory is gone.
+        git -C "$origin" worktree remove -f -f "$workspace" || true
+    fi
+    if git -C "$origin" rev-parse --verify -q "${ref}^{commit}" >/dev/null 2>&1; then
+        have_ref=1
+    fi
+    if git -C "$origin" show-ref --verify --quiet "refs/heads/$bookmark"; then
+        have_branch=1
     fi
 
-    if git -C "$origin" show-ref --verify --quiet "refs/heads/$bookmark"; then
+    local lock=(--lock --reason "$bookmark")
+    if [ "$have_ref" = 1 ] || [ "$have_branch" = 1 ]; then
         echo "[cld] reattaching worktree '$bookmark'"
-        if ! git -C "$origin" worktree add "${add_flags[@]}" "$workspace" "$bookmark"; then
+        local add
+        if [ -n "$stale_branch" ] && git -C "$origin" show-ref --verify --quiet "refs/heads/$stale_branch"; then
+            add=("$workspace" "$stale_branch")
+        elif [ -z "$stale_branch" ] && [ -n "$stale_head" ] &&
+                git -C "$origin" cat-file -e "${stale_head}^{commit}" 2>/dev/null; then
+            add=(--detach "$workspace" "$stale_head")
+        elif [ "$have_branch" = 1 ]; then
+            add=("$workspace" "$bookmark")
+        else
+            add=(--no-track -b "$bookmark" "$workspace" "$ref")
+        fi
+        if ! git -C "$origin" worktree add "${lock[@]}" "${add[@]}"; then
             echo "Error: git worktree add failed (reattach)" >&2
             return 1
         fi
+        _cld_git_boot_anchor "$origin" "$bookmark" "$base_rev"
         return 0
     fi
 
     CLD_BOOT_FIRST_LAUNCH=1
-    echo "[cld] first launch (git), base=${base_rev:0:12}"
-    if ! git -C "$origin" worktree add "${add_flags[@]}" --no-track -b "$bookmark" "$workspace" "$base_rev"; then
+    local a_hash s_hash
+    if ! a_hash=$(git -C "$origin" rev-parse --verify -q "${base_rev}^{commit}"); then
+        echo "Error: could not resolve base revision '$base_rev'" >&2
+        return 1
+    fi
+    echo "[cld] first launch (git), base=${a_hash:0:12}"
+    if ! git -C "$origin" worktree add "${lock[@]}" --no-track -b "$bookmark" "$workspace" "$a_hash"; then
         echo "Error: git worktree add failed (first launch)" >&2
         return 1
     fi
+    # -P: as in cld_boot_workspace.
+    if ! s_hash=$(cd "$workspace" && \
+            WORKSPACE_CURRENT="$workspace" AGENT_ANCHOR_MODE="$mode" \
+            python3 -P -m cld.vcs.scratch --default-payload); then
+        echo "Error: anchor staging failed" >&2
+        # Without the worktree and the branch the next boot is a clean first
+        # launch again, not a warm restart that has no anchor.
+        git -C "$origin" worktree remove -f -f "$workspace" || true
+        git -C "$origin" branch -D "$bookmark" >/dev/null || true
+        return 1
+    fi
+    if [ "$mode" = "shared" ]; then
+        CLD_BOOT_ANCHOR="$a_hash"
+    else
+        CLD_BOOT_ANCHOR="$s_hash"
+    fi
+    echo "[cld] anchor=${CLD_BOOT_ANCHOR:0:12} (mode=$mode, base=${a_hash:0:12}, scratch=${s_hash:0:12})"
     return 0
 }
 

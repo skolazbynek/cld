@@ -5,7 +5,8 @@ workspace name, the session bookmark, the mailbox folder and the broker caller
 id. See docs/design-bookmark-naming.md. No part ever contains a dot.
 
 ``broker/cld-broker.py`` is standalone and cannot import this module: the few
-strings it builds are duplicated there, with a pointer to this file.
+strings it builds are duplicated there, with a pointer to this file. So is
+``imgs/claude-devcontainer/vcs-lib.sh`` (the anchor ref of a git ticket).
 """
 
 import re
@@ -96,6 +97,18 @@ def deliverable(agent_identifier: str, branch_arg: str = "") -> str:
         return f"{agent_identifier}{SEP}mr"
     check_part(branch_arg)
     return branch_arg if SEP in branch_arg else f"{agent_identifier}{SEP}{branch_arg}"
+
+
+def anchor_ref(identifier: str) -> str:
+    """Hidden git ref pinning a git ticket's scratch commit S. Outside ``refs/heads``
+    on purpose: no branch list shows it and ``git push --all`` skips it."""
+    return f"refs/cld/anchor/{identifier}"
+
+
+def ended_ref(identifier: str, stamp: str) -> str:
+    """Where shutdown archives the tip of a git ticket's session branch before
+    deleting the branch. *stamp* is a UTC ``YYYYmmddTHHMMSSZ`` string."""
+    return f"refs/cld/ended/{identifier}/{stamp}"
 
 
 def docker_name_filter(identifier: str) -> str:

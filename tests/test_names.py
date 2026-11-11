@@ -115,6 +115,14 @@ class TestCheckPart:
             names.check_part(part)
 
 
+class TestGitRefs:
+    def test_anchor_ref(self):
+        assert names.anchor_ref("t.lide-1") == "refs/cld/anchor/t.lide-1"
+
+    def test_ended_ref(self):
+        assert names.ended_ref("t.lide-1", "20260101T000000Z") == "refs/cld/ended/t.lide-1/20260101T000000Z"
+
+
 class TestDockerNameFilter:
     def test_anchored_and_escaped(self):
         assert names.docker_name_filter("t.us") == r"name=^t\.us$"

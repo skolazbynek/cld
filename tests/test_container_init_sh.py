@@ -207,6 +207,11 @@ class TestTicketClaudeMdGitRepos:
         # The jj text stays in place above it.
         assert "`t.lide-1` is the session bookmark: never move or delete it." in text
 
+    def test_git_section_names_the_anchor_ref(self, tmp_path):
+        text = self._claude_md(tmp_path, [self.GIT_ROW])
+        assert "hidden ref\n  `refs/cld/anchor/t.lide-1`" in text
+        assert "only `cld restart --reanchor` does" in text
+
     def test_mixed_table_gets_the_git_section_too(self, tmp_path):
         assert "## Git repos" in self._claude_md(tmp_path, [self.JJ_ROW, self.GIT_ROW])
 
@@ -281,7 +286,10 @@ class _RealJjOrigin:
         python_bin = str(Path(sys.executable).parent)
         return {**os.environ, "JJ_CONFIG": str(config), "HOME": str(tmp_path / "home"),
                 "PATH": f"{python_bin}:{os.environ['PATH']}", "PYTHONPATH": str(REPO_ROOT),
-                "SESSION_NAME": self.BOOKMARK}
+                "SESSION_NAME": self.BOOKMARK,
+                # The scratch commit of a git ticket needs an identity; the container mounts a .gitconfig.
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@localhost",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@localhost"}
 
     def _boot(self, env: dict, body: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", "-c", f"set -e\n. {VCS_LIB_SH}\n{body}"],
@@ -466,6 +474,150 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         registered = self._worktrees(env, origin)
         assert f"locked {self.BOOKMARK}" in registered[str(workspace)]
         assert str(tmp_path / "other") in registered
+
+    def _git(self, env, origin: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(origin), *args], env=env, capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    def _boot_git(self, env, origin: Path, workspace: Path, mode: str = "isolated", session: str = "",
+                  base: str = "origin/main") -> subprocess.CompletedProcess:
+        session = session or self.BOOKMARK
+        return self._boot({**env, "SESSION_NAME": session},
+                          f'cld_boot_worktree {origin} {workspace} {session} {base} {mode}\n'
+                          'echo "anchor=$CLD_BOOT_ANCHOR first=$CLD_BOOT_FIRST_LAUNCH"')
+
+    def _anchor_of(self, result: subprocess.CompletedProcess) -> str:
+        return result.stdout.splitlines()[-1].split()[0].removeprefix("anchor=")
+
+    def test_git_first_launch_isolated_anchors_on_the_scratch_commit(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        base = self._git(env, origin, "rev-parse", "origin/main")
+        workspace = tmp_path / "ws"
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert "first=1" in result.stdout
+        scratch = self._git(env, origin, "rev-parse", f"refs/cld/anchor/{self.BOOKMARK}")
+        assert self._anchor_of(result) == scratch
+        assert self._git(env, origin, "rev-parse", f"{scratch}^") == base
+        assert self._git(env, workspace, "rev-parse", "HEAD") == scratch
+        assert self._git(env, origin, "log", "-1", "--format=%B", scratch) == f"cld anchor: {self.BOOKMARK} mode=isolated"
+        assert self._git(env, origin, "rev-parse", self.BOOKMARK) == scratch
+        assert f"locked {self.BOOKMARK}" in self._worktrees(env, origin)[str(workspace)]
+
+    def test_git_first_launch_shared_anchors_on_the_base(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        base = self._git(env, origin, "rev-parse", "origin/main")
+        result = self._boot_git(env, origin, tmp_path / "ws", mode="shared")
+        assert result.returncode == 0, result.stderr
+        assert self._anchor_of(result) == base
+        scratch = self._git(env, origin, "rev-parse", f"refs/cld/anchor/{self.BOOKMARK}")
+        assert self._git(env, origin, "log", "-1", "--format=%B", scratch).endswith("mode=shared")
+
+    def test_git_staging_failure_leaves_a_clean_first_launch(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        self._git(env, origin, "config", "user.useConfigOnly", "true")
+        no_identity = {k: v for k, v in env.items() if not k.startswith(("GIT_AUTHOR", "GIT_COMMITTER"))}
+        result = self._boot_git(no_identity, origin, workspace)
+        assert result.returncode != 0
+        assert "anchor staging failed" in result.stderr
+        assert not workspace.exists()
+        assert self._git(env, origin, "branch", "--list", self.BOOKMARK) == ""
+        self._git(env, origin, "config", "--unset", "user.useConfigOnly")
+        assert self._boot_git(env, origin, workspace).returncode == 0
+
+    def test_git_warm_restart_recovers_the_anchor_from_the_ref(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        first = self._boot_git(env, origin, workspace)
+        (workspace / "work.txt").write_text("work\n")
+        self._git(env, workspace, "add", "work.txt")
+        self._git(env, workspace, "commit", "-q", "-m", "work")
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert "warm restart" in result.stdout
+        assert self._anchor_of(result) == self._anchor_of(first)
+        assert "first=0" in result.stdout
+
+    def test_git_reattach_after_dir_loss_resumes_the_branch(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        first = self._boot_git(env, origin, workspace)
+        (workspace / "work.txt").write_text("work\n")
+        self._git(env, workspace, "add", "work.txt")
+        self._git(env, workspace, "commit", "-q", "-m", "work")
+        tip = self._git(env, workspace, "rev-parse", "HEAD")
+        shutil.rmtree(workspace)
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert "reattaching worktree" in result.stdout
+        assert "first=0" in result.stdout
+        assert self._anchor_of(result) == self._anchor_of(first)
+        assert (workspace / "work.txt").read_text() == "work\n"
+        assert self._git(env, workspace, "rev-parse", "HEAD") == tip
+        assert f"locked {self.BOOKMARK}" in self._worktrees(env, origin)[str(workspace)]
+
+    def test_git_reattach_resumes_a_detached_head(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        first = self._boot_git(env, origin, workspace)
+        self._git(env, workspace, "checkout", "-q", "--detach")
+        self._git(env, workspace, "commit", "-q", "--allow-empty", "-m", "detached work")
+        tip = self._git(env, workspace, "rev-parse", "HEAD")
+        shutil.rmtree(workspace)
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert self._git(env, workspace, "rev-parse", "HEAD") == tip
+        assert self._git(env, workspace, "branch", "--show-current") == ""
+        assert self._anchor_of(result) == self._anchor_of(first)
+        assert f"locked {self.BOOKMARK}" in self._worktrees(env, origin)[str(workspace)]
+
+    def test_git_reattach_resumes_another_checked_out_branch(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        self._git(env, workspace, "checkout", "-q", "-b", f"{self.BOOKMARK}.mr")
+        shutil.rmtree(workspace)
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        assert self._git(env, workspace, "branch", "--show-current") == f"{self.BOOKMARK}.mr"
+
+    def test_git_branch_without_a_ref_reattaches_on_the_base_with_a_warning(self, tmp_path, env):
+        """A ticket booted before the scratch commit existed: branch, no anchor ref."""
+        origin = self._git_origin(tmp_path, env)
+        base = self._git(env, origin, "rev-parse", "origin/main")
+        self._git(env, origin, "branch", self.BOOKMARK, base)
+        result = self._boot_git(env, origin, tmp_path / "ws", base=base)
+        assert result.returncode == 0, result.stderr
+        assert "first=0" in result.stdout
+        assert self._anchor_of(result) == base
+        assert "no anchor ref" in result.stderr
+        assert self._git(env, origin, "for-each-ref", "refs/cld/") == ""
+
+    def test_git_ref_without_a_branch_reattaches_with_a_new_branch_at_the_scratch_commit(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        first = self._boot_git(env, origin, workspace)
+        shutil.rmtree(workspace)
+        self._git(env, origin, "worktree", "remove", "-f", "-f", str(workspace))
+        self._git(env, origin, "branch", "-D", self.BOOKMARK)
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert "first=0" in result.stdout
+        assert self._anchor_of(result) == self._anchor_of(first)
+        assert self._git(env, workspace, "branch", "--show-current") == self.BOOKMARK
+        assert self._git(env, workspace, "rev-parse", "HEAD") == self._anchor_of(first)
+
+    def test_git_second_ticket_boot_keeps_the_first_tickets_registration(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        first, second = tmp_path / "first", tmp_path / "second"
+        assert self._boot_git(env, origin, first, session="t.one").returncode == 0
+        shutil.rmtree(first)
+        assert self._boot_git(env, origin, second, session="t.two").returncode == 0
+        registered = self._worktrees(env, origin)
+        assert "locked t.one" in registered[str(first)]
+        assert "locked t.two" in registered[str(second)]
+        assert self._boot_git(env, origin, first, session="t.one").returncode == 0
+        assert self._git(env, origin, "rev-parse", "--verify", "refs/cld/anchor/t.two")
 
 
 @pytest.mark.skipif(shutil.which("jj") is None or shutil.which("git") is None, reason="needs jj and git")

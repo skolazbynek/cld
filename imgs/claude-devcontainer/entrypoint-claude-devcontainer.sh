@@ -69,7 +69,7 @@ if [ -n "${TICKET_MODE:-}" ]; then
                 ;;
             git)
                 if ! cld_boot_worktree "$REPO_ORIGIN" "$REPO_WORKSPACE" \
-                        "$BOOKMARK" "$REPO_BASE"; then
+                        "$BOOKMARK" "$REPO_BASE" "$REPO_MODE"; then
                     echo "Error: repo '${REPO_NAME}': boot failed" >&2
                     exit 1
                 fi

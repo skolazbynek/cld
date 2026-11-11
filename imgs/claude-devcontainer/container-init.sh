@@ -94,6 +94,11 @@ the branch \`t.${ticket}\`, and the bookmark rules above apply to branches:
 
 - \`t.${ticket}\` is the session branch: never delete it or switch the
   workspace off it. Every other branch you create starts with \`t.${ticket}\`.
+- The anchor of a git repo is the scratch commit \`cld anchor: t.${ticket} ...\`
+  (isolated) or its parent (shared), pinned by the hidden ref
+  \`refs/cld/anchor/t.${ticket}\`. Never move or delete that ref. \`HEAD\` must
+  stay on a descendant of the anchor. A host rebase does not move the anchor;
+  only \`cld restart --reanchor\` does.
 - Commit with \`git add\` and \`git commit\`. The session branch advances
   with each commit; uncommitted edits are not part of any shared state.
 - Push a merge request with \`git push origin HEAD:t.${ticket}.mr\` (or

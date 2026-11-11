@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from cld.names import anchor_ref
 from cld.vcs.anchor import find_anchor_commit, move_anchor_commit, revert_ops
 from cld.vcs.jj import JjBackend
 from cld.vcs.scratch import (
@@ -132,6 +133,89 @@ class TestStageInWorkspace:
         peer = _make_peer_workspace(jj_repo, anchor, tmp_path)
         b_id = stage_in_workspace(peer, "sess_id", {"session": b"sess_id\n"})
         assert b_id == _rev(jj_repo, "description(glob:'cld anchor: sess_id *')", "change_id")
+
+
+def _git(repo, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo.repo_root), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _make_git_peer(repo, base: str, tmp_path: Path, branch: str = "peer") -> Path:
+    """A git worktree at *base* (mimics the container's `git worktree add -b`)."""
+    peer = tmp_path / "peer-worktree"
+    _git(repo, "worktree", "add", "--no-track", "-b", branch, str(peer), base)
+    return peer
+
+
+class TestStageInWorktree:
+    def test_stages_a_child_of_the_base_with_the_message(self, git_repo, tmp_path):
+        base = _git(git_repo, "rev-parse", "HEAD")
+        peer = _make_git_peer(git_repo, base, tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {"task.md": b"# body\n"}, mode="shared")
+
+        assert _git(git_repo, "rev-parse", f"{s_hash}^") == base
+        assert _git(git_repo, "log", "-1", "--format=%B", s_hash) == "cld anchor: t.sess mode=shared"
+        assert _git(git_repo, "show", "--name-only", "--format=", s_hash) == f"{SCRATCH_DIR}/task.md"
+        assert _git(git_repo, "rev-parse", "peer") == s_hash
+
+    def test_empty_payload_stages_an_empty_commit_and_skips_strays(self, git_repo, tmp_path):
+        base = _git(git_repo, "rev-parse", "HEAD")
+        peer = _make_git_peer(git_repo, base, tmp_path)
+        (peer / "stray.txt").write_text("not scratch\n")
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert _git(git_repo, "diff", "--name-only", f"{s_hash}^", s_hash) == ""
+        assert (peer / "stray.txt").exists()
+
+    def test_pins_the_commit_by_the_hidden_ref(self, git_repo, tmp_path):
+        base = _git(git_repo, "rev-parse", "HEAD")
+        peer = _make_git_peer(git_repo, base, tmp_path)
+
+        s_hash = stage_in_workspace(peer, "t.sess", {})
+
+        assert _git(git_repo, "rev-parse", anchor_ref("t.sess")) == s_hash
+        assert anchor_ref("t.sess") not in _git(git_repo, "branch", "--all", "--format=%(refname)")
+
+    def test_an_existing_ref_is_not_overwritten(self, git_repo, tmp_path):
+        base = _git(git_repo, "rev-parse", "HEAD")
+        peer = _make_git_peer(git_repo, base, tmp_path)
+        _git(git_repo, "update-ref", anchor_ref("t.sess"), base)
+
+        with pytest.raises(RuntimeError, match="update-ref"):
+            stage_in_workspace(peer, "t.sess", {})
+
+        assert _git(git_repo, "rev-parse", anchor_ref("t.sess")) == base
+
+    def test_a_failing_pre_commit_hook_does_not_break_it(self, git_repo, tmp_path):
+        hook = git_repo.repo_root / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        stage_in_workspace(peer, "t.sess", {"task.md": b"x\n"})
+
+    def test_signing_configured_does_not_break_it(self, git_repo, tmp_path):
+        _git(git_repo, "config", "commit.gpgsign", "true")
+        _git(git_repo, "config", "gpg.program", "false")
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+
+        stage_in_workspace(peer, "t.sess", {})
+
+    def test_no_identity_fails_loudly(self, git_repo, tmp_path, monkeypatch):
+        peer = _make_git_peer(git_repo, _git(git_repo, "rev-parse", "HEAD"), tmp_path)
+        _git(git_repo, "config", "--unset", "user.name")
+        _git(git_repo, "config", "--unset", "user.email")
+        _git(git_repo, "config", "user.useConfigOnly", "true")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+            monkeypatch.delenv(var, raising=False)
+
+        with pytest.raises(RuntimeError, match="git commit failed"):
+            stage_in_workspace(peer, "t.sess", {})
 
 
 _VCS_LIB =Path(__file__).resolve().parent.parent / "imgs/claude-devcontainer/vcs-lib.sh"
