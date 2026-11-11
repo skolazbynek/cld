@@ -218,4 +218,12 @@ build_claude_config() {
             mv /tmp/claude-json-tmp "$HOME/.claude.json"
         echo "MCP servers rewritten for container: $(echo "$rewrites" | jq -r 'keys | join(", ")')"
     fi
+
+    # Arguments are workspace paths claude must treat as trusted, so the
+    # "trust this workspace" dialog never blocks a container session.
+    if [ "$#" -gt 0 ]; then
+        jq 'reduce $ARGS.positional[] as $p (.; .projects[$p].hasTrustDialogAccepted = true)' \
+            --args "$@" < "$HOME/.claude.json" > /tmp/claude-json-tmp && \
+            mv /tmp/claude-json-tmp "$HOME/.claude.json"
+    fi
 }

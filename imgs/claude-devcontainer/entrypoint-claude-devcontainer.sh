@@ -34,6 +34,7 @@ if [ -n "${TICKET_MODE:-}" ]; then
     mkdir -p "$TICKET_ROOT"
     TICKET_ROWS=""
     TICKET_ADD_DIRS=""
+    TICKET_TRUST_DIRS=("$TICKET_ROOT")
     REPO_INDEX=0
     export CLD_TICKET_ANCHOR_ENV_FILE="/tmp/cld-ticket-anchors.sh"
     : > "$CLD_TICKET_ANCHOR_ENV_FILE"
@@ -103,10 +104,11 @@ if [ -n "${TICKET_MODE:-}" ]; then
         # loads a repo's .claude/skills/ only once it touches a file there;
         # --add-dir loads them at startup.
         TICKET_ADD_DIRS="${TICKET_ADD_DIRS} --add-dir $(printf '%q' "$REPO_WORKSPACE")"
+        TICKET_TRUST_DIRS+=("$REPO_WORKSPACE")
     done < <(printf '%s' "$CLD_TICKET_MANIFEST" | jq -c '.repos[]')
 
     write_ticket_claude_md "$TICKET_ROOT" "$TICKET" "$TICKET_ROWS"
-    build_claude_config
+    build_claude_config "${TICKET_TRUST_DIRS[@]}"
 
     # Claude wrapper: permission-skip and baked skills stay in-container; the
     # model comes per-invocation from `cld claude -- --model ...`, never baked
