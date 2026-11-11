@@ -65,7 +65,8 @@ if [ ! -d /repo/.jj ]; then
     rev=$(git --git-dir=/repo/.git rev-parse --verify --quiet "$REVISION^{commit}") ||
         { echo "[runtests] cannot resolve $REVISION in the git store" >&2; exit 1; }
     trap 'git --git-dir=/repo/.git worktree remove --force "$work" >/dev/null 2>&1 || true' EXIT
-    git --git-dir=/repo/.git worktree add --quiet --detach "$work" "$rev"
+    # No hooks: the store holds the host's own post-checkout, and this image gets no hooks setting.
+    git -c core.hooksPath=/dev/null --git-dir=/repo/.git worktree add --quiet --detach "$work" "$rev"
     cd "$work"
 else
     # --ignore-working-copy wherever /repo is touched: a plain jj command there would

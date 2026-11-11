@@ -226,6 +226,19 @@ class TestGitWorkspaceStep:
         assert result.returncode != 0
         assert "cannot resolve no-such-rev in the git store" in result.stderr
 
+    def test_a_hook_of_the_store_never_runs(self, entrypoint, git_repo, env, tmp_path):
+        """The runner images have no hooks setting of their own, and a failing post-checkout
+        would fail `git worktree add`; a working one would run host code."""
+        marker = tmp_path / "hook-ran"
+        hook = git_repo / ".git/hooks/post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        hook.chmod(0o755)
+        rev = _git(env, git_repo, "rev-parse", "HEAD").strip()
+        result = _run(entrypoint, git_repo, env, rev, after="cat tracked.txt")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "committed\n"
+        assert not marker.exists()
+
 
 def test_graphqlserver_takes_over_the_registration_a_killed_server_left(git_repo, env):
     """docker rm -f skips the exit trap: the registration of the old container's worktree stays."""
