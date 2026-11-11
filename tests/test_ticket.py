@@ -912,6 +912,63 @@ class TestForgetGitSessionState:
         assert not [ref for ref in self._refs(git_repo) if ref.startswith("refs/cld/")]
         assert f"refs/heads/{self.SESSION}" not in self._refs(git_repo)
 
+    def _detach_with_commit(self, git_repo, workspace: str, tmp_path) -> str:
+        """Recreate the worktree dir (the lost registration's path), detach HEAD and commit there."""
+        git_repo.run(["worktree", "unlock", workspace])
+        git_repo.run(["worktree", "remove", "--force", workspace])
+        git_repo.run(["worktree", "add", "--lock", "--reason", self.SESSION, "--detach", workspace,
+                      f"refs/heads/{self.SESSION}"])
+        git_repo.run(["-C", workspace, "commit", "-q", "--allow-empty", "-m", "detached work"])
+        head = git_repo.run(["-C", workspace, "rev-parse", "HEAD"]).stdout.strip()
+        shutil.rmtree(workspace)
+        return head
+
+    def _archived(self, git_repo, suffix: str = "") -> dict[str, str]:
+        prefix = f"refs/cld/ended/{self.SESSION}/"
+        return {ref: sha for ref, sha in self._refs(git_repo).items()
+                if ref.startswith(prefix) and ref.endswith(suffix)}
+
+    def test_detached_work_is_archived_next_to_the_branch_tip(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        tip = git_repo.run(["rev-parse", f"refs/heads/{self.SESSION}"]).stdout.strip()
+        head = self._detach_with_commit(git_repo, workspace, tmp_path)
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        archived = self._archived(git_repo)
+        tip_ref = next(ref for ref, sha in archived.items() if sha == tip)
+        assert archived == {tip_ref: tip, f"{tip_ref}-detached": head}
+        assert f"refs/heads/{self.SESSION}" not in self._refs(git_repo)
+        assert f"refs/cld/anchor/{self.SESSION}" not in self._refs(git_repo)
+
+    def test_detached_work_is_archived_when_the_branch_holds_nothing_more(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=False)
+        head = self._detach_with_commit(git_repo, workspace, tmp_path)
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        assert list(self._archived(git_repo).values()) == [head]
+
+    @pytest.mark.parametrize("work", [False, True], ids=["at-the-scratch-commit", "on-the-branch-tip"])
+    def test_a_detached_head_already_reachable_is_not_archived_again(self, git_repo, tmp_path, work):
+        workspace = self._lifecycle(git_repo, tmp_path, work=work)
+        git_repo.run(["worktree", "unlock", workspace])
+        git_repo.run(["worktree", "remove", "--force", workspace])
+        git_repo.run(["worktree", "add", "--lock", "--reason", self.SESSION, "--detach", workspace,
+                      f"refs/heads/{self.SESSION}"])
+        shutil.rmtree(workspace)
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        assert not self._archived(git_repo, "-detached")
+        assert len(self._archived(git_repo)) == (1 if work else 0)
+
+    def test_a_branch_checkout_is_not_archived_as_detached(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        assert not self._archived(git_repo, "-detached")
+
+    def test_a_failed_detached_archive_keeps_the_registration(self, tmp_path, caplog):
+        backend = self._scripted_backend(detached=True, fail="update-ref refs/cld/ended")
+        with patch("cld.ticket.get_backend", return_value=backend), caplog.at_level("WARNING"):
+            forget_session_state(str(tmp_path), self.SESSION, "/workspace/x/api")
+        assert not [c for c in self._commands(backend) if c.startswith(("worktree remove", "branch -D"))]
+        assert "recover with: cd /repo && git update-ref refs/cld/ended/t.x/" in caplog.text
+
     def test_a_missing_ref_and_registration_are_tolerated(self, git_repo, tmp_path):
         git_repo.run(["branch", self.SESSION])
         forget_session_state(str(git_repo.repo_root), self.SESSION, str(tmp_path / "never-registered"))
@@ -927,9 +984,10 @@ class TestForgetGitSessionState:
         assert "refs/heads/t.other" in refs
 
     @staticmethod
-    def _scripted_backend(fail: str = "") -> MagicMock:
+    def _scripted_backend(fail: str = "", detached: bool = False) -> MagicMock:
         """A git backend whose rev-parse finds a branch tip above the scratch commit and which
-        fails the command that starts with *fail*."""
+        fails the command that starts with *fail*. With *detached*, the worktree's HEAD is
+        detached on a commit neither the branch nor the anchor holds."""
         backend = MagicMock()
         backend.name = "git"
         backend.repo_root = Path("/repo")
@@ -937,9 +995,11 @@ class TestForgetGitSessionState:
         def run(cmd):
             out = ""
             if cmd[0] == "worktree" and cmd[1] == "list":
-                out = "worktree /workspace/x/api\n"
+                out = "worktree /workspace/x/api\n" + ("HEAD " + "c" * 40 + "\ndetached\n" if detached else "")
             elif cmd[0] == "rev-parse":
                 out = "a" * 40 if "refs/heads/t.x^{commit}" in cmd else "b" * 40
+            if cmd[0] == "merge-base":
+                return MagicMock(returncode=1, stdout="", stderr="")
             return MagicMock(returncode=1 if fail and " ".join(cmd).startswith(fail) else 0, stdout=out, stderr="boom")
 
         backend.run.side_effect = run

@@ -643,7 +643,8 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
     """git shutdown: end the session's lifecycle, keeping the work.
 
     Order matters: git refuses to delete a checked-out branch, so the worktree
-    registration goes first; the branch tip is archived before the branch is
+    registration goes first, after a detached HEAD holding commits of its own is
+    archived (``<stamp>-detached``); the branch tip is archived before the branch is
     deleted (when it holds work above the scratch commit); the anchor ref goes
     last, because it is the lifecycle-alive marker -- a partial failure leaves
     it, and the next start reattaches. Stops at the first failure with the
@@ -666,15 +667,24 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
         found = backend.run(["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"])
         return found.stdout.strip() if found.returncode == 0 else ""
 
-    registered = backend.run(["worktree", "list", "--porcelain"]).stdout.splitlines()
-    if f"worktree {worktree_path}" in registered:
+    def contains(ref: str, commit: str) -> bool:
+        return bool(rev(ref)) and backend.run(["merge-base", "--is-ancestor", commit, ref]).returncode == 0
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    listing = [block.splitlines() for block in backend.run(["worktree", "list", "--porcelain"]).stdout.split("\n\n")]
+    if mine := next((block for block in listing if block[:1] == [f"worktree {worktree_path}"]), None):
+        # Commits made on a detached HEAD are held by nothing else once the registration is gone.
+        head = next((line.removeprefix("HEAD ") for line in mine if line.startswith("HEAD ")), "")
+        if (head and "detached" in mine and not contains(f"refs/heads/{session}", head)
+                and not contains(anchor, head)):
+            if not run("update-ref", ended_ref(session, f"{stamp}-detached"), head):
+                return
         # A lock whose directory is gone is what keeps the registration (and a detached HEAD) alive.
         backend.run(["worktree", "unlock", worktree_path])
         if not run("worktree", "remove", "--force", worktree_path):
             return
     if tip := rev(f"refs/heads/{session}"):
         if tip != rev(anchor):
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             if not run("update-ref", ended_ref(session, stamp), tip):
                 return
         if not run("branch", "-D", session):

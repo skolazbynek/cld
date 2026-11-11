@@ -107,7 +107,9 @@ def anchor_ref(identifier: str) -> str:
 
 def ended_ref(identifier: str, stamp: str) -> str:
     """Where shutdown archives the tip of a git ticket's session branch before
-    deleting the branch. *stamp* is a UTC ``YYYYmmddTHHMMSSZ`` string."""
+    deleting the branch. *stamp* is a UTC ``YYYYmmddTHHMMSSZ`` string; the
+    detached HEAD of the worktree is archived under the same stamp plus
+    ``-detached``."""
     return f"refs/cld/ended/{identifier}/{stamp}"
 
 
