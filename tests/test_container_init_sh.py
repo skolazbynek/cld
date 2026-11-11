@@ -183,6 +183,49 @@ class TestTicketClaudeMdBookmarkNames:
         assert "Never use `internal.`" in text
 
 
+class TestTicketClaudeMdGitRepos:
+    """A row whose backend is git adds git wording; a table of jj rows reads as before."""
+
+    JJ_ROW = "| cld | abc | isolated | jj |"
+    GIT_ROW = "| api | def | isolated | git |"
+
+    def _claude_md(self, tmp_path, rows: list[str], broker_wired: bool = False) -> str:
+        root = tmp_path / "ticket"
+        root.mkdir()
+        table = "".join(f"{row}\n" for row in rows)
+        _source_container_init(tmp_path, f"write_ticket_claude_md {root} lide-1 '{table}'", broker_wired)
+        return (root / "CLAUDE.md").read_text()
+
+    def test_git_row_adds_the_git_section(self, tmp_path):
+        text = self._claude_md(tmp_path, [self.GIT_ROW])
+        assert "## Git repos" in text
+        assert "the branch `t.lide-1`" in text
+        assert "`t.lide-1` is the session branch: never delete it" in text
+        assert "Commit with `git add` and `git commit`" in text
+        assert "The session branch advances\n  with each commit" in text
+        assert "`git push origin HEAD:t.lide-1.mr`" in text
+        # The jj text stays in place above it.
+        assert "`t.lide-1` is the session bookmark: never move or delete it." in text
+
+    def test_mixed_table_gets_the_git_section_too(self, tmp_path):
+        assert "## Git repos" in self._claude_md(tmp_path, [self.JJ_ROW, self.GIT_ROW])
+
+    def test_jj_table_has_no_git_wording(self, tmp_path):
+        text = self._claude_md(tmp_path, [self.JJ_ROW], broker_wired=True)
+        assert "Git repos" not in text
+        assert "git add" not in text
+        assert "committed work only" not in text
+
+    def test_broker_section_says_git_tests_see_committed_work_only(self, tmp_path):
+        text = self._claude_md(tmp_path, [self.GIT_ROW], broker_wired=True)
+        assert "uncommitted ones included" in text
+        assert "For a git repo the broker sees committed work only" in text
+        assert "the tip of the\nbranch `t.lide-1`" in text
+
+    def test_no_broker_note_without_the_broker(self, tmp_path):
+        assert "committed work only" not in self._claude_md(tmp_path, [self.GIT_ROW])
+
+
 class TestTicketClaudeMdOriginLine:
     """Origin is only the store now, and the generated CLAUDE.md says so."""
 

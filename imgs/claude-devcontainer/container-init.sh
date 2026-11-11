@@ -82,6 +82,24 @@ Every bookmark you create starts with this ticket's identifier \`t.${ticket}\`.
 - Any other bookmark: \`t.${ticket}.<word>\` (more dotted words may follow).
 - Never use \`internal.\`: it belongs to host automation.
 EOF
+    local has_git=0
+    [[ "$rows" == *"| git |"* ]] && has_git=1
+    if [ "$has_git" = 1 ]; then
+        cat >> "$ticket_root/CLAUDE.md" <<EOF
+
+## Git repos
+
+For a repo whose Backend above is \`git\`, the workspace is a git worktree on
+the branch \`t.${ticket}\`, and the bookmark rules above apply to branches:
+
+- \`t.${ticket}\` is the session branch: never delete it or switch the
+  workspace off it. Every other branch you create starts with \`t.${ticket}\`.
+- Commit with \`git add\` and \`git commit\`. The session branch advances
+  with each commit; uncommitted edits are not part of any shared state.
+- Push a merge request with \`git push origin HEAD:t.${ticket}.mr\` (or
+  \`HEAD:t.${ticket}.mr-<word>\`).
+EOF
+    fi
     if cld_broker_wired; then
         cat >> "$ticket_root/CLAUDE.md" <<'EOF'
 
@@ -98,6 +116,14 @@ against your latest edits -- uncommitted ones included.
 Pass the repo name (`--repo <name>`, tool argument `repo`) only when this
 ticket mounts more than one repo.
 EOF
+        if [ "$has_git" = 1 ]; then
+            cat >> "$ticket_root/CLAUDE.md" <<EOF
+
+For a git repo the broker sees committed work only: it tests the tip of the
+branch \`t.${ticket}\`, not your working tree. Commit before you run tests
+or restart the server.
+EOF
+        fi
     fi
     echo "[cld] wrote ${ticket_root}/CLAUDE.md"
 }
