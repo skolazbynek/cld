@@ -534,6 +534,27 @@ def host_jj(repo: str, *args: str, snapshot: bool = False) -> str | None:
     return _out("jj", "-R", repo, *(() if snapshot else ("--ignore-working-copy",)), *args)
 
 
+def _git_only(repo: str) -> bool:
+    return os.path.isdir(f"{repo}/.git") and not os.path.lexists(f"{repo}/.jj")
+
+
+def host_git(repo: str, *args: str) -> str | None:
+    """stdout of host ``git --git-dir <repo>/.git <args>``, None if it failed. For a git-only repo
+    (no ``.jj``) after the same store checks the runner mount makes, so git never loads the config
+    or hooks of a git dir the container can write. Raises StoreRefused."""
+    layout = store_layout(repo)
+    return _out("git", "--git-dir", f"{repo}/{layout.git_dir}", *args)
+
+
+def git_branch_tip(repo: str, branch: str) -> str | None:
+    """Commit id of ``refs/heads/<branch>`` in a git-only *repo*: committed work only, as a git
+    worktree has no working-copy snapshot to read. None if the branch is missing."""
+    try:
+        return host_git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}")
+    except StoreRefused as e:
+        _die(str(e), 3)
+
+
 def store_rows(layout: StoreLayout) -> list[tuple[str, str, bool]]:
     """The eleven mount rows as ``(path, kind, readonly)``; the path is the same under the host
     repo and under the container root. The ``commondir`` row is a placeholder that keeps the
@@ -746,7 +767,10 @@ class LabelCaller:
     # violate the broker's store-reading-only posture (docs/design-cld-broker.md
     # §9) for no freshness gain -- watchman already wrote the container's own
     # snapshot independently.
+    # A git-only repo has no workspace tip: the session branch is the tip (committed work only).
     def revision(self, repo: str) -> str | None:
+        if _git_only(repo):
+            return git_branch_tip(repo, self.name)
         return _commit_id(repo, f"{self.name}@")
 
     # The agent already forwarded into the caller (cld/docker.py:stage_ssh_agent),

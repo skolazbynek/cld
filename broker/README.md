@@ -201,12 +201,14 @@ host registry. Its other ops act on an agent by name, which carries its repo,
 so they need none. `graphql`, like `run-tests`, stays on the caller's mounted
 repos (`Caller.repo`).
 
-Both `run-tests`' `resolve_test_context` and `graphql`'s
-`resolve_graphql_context` resolve the session's revision by calling `jj`
-unconditionally -- neither action works against a git-backed repo (jj
-resolution `exit 3`s). `graphql`'s read-only ops (`status`/`logs`/`stop`/
-`endpoints`) avoid this by not resolving a revision at all; only `start` (and
-by extension `restart`) needs it.
+`run-tests` and `graphql start` (and `restart`) resolve the session's revision first. On a jj
+repo that is the session workspace's tip, `<session>@`, so uncommitted edits are part of the run.
+On a git repo it is the commit of the branch `refs/heads/<session>` (read with host `git`
+after the same store checks as the mount), and the runner checks it out through a detached
+`git worktree`: **on git only committed work is tested** -- commit first, edits in the working
+tree are not seen. A git session without that branch gets `cannot resolve revision` (exit 3).
+`graphql`'s read-only ops (`status`/`logs`/`stop`/`endpoints`) do not need a revision at all.
+The host route (`cld-brokerctl run`, `CliCaller`) takes a jj revset and still works on jj repos only.
 
 `task-agent` is the only action that creates a container with a caller-chosen file
 mounted inside it, so it also polices its argv: `--force` is denied (overriding a

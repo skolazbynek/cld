@@ -19,6 +19,9 @@
 #   VENV_CACHE*           venv cache controls, see venv-cache.sh (the cache is
 #                         used only when the broker mounts it at /cache).
 #
+# A git store (no .jj) is checked out the same way through a detached `git worktree`, at the
+# commit REVISION names -- committed work only, the broker resolves the session's branch.
+#
 # Only the repo's jj/git store is bind-mounted at /repo -- no checkout files, and the
 # settings and the default workspace's working_copy are read-only (docs/design-secrets-
 # containment.md section 3.1); the isolated working copy is created under $HOME via
@@ -54,30 +57,43 @@ seed-secure-config.sh /repo
 # Workspace dir lives under $HOME: with `--user` (the broker path always uses
 # it) the container user cannot mkdir at / (root-owned), but $HOME is writable.
 work="$HOME/gql-workspace"
-# Best effort only -- `docker rm -f` sends SIGKILL and this trap does not run,
-# which is exactly why the broker's `stop`/`restart` forgets $GQL_WORKSPACE
-# explicitly by its (deterministic) name rather than relying on this.
-# --ignore-working-copy wherever /repo is touched, as in runtests: a plain jj
-# command there would snapshot a checkout that is not mounted, and fails instead.
-trap 'jj -R /repo --ignore-working-copy workspace forget "$GQL_WORKSPACE" >/dev/null 2>&1 || true' EXIT
+if [ ! -d /repo/.jj ]; then
+    # A git store: the broker resolved REVISION to a commit of the session branch, so only
+    # committed work is served. A detached worktree under $HOME, named by the deterministic
+    # $GQL_WORKSPACE, checks it out; -f takes over the registration a killed server left
+    # behind. --git-dir skips the ownership check on /repo, which the mount makes root-owned.
+    work="$HOME/$GQL_WORKSPACE"
+    rev=$(git --git-dir=/repo/.git rev-parse --verify --quiet "$REVISION^{commit}") ||
+        { echo "[graphqlserver] cannot resolve $REVISION in the git store" >&2; exit 1; }
+    trap 'git --git-dir=/repo/.git worktree remove --force "$work" >/dev/null 2>&1 || true' EXIT
+    git --git-dir=/repo/.git worktree add --quiet -f --detach "$work" "$rev"
+    cd "$work"
+else
+    # Best effort only -- `docker rm -f` sends SIGKILL and this trap does not run,
+    # which is exactly why the broker's `stop`/`restart` forgets $GQL_WORKSPACE
+    # explicitly by its (deterministic) name rather than relying on this.
+    # --ignore-working-copy wherever /repo is touched, as in runtests: a plain jj
+    # command there would snapshot a checkout that is not mounted, and fails instead.
+    trap 'jj -R /repo --ignore-working-copy workspace forget "$GQL_WORKSPACE" >/dev/null 2>&1 || true' EXIT
 
-rev=$(jj --ignore-working-copy log --no-graph -n1 -r "$REVISION" -T commit_id)
-# The caller may have snapshotted again since REVISION was resolved. Building on
-# its now-hidden old commit would make that commit visible again -- a divergent
-# twin of the caller's change -- so take the change's current commit instead.
-if change=$(jj --ignore-working-copy log --no-graph -r "$rev" -T 'if(hidden, change_id)') && [ -n "$change" ]; then
-    rev=$(jj --ignore-working-copy log --no-graph -n1 -r "change_id($change)" -T commit_id)
-    [ -n "$rev" ] || { echo "[graphqlserver] $REVISION was abandoned" >&2; exit 1; }
+    rev=$(jj --ignore-working-copy log --no-graph -n1 -r "$REVISION" -T commit_id)
+    # The caller may have snapshotted again since REVISION was resolved. Building on
+    # its now-hidden old commit would make that commit visible again -- a divergent
+    # twin of the caller's change -- so take the change's current commit instead.
+    if change=$(jj --ignore-working-copy log --no-graph -r "$rev" -T 'if(hidden, change_id)') && [ -n "$change" ]; then
+        rev=$(jj --ignore-working-copy log --no-graph -n1 -r "change_id($change)" -T commit_id)
+        [ -n "$rev" ] || { echo "[graphqlserver] $REVISION was abandoned" >&2; exit 1; }
+    fi
+    # Without a snapshot jj creates the workspace but refuses to check it out;
+    # `jj new` inside it does the checkout. Any other failure is real.
+    err=$(jj --quiet --ignore-working-copy workspace add --name "$GQL_WORKSPACE" -r "$rev" "$work" 2>&1) ||
+        case "$err" in
+            *"must be able to update the working copy"*) ;;
+            *) echo "$err" >&2; exit 1 ;;
+        esac
+    cd "$work"
+    jj --quiet new "$rev"
 fi
-# Without a snapshot jj creates the workspace but refuses to check it out;
-# `jj new` inside it does the checkout. Any other failure is real.
-err=$(jj --quiet --ignore-working-copy workspace add --name "$GQL_WORKSPACE" -r "$rev" "$work" 2>&1) ||
-    case "$err" in
-        *"must be able to update the working copy"*) ;;
-        *) echo "$err" >&2; exit 1 ;;
-    esac
-cd "$work"
-jj --quiet new "$rev"
 cd "$work/$PROJECT_SUBDIR"
 
 if [ -f "$SECRETS_FILE" ]; then

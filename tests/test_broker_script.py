@@ -1975,6 +1975,77 @@ esac
         assert "graphql-sweep() { run graphql-sweep; }" in code
 
 
+class TestGitTicketRevision:
+    """A git-only repo has no workspace tip: run-tests and graphql start get the session branch's
+    commit (committed work only), through host git after the store checks of the runner mount."""
+
+    SESSION = "t.x"
+
+    @pytest.fixture
+    def git_store(self, tmp_path) -> Path:
+        """A real git repo: the session branch on the first commit, the checked-out branch one commit later."""
+        repo = tmp_path / "git-repo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@localhost"]
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "first"], check=True)
+        subprocess.run([*git, "branch", self.SESSION], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "second"], check=True)
+        (repo / ".git" / "hooks").mkdir(exist_ok=True)
+        (repo / ".git" / "commondir").write_text(".")
+        return repo
+
+    def _rev(self, repo: Path, ref: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", ref], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def test_the_label_caller_resolves_the_session_branch_not_head(self, git_store):
+        tip = broker.LabelCaller(self.SESSION, "ticket", "").revision(str(git_store))
+        assert tip == self._rev(git_store, self.SESSION)
+        assert tip != self._rev(git_store, "HEAD")
+
+    def test_a_missing_session_branch_is_unresolved(self, git_store):
+        assert broker.LabelCaller("t.other", "ticket", "").revision(str(git_store)) is None
+
+    def test_a_refused_store_is_a_denial_and_runs_no_git(self, git_store, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))
+        _fakebin(tmp_path, monkeypatch, git='echo "$*" >> "$FAKE_GIT_LOG"\n')
+        _break_commondir_redirect(git_store)
+        with pytest.raises(SystemExit) as excinfo:
+            broker.LabelCaller(self.SESSION, "ticket", "").revision(str(git_store))
+        assert _exit_code(excinfo) == 3
+        assert "commondir exists" in capsys.readouterr().err
+        assert not (tmp_path / "git.log").exists()
+
+    def test_a_jj_repo_never_asks_git(self, repo, tmp_path, monkeypatch):
+        monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))
+        _fakebin(tmp_path, monkeypatch, git='echo "$*" >> "$FAKE_GIT_LOG"\n', jj="echo rev123\n")
+        assert broker.LabelCaller("a.t1.x", "task-agent", str(repo)).revision(str(repo)) == "rev123"
+        assert not (tmp_path / "git.log").exists()
+
+    def test_run_tests_passes_the_branch_tip_as_the_revision(self, git_store, stage, monkeypatch):
+        launched = []
+        monkeypatch.setattr(broker, "_exec", launched.append)
+        broker.action_run_tests(broker.LabelCaller(self.SESSION, "task-agent", str(git_store)), [])
+        argv = launched[0]
+        assert f"REVISION={self._rev(git_store, self.SESSION)}" in argv
+        assert f"type=bind,src={git_store}/.git,dst=/repo/.git" in " ".join(argv)
+
+    def test_graphql_start_resolves_the_branch_tip(self, git_store):
+        caller = broker.LabelCaller(self.SESSION, "ticket", "")
+        assert broker.resolve_revision(caller, str(git_store)) == self._rev(git_store, self.SESSION)
+
+    def test_host_git_is_named_only_in_host_git(self):
+        """Static: the script runs the `git` binary only through host_git, after the store checks."""
+        lines = BROKER_PY.read_text().splitlines()
+        hits = [i for i, line in enumerate(lines) if '"git"' in line and not line.lstrip().startswith("#")]
+        assert [next(line for line in reversed(lines[:i]) if line.startswith("def ")).split("(")[0]
+                for i in hits] == ["def host_git"]
+        start = next(i for i, line in enumerate(lines) if line.startswith("def host_git("))
+        body = "\n".join(lines[start:hits[0] + 1])
+        assert body.index("store_layout(repo)") < body.index('_out("git"')
+
+
 class TestVenvCachePerRepo:
     """Code under test writes the venv cache, and a venv or a wheel in it is run or installed later
     with the `.env` of whichever repo restores it. A repo therefore gets a folder of its own below

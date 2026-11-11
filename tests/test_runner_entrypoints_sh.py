@@ -180,10 +180,62 @@ class TestStoreOnlyRepo:
 def test_every_jj_call_in_the_store_ignores_its_working_copy(entrypoint, tmp_path):
     """Static: every jj call before the `cd` into the new workspace. /repo holds no checkout,
     so a plain jj there would snapshot every file as deleted (or fail on the read-only rows)."""
-    fragment = _fragment(entrypoint, tmp_path).split('\ncd "$work"\n')[0]
+    fragment = _fragment(entrypoint, tmp_path).split("\nelse\n")[1].split('\n    cd "$work"\n')[0]
     calls = re.findall(r"\bjj\b[^\n]*", re.sub(r"^\s*#.*$", "", fragment, flags=re.MULTILINE))
     assert len(calls) >= 4
     assert all("--ignore-working-copy" in call for call in calls)
+
+
+def _git(env: dict, repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@localhost", *args],
+                          env=env, capture_output=True, text=True, check=True).stdout
+
+
+@pytest.fixture
+def git_repo(tmp_path, env):
+    """A git store with one committed file, a later uncommitted edit and an untracked file."""
+    repo = tmp_path / "git-repo"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    (repo / "tracked.txt").write_text("committed\n")
+    _git(env, repo, "add", "tracked.txt")
+    _git(env, repo, "commit", "-q", "-m", "first")
+    (repo / "tracked.txt").write_text("edited, not committed\n")
+    (repo / "host-edit.txt").write_text("in progress\n")
+    return repo
+
+
+@pytest.mark.parametrize("entrypoint", ENTRYPOINTS, ids=["runtests", "graphqlserver"])
+class TestGitWorkspaceStep:
+    """A store with no .jj is checked out through a detached git worktree at the commit the broker resolved."""
+
+    def test_checks_out_the_committed_revision_only(self, entrypoint, git_repo, env):
+        rev = _git(env, git_repo, "rev-parse", "HEAD").strip()
+        result = _run(entrypoint, git_repo, env, rev, after="cat tracked.txt; test ! -e host-edit.txt")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "committed\n"
+
+    def test_the_worktree_is_removed_on_exit(self, entrypoint, git_repo, env):
+        rev = _git(env, git_repo, "rev-parse", "HEAD").strip()
+        result = _run(entrypoint, git_repo, env, rev, after="echo junk > byproduct.txt")
+        assert result.returncode == 0, result.stderr
+        assert _git(env, git_repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+        assert _git(env, git_repo, "status", "--porcelain").splitlines() == [" M tracked.txt", "?? host-edit.txt"]
+
+    def test_unknown_revision_fails_with_a_message(self, entrypoint, git_repo, env):
+        result = _run(entrypoint, git_repo, env, "no-such-rev")
+        assert result.returncode != 0
+        assert "cannot resolve no-such-rev in the git store" in result.stderr
+
+
+def test_graphqlserver_takes_over_the_registration_a_killed_server_left(git_repo, env):
+    """docker rm -f skips the exit trap: the registration of the old container's worktree stays."""
+    rev = _git(env, git_repo, "rev-parse", "HEAD").strip()
+    stale = Path(env["HOME"]) / "gql-abc123"
+    _git(env, git_repo, "worktree", "add", "--detach", str(stale), rev)
+    shutil.rmtree(stale)
+    result = _run(ENTRYPOINTS[1], git_repo, env, rev, after="cat tracked.txt")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "committed\n"
 
 
 class TestSshWrapper:
