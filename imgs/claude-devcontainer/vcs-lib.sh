@@ -205,13 +205,19 @@ cld_boot_worktree() {
         echo "[cld] warm restart: reusing existing worktree at $workspace"
         return 0
     fi
-    # Drop a stale registration left by a recreate (the worktree dir died with
-    # the container layer, the origin's registration did not).
-    git -C "$origin" worktree prune 2>/dev/null || true
+    # The origin store is shared with other tickets whose worktree paths do not
+    # exist in this container, so never `git worktree prune` it. Worktrees are
+    # added locked (the lock reason names the session); a stale registration
+    # left by a recreate of THIS session is overridden below by its own path.
+    local add_flags=(--lock --reason "$bookmark")
+    if git -C "$origin" worktree list --porcelain \
+            | grep -Fxq "worktree $(realpath -m "$workspace")"; then
+        add_flags+=(-f -f)
+    fi
 
     if git -C "$origin" show-ref --verify --quiet "refs/heads/$bookmark"; then
         echo "[cld] reattaching worktree '$bookmark'"
-        if ! git -C "$origin" worktree add "$workspace" "$bookmark"; then
+        if ! git -C "$origin" worktree add "${add_flags[@]}" "$workspace" "$bookmark"; then
             echo "Error: git worktree add failed (reattach)" >&2
             return 1
         fi
@@ -220,7 +226,7 @@ cld_boot_worktree() {
 
     CLD_BOOT_FIRST_LAUNCH=1
     echo "[cld] first launch (git), base=${base_rev:0:12}"
-    if ! git -C "$origin" worktree add --no-track -b "$bookmark" "$workspace" "$base_rev"; then
+    if ! git -C "$origin" worktree add "${add_flags[@]}" --no-track -b "$bookmark" "$workspace" "$base_rev"; then
         echo "Error: git worktree add failed (first launch)" >&2
         return 1
     fi

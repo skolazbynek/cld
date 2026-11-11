@@ -369,6 +369,61 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         finally:
             _restore_writable(*protected)
 
+    def _git_origin(self, tmp_path, env) -> Path:
+        origin = tmp_path / "git-origin"
+        git = ["git", "-C", str(origin), "-c", "user.name=t", "-c", "user.email=t@localhost"]
+        subprocess.run(["git", "init", "-q", str(origin)], env=env, check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "seed"], env=env, check=True)
+        subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], env=env, check=True)
+        return origin
+
+    def _worktrees(self, env, origin: Path) -> dict[str, list[str]]:
+        """Registered worktree path -> its attribute lines (branch, locked ...)."""
+        out = subprocess.run(["git", "-C", str(origin), "worktree", "list", "--porcelain"],
+                             env=env, capture_output=True, text=True, check=True).stdout
+        blocks = [b.splitlines() for b in out.strip().split("\n\n")]
+        return {b[0].removeprefix("worktree "): b[1:] for b in blocks}
+
+    def test_git_worktree_is_locked_with_the_session_as_reason(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        result = self._boot(env, f"cld_boot_worktree {origin} {workspace} {self.BOOKMARK} origin/main")
+        assert result.returncode == 0, result.stderr
+        assert f"locked {self.BOOKMARK}" in self._worktrees(env, origin)[str(workspace)]
+
+    def test_git_boot_keeps_other_tickets_worktree_registrations(self, tmp_path, env):
+        """Their paths do not exist here; a blanket `git worktree prune` would drop them."""
+        origin = self._git_origin(tmp_path, env)
+        for other, lock in (("t.other", ["--lock", "--reason", "t.other"]), ("t.legacy", [])):
+            subprocess.run(["git", "-C", str(origin), "worktree", "add", *lock, "-b", other,
+                            str(tmp_path / other), "HEAD"], env=env, check=True, capture_output=True)
+            shutil.rmtree(tmp_path / other)
+        workspace = tmp_path / "ws"
+        result = self._boot(env, f"cld_boot_worktree {origin} {workspace} {self.BOOKMARK} origin/main")
+        assert result.returncode == 0, result.stderr
+        registered = self._worktrees(env, origin)
+        assert str(tmp_path / "t.other") in registered
+        assert str(tmp_path / "t.legacy") in registered
+
+    def test_git_reboot_replaces_only_its_own_stale_registration(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        subprocess.run(["git", "-C", str(origin), "worktree", "add", "--lock", "--reason", "t.other",
+                        "-b", "t.other", str(tmp_path / "other"), "HEAD"],
+                       env=env, check=True, capture_output=True)
+        shutil.rmtree(tmp_path / "other")
+        workspace = tmp_path / "ws"
+        boot = f"cld_boot_worktree {origin} {workspace} {self.BOOKMARK} origin/main"
+        assert self._boot(env, boot).returncode == 0
+        # The container layer died with the workspace; the registration stays.
+        shutil.rmtree(workspace)
+        result = self._boot(env, boot)
+        assert result.returncode == 0, result.stderr
+        assert "reattaching worktree" in result.stdout
+        assert (workspace / ".git").exists()
+        registered = self._worktrees(env, origin)
+        assert f"locked {self.BOOKMARK}" in registered[str(workspace)]
+        assert str(tmp_path / "other") in registered
+
 
 @pytest.mark.skipif(shutil.which("jj") is None or shutil.which("git") is None, reason="needs jj and git")
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
