@@ -1051,6 +1051,9 @@ def action_task_agent(caller: Caller, argv: list[str]) -> None:
                 _die(f"denied: prompt ref '{arg}' must be an @ref, not a path", 2)
         # Host-side start finds its repo from cwd.
         repo = resolve_task_agent_repo(caller, selector)
+        if _git_only(repo):
+            _die(f"denied: task-agents need a jj repo: {repo} is a git repo, and task-agents "
+                 "are not supported on git", 3)
         try:
             os.chdir(repo)
         except OSError:

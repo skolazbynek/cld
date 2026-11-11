@@ -356,6 +356,17 @@ path = "{tmp_path}/mounted"
         assert result.stdout.splitlines() == [
             f"CWD {home}/{name}", "task-agent", "start", "--parent", "t.x", "@task", "-n", "s"]
 
+    def test_start_on_a_git_repo_is_denied_before_cld_runs(self, home):
+        (home / "gitrepo" / ".git").mkdir(parents=True)
+        _write_registry(home, f"""
+[repos.gitrepo]
+path = "{home}/gitrepo"
+""")
+        result = self._dispatch(home, "task-agent", ["start", "--repo", "gitrepo", "@task", "-n", "s"])
+        assert result.returncode == 3
+        assert "task-agents need a jj repo" in result.stderr
+        assert result.stdout == ""
+
     def test_start_without_repo_on_several_mounts_denied(self, home):
         result = self._dispatch(home, "task-agent", ["start", "@task", "-n", "s"])
         assert result.returncode == 3

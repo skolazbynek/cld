@@ -370,7 +370,7 @@ def start_env(tmp_path, monkeypatch):
             # The real namer, minus the docker probe: slug validation stays real.
             allocate=p("allocate_task_agent_name", side_effect=names.agent_id),
             deliverable_free=p("assert_deliverable_free"),
-            get_backend=p("get_backend"),
+            get_backend=p("get_backend", return_value=SimpleNamespace(name="jj")),
             bca=p("build_container_args", return_value=["--name", "placeholder"]),
             anchor_env=p("anchor_env_args", return_value=["-e", "AGENT_REVISION_HINT=deadbeef"]),
             stage_home=p("stage_home_ro", return_value=[]),
@@ -504,6 +504,16 @@ class TestTaskAgentStart:
         result = self._invoke("-p", "do it", "-n", "add-oauth")
         assert result.exit_code == 0, result.output
         assert order == [("preflight", start_env.repo_root), "resolve"]
+
+    def test_git_repo_is_refused_up_front(self, start_env):
+        start_env.get_backend.return_value = SimpleNamespace(name="git")
+        result = self._invoke("-p", "do it", "-n", "add-oauth")
+        assert result.exit_code == 1
+        assert "task-agents need a jj repo" in result.output
+        assert "is a git repo" in result.output
+        assert not start_env.resolve_anchor.called
+        assert not start_env.ensure_image.called
+        assert not start_env.run.called
 
     def test_persona_recorded_for_display(self, start_env):
         """The first persona-kind ref names the role; nothing is mounted for it."""

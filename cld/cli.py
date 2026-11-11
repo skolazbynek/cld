@@ -260,6 +260,11 @@ def task_agent_start(
     repo_root = find_target_repo(cfg)
     # Before any host jj call on the repo (the anchor resolution below).
     prepare_store_mounts(repo_root)
+    if get_backend(repo_root).name != "jj":
+        raise RuntimeError(
+            f"task-agents need a jj repo: {repo_root} is a git repo, and task-agents "
+            "are not supported on git"
+        )
     brief, resolved = _compose_from_args(refs or [], prompt, repo_root, cld_root)
     # Display only: the roster's Persona column and the launch banner. A task-agent with
     # no persona ref is coherent -- the lifecycle preamble is always layered in.
