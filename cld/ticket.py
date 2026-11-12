@@ -16,6 +16,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import typer
 
@@ -446,14 +447,14 @@ def _reanchor_restart(
 
     done: list[tuple[object, list[str]]] = []
     moved: dict[str, tuple[str, str]] = {}
-    hints: dict[str, str] = {}
+    hints: dict[str, list[RebaseHint]] = {}
     try:
         for name, backend, s_hash, target in plan:
             repo = by_name[name]
             ops = move_anchor_commit(backend, s_hash, target, repo.anchor_mode, container)
             done.append((backend, ops))
             moved[name] = (repo.anchor_base, target)
-            hints[name] = _rebase_hint(backend, container, s_hash)
+            hints[name] = _rebase_hints(backend, container, s_hash, f"{WORKSPACE_BASE}/{slug}/{name}")
     except RuntimeError as e:
         for backend, ops in reversed(done):
             revert_ops(backend, ops)
@@ -474,28 +475,82 @@ def _reanchor_restart(
             f"  {name}: anchor {old_base[:12]} -> {new_base[:12]} "
             f"(undo: cld restart {slug} --reanchor {name}@{old_base})"
         )
-        if hints[name]:
+        for hint in hints[name]:
+            where = (
+                f"in the ticket worktree (`cld shell {slug}`, then cd to {name})"
+                if hint.in_worktree else "in the repo, where the branch is checked out (if anywhere)"
+            )
             typer.echo(
-                f"  {name}: branch {container} keeps its work on the old anchor commit; carry it over "
-                f"where it is checked out (`cld shell {slug}`, then cd to {name}): {hints[name]}"
+                f"  {name}: {hint.what} keeps its work on the old anchor commit, so a restart would resume it "
+                f"outside the anchor tree; carry it over {where}: {hint.command}"
             )
     typer.echo(f"Ticket '{slug}' recreated with {len(moved)} repo anchor(s) moved.")
 
 
-def _rebase_hint(backend: VcsBackend, container: str, old_anchor: str) -> str:
-    """git only: the ``git rebase --onto`` that moves the session branch onto the moved anchor
-    commit, when the branch did not follow it because it holds work above the old one."""
-    if backend.name != "git":
-        return ""
+class RebaseHint(NamedTuple):
+    """One ``git rebase --onto`` that carries work over to the moved anchor commit. *in_worktree*:
+    the work is checked out in the ticket's worktree, so the command runs there."""
 
-    def rev(ref: str) -> str:
-        found = backend.run(["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"])
+    command: str
+    what: str
+    in_worktree: bool
+
+
+def _worktree_block(backend: VcsBackend, worktree_path: str) -> list[str]:
+    """The ``git worktree list --porcelain`` lines of the worktree registered at *worktree_path*,
+    empty when none is."""
+    listing = [block.splitlines() for block in backend.run(["worktree", "list", "--porcelain"]).stdout.split("\n\n")]
+    return next((block for block in listing if block[:1] == [f"worktree {worktree_path}"]), [])
+
+
+def _rebase_hints(backend: VcsBackend, container: str, old_anchor: str, worktree_path: str) -> list[RebaseHint]:
+    """git only: the ``git rebase --onto`` commands for work that stayed on an old scratch commit
+    after the move: any local branch, and the detached HEAD of the ticket's worktree registration
+    (*worktree_path* in ``git worktree list``), that holds a scratch commit of this ticket but not
+    the current one. The session branch follows the move when it sits on the scratch commit;
+    a branch with work above it, another branch (``<id>.mr``) and a detached HEAD do not, and a
+    reattach would resume them outside the anchor tree.
+
+    The old scratch commits are *old_anchor* and every scratch commit of the ticket that a branch or
+    the worktree HEAD holds outside the history of the current one, so work stranded by an earlier
+    reanchor (and its undo) is found as well.
+    """
+    if backend.name != "git":
+        return []
+
+    def git(*args: str) -> str:
+        found = backend.run(list(args))
         return found.stdout.strip() if found.returncode == 0 else ""
 
-    new_anchor, tip = rev(anchor_ref(container)), rev(f"refs/heads/{container}")
-    if not tip or new_anchor in (old_anchor, tip):
-        return ""
-    return f"git rebase --onto {new_anchor} {old_anchor} {container}"
+    def descends(ancestor: str, commit: str) -> bool:
+        return backend.run(["merge-base", "--is-ancestor", ancestor, commit]).returncode == 0
+
+    new = git("rev-parse", "--verify", "-q", f"{anchor_ref(container)}^{{commit}}")
+    if not new:
+        return []
+    mine = _worktree_block(backend, worktree_path)
+    head = next((line.removeprefix("HEAD ") for line in mine if line.startswith("HEAD ")), "")
+    checked_out = next((line.removeprefix("branch refs/heads/") for line in mine if line.startswith("branch refs/heads/")), "")
+
+    scratch = git(
+        "rev-list", "--branches", *([head] if head else []), "--fixed-strings",
+        f"--grep=cld anchor: {container} mode=", "--not", new,
+    ).split()
+    olds = list(dict.fromkeys([old_anchor, *scratch]))
+    outside = set(git("for-each-ref", "--no-contains", new, "--format=%(refname:lstrip=2)", "refs/heads/").splitlines())
+    holders: dict[str, list[str]] = {}
+    for old in olds:
+        for branch in git("for-each-ref", "--contains", old, "--format=%(refname:lstrip=2)", "refs/heads/").splitlines():
+            if branch in outside:
+                holders.setdefault(branch, []).append(old)
+    hints = [
+        RebaseHint(f"git rebase --onto {new} {found[0]} {branch}", f"branch {branch}", branch == checked_out)
+        for branch, found in sorted(holders.items())
+    ]
+    if head and not checked_out and not descends(new, head):
+        if found := [old for old in olds if descends(old, head)]:
+            hints.append(RebaseHint(f"git rebase --onto {new} {found[0]}", "the detached HEAD", True))
+    return hints
 
 
 def restart_ticket(cfg: Config, ticket: str, reanchor: tuple[str, ...] = ()) -> None:
@@ -681,8 +736,7 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
         return bool(rev(ref)) and backend.run(["merge-base", "--is-ancestor", commit, ref]).returncode == 0
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    listing = [block.splitlines() for block in backend.run(["worktree", "list", "--porcelain"]).stdout.split("\n\n")]
-    if mine := next((block for block in listing if block[:1] == [f"worktree {worktree_path}"]), None):
+    if mine := _worktree_block(backend, worktree_path):
         # Commits made on a detached HEAD are held by nothing else once the registration is gone.
         head = next((line.removeprefix("HEAD ") for line in mine if line.startswith("HEAD ")), "")
         if (head and "detached" in mine and not contains(f"refs/heads/{session}", head)

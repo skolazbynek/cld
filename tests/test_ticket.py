@@ -20,7 +20,8 @@ from cld.ticket import (
     _bookmark_tip,
     _echo_new_log_lines,
     _parse_reanchor,
-    _rebase_hint,
+    RebaseHint,
+    _rebase_hints,
     _session_state,
     exec_claude,
     exec_shell,
@@ -38,6 +39,7 @@ from cld.ticket import (
     stop_ticket,
     wait_ticket_ready,
 )
+from cld.vcs.anchor import move_anchor_commit
 from cld.vcs.git import NO_HOOKS
 from cld.vcs.scratch import stage_in_workspace
 
@@ -591,12 +593,19 @@ class TestReanchorRestart:
         with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
              patches["get_backend"], patches["find_anchor"], patches["resolver"], \
              patches["move"], patches["revert"], patches["subprocess_run"], \
-             patch("cld.ticket._rebase_hint", return_value="git rebase --onto N S t.lide-2600"), \
+             patch("cld.ticket._rebase_hints", return_value=[
+                 RebaseHint("git rebase --onto N S t.lide-2600", "branch t.lide-2600", True),
+                 RebaseHint("git rebase --onto N S", "the detached HEAD", True),
+                 RebaseHint("git rebase --onto N S t.lide-2600.mr", "branch t.lide-2600.mr", False),
+             ]) as hints, \
              patches["launch"], patches["warm_start"]:
             restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
         out = capsys.readouterr().out
+        assert hints.call_args.args[1:] == ("t.lide-2600", "s" * 40, "/workspace/lide-2600/lide-api")
         assert "lide-api: branch t.lide-2600 keeps its work on the old anchor commit" in out
-        assert "git rebase --onto N S t.lide-2600" in out
+        assert "in the ticket worktree (`cld shell lide-2600`, then cd to lide-api): git rebase --onto N S t.lide-2600\n" in out
+        assert "lide-api: the detached HEAD keeps its work" in out
+        assert "in the repo, where the branch is checked out (if anywhere): git rebase --onto N S t.lide-2600.mr" in out
 
     def test_no_hint_line_for_jj(self, capsys):
         manifest = self._manifest()
@@ -726,40 +735,126 @@ class TestReanchorRestart:
         assert rc[0][3] == "t.lide-2600"
 
 
-class TestRebaseHint:
-    """The hint is for a git session branch that kept its work above the old anchor commit."""
+class TestRebaseHints:
+    """The hints name every git ref that kept its work on an old scratch commit after a reanchor:
+    real repos, real worktree registration, the real move."""
 
     SESSION = "t.x"
 
-    def _setup(self, git_repo, *, branch_follows: bool) -> tuple[str, str]:
-        old = git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
-        git_repo.run(["commit", "-q", "--allow-empty", "-m", "new anchor"])
-        new = git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
-        git_repo.run(["update-ref", f"refs/cld/anchor/{self.SESSION}", new])
-        git_repo.run(["update-ref", f"refs/heads/{self.SESSION}", new if branch_follows else old])
-        return old, new
+    @pytest.fixture
+    def lifecycle(self, git_repo, tmp_path):
+        """A locked ticket worktree on the session branch at its scratch commit S, plus a host
+        commit T to move the anchor onto. Returns (workspace, S, T)."""
+        workspace = tmp_path.resolve() / "ws"
+        base = git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
+        git_repo.run(["worktree", "add", "--lock", "--reason", self.SESSION, "--no-track", "-b", self.SESSION,
+                      str(workspace), base])
+        old = stage_in_workspace(workspace, self.SESSION, {})
+        git_repo.run(["commit", "-q", "--allow-empty", "-m", "target"])
+        return workspace, old, git_repo.run(["rev-parse", "HEAD"]).stdout.strip()
 
-    def test_branch_that_kept_its_work_gets_the_rebase_command(self, git_repo):
-        old, new = self._setup(git_repo, branch_follows=False)
-        assert _rebase_hint(git_repo, self.SESSION, old) == f"git rebase --onto {new} {old} {self.SESSION}"
+    def _commit(self, git_repo, workspace: Path, message: str) -> str:
+        git_repo.run(["-C", str(workspace), "commit", "-q", "--allow-empty", "-m", message])
+        return git_repo.run(["-C", str(workspace), "rev-parse", "HEAD"]).stdout.strip()
 
-    def test_branch_that_followed_the_anchor_needs_none(self, git_repo):
-        old, _new = self._setup(git_repo, branch_follows=True)
-        assert _rebase_hint(git_repo, self.SESSION, old) == ""
+    def _move(self, git_repo, old: str, target: str) -> str:
+        move_anchor_commit(git_repo, old, target, "isolated", self.SESSION)
+        return git_repo.run(["rev-parse", f"refs/cld/anchor/{self.SESSION}"]).stdout.strip()
 
-    def test_anchor_that_did_not_move_needs_none(self, git_repo):
-        _old, new = self._setup(git_repo, branch_follows=False)
-        assert _rebase_hint(git_repo, self.SESSION, new) == ""
+    def _hints(self, git_repo, old: str, workspace: Path):
+        return _rebase_hints(git_repo, self.SESSION, old, str(workspace))
 
-    def test_missing_branch_needs_none(self, git_repo):
-        old, _new = self._setup(git_repo, branch_follows=False)
-        git_repo.run(["update-ref", "-d", f"refs/heads/{self.SESSION}"])
-        assert _rebase_hint(git_repo, self.SESSION, old) == ""
+    def test_a_session_branch_that_followed_needs_none(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == []
+
+    def test_a_session_branch_with_work_gets_the_rebase_command(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        self._commit(git_repo, workspace, "work")
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}", f"branch {self.SESSION}", True),
+        ]
+
+    def test_another_checked_out_branch_is_found_while_the_session_branch_follows(self, git_repo, lifecycle):
+        """The session branch sat on S, so it moved; the work is on a branch the agent switched to."""
+        workspace, old, target = lifecycle
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "-b", f"{self.SESSION}.mr"])
+        self._commit(git_repo, workspace, "work")
+        new = self._move(git_repo, old, target)
+        assert git_repo.run(["rev-parse", f"refs/heads/{self.SESSION}"]).stdout.strip() == new
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}.mr", f"branch {self.SESSION}.mr", True),
+        ]
+
+    def test_a_branch_checked_out_nowhere_is_not_a_worktree_command(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "-b", f"{self.SESSION}.mr"])
+        self._commit(git_repo, workspace, "work")
+        git_repo.run(["-C", str(workspace), "checkout", "-q", self.SESSION])
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}.mr", f"branch {self.SESSION}.mr", False),
+        ]
+
+    def test_a_detached_head_gets_a_rebase_without_a_branch(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "--detach"])
+        self._commit(git_repo, workspace, "detached work")
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old}", "the detached HEAD", True),
+        ]
+
+    def test_a_detached_head_on_the_scratch_commit_itself_is_found(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "--detach"])
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old}", "the detached HEAD", True),
+        ]
+
+    def test_a_detached_head_already_on_the_new_anchor_needs_none(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        new = self._move(git_repo, old, target)
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "--detach", new])
+        assert self._hints(git_repo, old, workspace) == []
+
+    def test_work_stranded_by_an_earlier_move_is_found_after_the_undo(self, git_repo, lifecycle, monkeypatch):
+        """reanchor, the work stays on S, then the printed undo (a second reanchor to the old base)
+        moves the anchor again: the hint names the scratch commit the work really sits on."""
+        workspace, old, target = lifecycle
+        base = git_repo.run(["rev-parse", f"{old}^"]).stdout.strip()
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "-b", f"{self.SESSION}.mr"])
+        self._commit(git_repo, workspace, "work")
+        first = self._move(git_repo, old, target)
+        # Within the same second the undo would recreate the very same commit as S.
+        monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+        undone = self._move(git_repo, first, base)
+        assert undone != old
+        assert git_repo.run(["rev-parse", f"{undone}^"]).stdout.strip() == base
+        assert self._hints(git_repo, first, workspace) == [
+            RebaseHint(f"git rebase --onto {undone} {old} {self.SESSION}.mr", f"branch {self.SESSION}.mr", True),
+        ]
+
+    def test_no_registration_leaves_only_branches(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        self._commit(git_repo, workspace, "work")
+        new = self._move(git_repo, old, target)
+        assert _rebase_hints(git_repo, self.SESSION, old, "/workspace/elsewhere") == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}", f"branch {self.SESSION}", False),
+        ]
+
+    def test_a_missing_anchor_ref_needs_none(self, git_repo, lifecycle):
+        workspace, old, _target = lifecycle
+        git_repo.run(["update-ref", "-d", f"refs/cld/anchor/{self.SESSION}"])
+        assert self._hints(git_repo, old, workspace) == []
 
     def test_jj_needs_none(self):
         backend = MagicMock()
         backend.name = "jj"
-        assert _rebase_hint(backend, self.SESSION, "s" * 40) == ""
+        assert _rebase_hints(backend, self.SESSION, "s" * 40, "/workspace/x/api") == []
         backend.run.assert_not_called()
 
 

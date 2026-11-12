@@ -10,12 +10,18 @@ taken from the real scripts and run via bash.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from cld.ticket import _rebase_hints
+from cld.vcs.anchor import find_anchor_commit, move_anchor_commit
+from cld.vcs.anchor_guard import Anchor, check_file
+from cld.vcs.git import GitBackend
 
 CONTAINER_INIT_SH = (
     Path(__file__).resolve().parent.parent
@@ -302,6 +308,35 @@ class _RealJjOrigin:
     def _ops(self, env: dict, repo: Path) -> list[str]:
         return self._jj(env, repo, "op", "log", "--no-graph", "-T", 'id.short() ++ " " ++ description ++ "\\n"').splitlines()
 
+    def _git_origin(self, tmp_path, env) -> Path:
+        origin = tmp_path / "git-origin"
+        git = ["git", "-C", str(origin), "-c", "user.name=t", "-c", "user.email=t@localhost"]
+        subprocess.run(["git", "init", "-q", str(origin)], env=env, check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "seed"], env=env, check=True)
+        subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], env=env, check=True)
+        return origin
+
+    def _worktrees(self, env, origin: Path) -> dict[str, list[str]]:
+        """Registered worktree path -> its attribute lines (branch, locked ...)."""
+        out = subprocess.run(["git", "-C", str(origin), "worktree", "list", "--porcelain"],
+                             env=env, capture_output=True, text=True, check=True).stdout
+        blocks = [b.splitlines() for b in out.strip().split("\n\n")]
+        return {b[0].removeprefix("worktree "): b[1:] for b in blocks}
+
+    def _git(self, env, origin: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(origin), *args], env=env, capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    def _boot_git(self, env, origin: Path, workspace: Path, mode: str = "isolated", session: str = "",
+                  base: str = "origin/main") -> subprocess.CompletedProcess:
+        session = session or self.BOOKMARK
+        return self._boot({**env, "SESSION_NAME": session},
+                          f'cld_boot_worktree {origin} {workspace} {session} {base} {mode}\n'
+                          'echo "anchor=$CLD_BOOT_ANCHOR first=$CLD_BOOT_FIRST_LAUNCH"')
+
+    def _anchor_of(self, result: subprocess.CompletedProcess) -> str:
+        return result.stdout.splitlines()[-1].split()[0].removeprefix("anchor=")
+
     @pytest.fixture
     def jj_origin(self, tmp_path, env):
         origin = tmp_path / "origin"
@@ -420,21 +455,6 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         finally:
             _restore_writable(*protected)
 
-    def _git_origin(self, tmp_path, env) -> Path:
-        origin = tmp_path / "git-origin"
-        git = ["git", "-C", str(origin), "-c", "user.name=t", "-c", "user.email=t@localhost"]
-        subprocess.run(["git", "init", "-q", str(origin)], env=env, check=True)
-        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "seed"], env=env, check=True)
-        subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], env=env, check=True)
-        return origin
-
-    def _worktrees(self, env, origin: Path) -> dict[str, list[str]]:
-        """Registered worktree path -> its attribute lines (branch, locked ...)."""
-        out = subprocess.run(["git", "-C", str(origin), "worktree", "list", "--porcelain"],
-                             env=env, capture_output=True, text=True, check=True).stdout
-        blocks = [b.splitlines() for b in out.strip().split("\n\n")]
-        return {b[0].removeprefix("worktree "): b[1:] for b in blocks}
-
     def test_git_worktree_is_locked_with_the_session_as_reason(self, tmp_path, env):
         origin = self._git_origin(tmp_path, env)
         workspace = tmp_path / "ws"
@@ -474,20 +494,6 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         registered = self._worktrees(env, origin)
         assert f"locked {self.BOOKMARK}" in registered[str(workspace)]
         assert str(tmp_path / "other") in registered
-
-    def _git(self, env, origin: Path, *args: str) -> str:
-        return subprocess.run(["git", "-C", str(origin), *args], env=env, capture_output=True,
-                              text=True, check=True).stdout.strip()
-
-    def _boot_git(self, env, origin: Path, workspace: Path, mode: str = "isolated", session: str = "",
-                  base: str = "origin/main") -> subprocess.CompletedProcess:
-        session = session or self.BOOKMARK
-        return self._boot({**env, "SESSION_NAME": session},
-                          f'cld_boot_worktree {origin} {workspace} {session} {base} {mode}\n'
-                          'echo "anchor=$CLD_BOOT_ANCHOR first=$CLD_BOOT_FIRST_LAUNCH"')
-
-    def _anchor_of(self, result: subprocess.CompletedProcess) -> str:
-        return result.stdout.splitlines()[-1].split()[0].removeprefix("anchor=")
 
     def test_git_first_launch_isolated_anchors_on_the_scratch_commit(self, tmp_path, env):
         origin = self._git_origin(tmp_path, env)
@@ -629,6 +635,111 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         assert "locked t.two" in registered[str(second)]
         assert self._boot_git(env, origin, first, session="t.one").returncode == 0
         assert self._git(env, origin, "rev-parse", "--verify", "refs/cld/anchor/t.two")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+class TestGitReanchorThenReattach(_RealJjOrigin):
+    """The host moves the scratch commit of a git ticket (cld/vcs/anchor.py) and works out the
+    rebase hints (cld/ticket.py), both unmocked; then the container reattaches through the locked
+    registration of its lost worktree (vcs-lib.sh). Wherever the agent was working, the printed
+    commands bring that work back into the anchor tree, which the guard checks."""
+
+    SCENARIOS = ["session-branch", "session-branch-no-work", "other-branch", "detached-head", "other-branch-checked-out-nowhere"]
+
+    def _work(self, env, workspace: Path, scenario: str) -> None:
+        def commit() -> None:
+            (workspace / "work.txt").write_text("work\n")
+            self._git(env, workspace, "add", "work.txt")
+            self._git(env, workspace, "commit", "-q", "-m", "work")
+
+        match scenario:
+            case "session-branch":
+                commit()
+            case "other-branch":
+                self._git(env, workspace, "checkout", "-q", "-b", f"{self.BOOKMARK}.mr")
+                commit()
+            case "detached-head":
+                self._git(env, workspace, "checkout", "-q", "--detach")
+                commit()
+            case "other-branch-checked-out-nowhere":
+                self._git(env, workspace, "checkout", "-q", "-b", f"{self.BOOKMARK}.mr")
+                commit()
+                self._git(env, workspace, "checkout", "-q", self.BOOKMARK)
+
+    def _guard_denies(self, workspace: Path, anchor: str) -> bool:
+        anchors = [Anchor(repo="api", workspace=str(workspace), anchor=anchor, mode="isolated", backend="git")]
+        reason = check_file(str(workspace / "x.txt"), anchors)
+        assert reason is None or "outside the anchor tree" in reason
+        return reason is not None
+
+    @pytest.fixture
+    def host_identity(self, monkeypatch, env):
+        """The host-side commit-tree needs an identity of the calling process."""
+        for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            monkeypatch.setenv(key, env[key])
+
+    @pytest.mark.parametrize("scenario", SCENARIOS)
+    def test_the_printed_commands_bring_the_work_back_into_the_tree(self, tmp_path, env, host_identity, scenario):
+        origin = self._git_origin(tmp_path, env)
+        workspace = (tmp_path / "ws").resolve()
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        self._work(env, workspace, scenario)
+        shutil.rmtree(workspace)
+
+        backend = GitBackend(origin)
+        old = find_anchor_commit(backend, self.BOOKMARK)
+        self._git(env, origin, "commit", "--allow-empty", "-q", "-m", "target")
+        target = self._git(env, origin, "rev-parse", "HEAD")
+        move_anchor_commit(backend, old, target, "isolated", self.BOOKMARK)
+        hints = _rebase_hints(backend, self.BOOKMARK, old, str(workspace))
+
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        new = self._anchor_of(result)
+        assert new == self._git(env, origin, "rev-parse", f"refs/cld/anchor/{self.BOOKMARK}") != old
+        assert "locked" in " ".join(self._worktrees(env, origin)[str(workspace)])
+        # A branch that sat on S follows it; the rest resumes on the old one, where the guard blocks.
+        assert self._guard_denies(workspace, new) == (scenario in ("session-branch", "other-branch", "detached-head"))
+        assert bool(hints) == (scenario != "session-branch-no-work")
+        for hint in hints:
+            assert hint.in_worktree == (scenario != "other-branch-checked-out-nowhere")
+            subprocess.run(shlex.split(hint.command), cwd=workspace, env=env, check=True, capture_output=True)
+
+        assert not self._guard_denies(workspace, new)
+        if scenario not in ("session-branch-no-work",):
+            assert (workspace / "work.txt").read_text() == "work\n"
+        if scenario == "detached-head":
+            assert self._git(env, workspace, "branch", "--show-current") == ""
+        if scenario == "other-branch-checked-out-nowhere":
+            self._git(env, workspace, "merge-base", "--is-ancestor", new, f"{self.BOOKMARK}.mr")
+        assert _rebase_hints(backend, self.BOOKMARK, old, str(workspace)) == []
+
+    def test_the_printed_undo_moves_the_anchor_back_onto_the_old_base(self, tmp_path, env, host_identity):
+        origin = self._git_origin(tmp_path, env)
+        base = self._git(env, origin, "rev-parse", "origin/main")
+        workspace = (tmp_path / "ws").resolve()
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        shutil.rmtree(workspace)
+        backend = GitBackend(origin)
+        old = find_anchor_commit(backend, self.BOOKMARK)
+        self._git(env, origin, "commit", "--allow-empty", "-q", "-m", "target")
+        moved = move_anchor_commit(backend, old, self._git(env, origin, "rev-parse", "HEAD"), "isolated", self.BOOKMARK)
+        assert moved
+        new = find_anchor_commit(backend, self.BOOKMARK)
+
+        # `cld restart <ticket> --reanchor <repo>@<old base>` asks for exactly this move.
+        undone = move_anchor_commit(backend, new, base, "isolated", self.BOOKMARK)
+
+        assert undone
+        back = find_anchor_commit(backend, self.BOOKMARK)
+        assert self._git(env, origin, "rev-parse", f"{back}^") == base
+        assert self._git(env, origin, "rev-parse", f"refs/heads/{self.BOOKMARK}") == back
+        assert _rebase_hints(backend, self.BOOKMARK, new, str(workspace)) == []
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        assert self._anchor_of(result) == back
+        assert not self._guard_denies(workspace, back)
 
 
 @pytest.mark.skipif(shutil.which("jj") is None or shutil.which("git") is None, reason="needs jj and git")

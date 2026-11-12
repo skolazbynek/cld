@@ -211,6 +211,18 @@ def _move_anchor_commit_git(vcs: VcsBackend, anchor: str, target: str, session: 
     target_commit = _git_rev(vcs, target)
     if not target_commit:
         raise RuntimeError(f"could not resolve the reanchor target {target!r}")
+    # The new S would sit inside the tree of the old one, which no longer holds it.
+    inside = vcs.run(["merge-base", "--is-ancestor", anchor, target_commit])
+    if inside.returncode == 0:
+        raise RuntimeError(
+            f"the reanchor target {target!r} is the anchor commit {anchor[:12]} or builds on it; "
+            "pick a commit outside the ticket's own tree"
+        )
+    if inside.returncode != 1:
+        raise RuntimeError(
+            f"could not compare the reanchor target {target!r} with the anchor commit: "
+            f"{(inside.stderr or '').strip()}"
+        )
     if _git_rev(vcs, f"{anchor}^") == target_commit:
         return []
     changed = vcs.run(["diff", "--quiet", f"{anchor}^", anchor])
@@ -265,7 +277,9 @@ def move_anchor_commit(
     with a compare-and-swap. The session branch follows only when it still points
     at S; work above S stays on the old S (the caller prints the ``git rebase
     --onto`` that carries it over). S must be empty, and unlike jj the other
-    children of *target* are not moved. Undo entries are ``<ref> <old> <new>``.
+    children of *target* are not moved. A *target* that is S or builds on S is refused: jj
+    moves S into its own descendants by rewriting them, which git does not do to the agent's
+    commits. Undo entries are ``<ref> <old> <new>``.
 
     Returns the op ids this call created, newest first, so a caller that
     fails on a later repo can revert them with ``revert_ops``. Raises

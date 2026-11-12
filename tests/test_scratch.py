@@ -717,6 +717,16 @@ class TestMoveAnchorCommitGit:
         with pytest.raises(RuntimeError, match="could not resolve the reanchor target"):
             move_anchor_commit(git_repo, s_hash, "no-such-rev", "isolated", GIT_SESSION)
 
+    @pytest.mark.parametrize("which", ["the-scratch-commit", "its-work"])
+    def test_a_target_inside_the_tree_of_s_is_refused(self, git_repo, tmp_path, which):
+        """jj rewrites the descendants to move S into them; git never rewrites the agent's commits."""
+        _base, s_hash, _target, _peer = _git_stage(git_repo, tmp_path, work=True)
+        tip = _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}")
+        with pytest.raises(RuntimeError, match="is the anchor commit .* or builds on it"):
+            move_anchor_commit(git_repo, s_hash, s_hash if which == "the-scratch-commit" else tip, "isolated", GIT_SESSION)
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
+        assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == tip
+
     def test_a_ref_moved_meanwhile_fails_without_changes(self, git_repo, tmp_path):
         base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
         _git(git_repo, "update-ref", anchor_ref(GIT_SESSION), base)
