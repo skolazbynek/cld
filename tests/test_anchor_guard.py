@@ -491,6 +491,23 @@ class TestGitFileRule:
         )
         assert repo.post() == "block"
 
+    def test_a_file_write_is_denied_when_the_anchor_no_longer_resolves(
+        self, repo: Repo, git_repo: tuple[Path, Callable[..., str]],
+    ) -> None:
+        """git's ancestry check errors out (not just says no): the hook must deny, not crash with
+        exit 1, which does not block the write."""
+        repo.register(
+            {"repo": "g", "workspace": str(git_repo[0]), "anchor": "f" * 40, "mode": "isolated", "backend": "git"},
+        )
+        result = repo.hook({
+            "hook_event_name": "PreToolUse", "tool_name": "Write",
+            "cwd": str(repo.path), "tool_input": {"file_path": str(git_repo[0] / "a.txt")},
+        })
+        assert result.returncode == 0, result.stderr
+        reason = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "cannot tell whether HEAD" in reason
+        assert "do not write files" in reason
+
 
 @needs_jj
 class TestPostToolUse:

@@ -233,8 +233,9 @@ def _move_anchor_commit_git(vcs: VcsBackend, anchor: str, target: str, session: 
             else f"could not compare anchor commit {anchor[:12]} with its parent: {(changed.stderr or '').strip()}"
         )
     # Host-side commit-tree: no working tree is involved, and S' is a plain child of the target.
+    # Host signing settings must not apply to a commit nobody there made.
     created = vcs.run([
-        *NO_HOOKS, "commit-tree", f"{target_commit}^{{tree}}", "-p", target_commit, "-m", vcs.get_description(anchor),
+        *NO_HOOKS, "-c", "commit.gpgsign=false", "commit-tree", f"{target_commit}^{{tree}}", "-p", target_commit, "-m", vcs.get_description(anchor),
     ])
     if created.returncode != 0:
         raise RuntimeError(f"git commit-tree failed: {(created.stderr or '').strip()}")

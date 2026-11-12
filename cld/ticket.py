@@ -713,7 +713,8 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
     deleted (when it holds work above the scratch commit); the anchor ref goes
     last, because it is the lifecycle-alive marker -- a partial failure leaves
     it, and the next start reattaches. Stops at the first failure with the
-    manual command, like the jj forget.
+    manual command, like the jj forget. The archive refs are create-only (an empty
+    old value): an archive that exists under the same stamp is never overwritten.
     """
     repo_root = backend.repo_root
     anchor = anchor_ref(session)
@@ -741,7 +742,7 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
         head = next((line.removeprefix("HEAD ") for line in mine if line.startswith("HEAD ")), "")
         if (head and "detached" in mine and not contains(f"refs/heads/{session}", head)
                 and not contains(anchor, head)):
-            if not run("update-ref", ended_ref(session, f"{stamp}-detached"), head):
+            if not run("update-ref", ended_ref(session, f"{stamp}-detached"), head, ""):
                 return
         # A lock whose directory is gone is what keeps the registration (and a detached HEAD) alive.
         backend.run([*NO_HOOKS, "worktree", "unlock", worktree_path])
@@ -749,7 +750,7 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
             return
     if tip := rev(f"refs/heads/{session}"):
         if tip != rev(anchor):
-            if not run("update-ref", ended_ref(session, stamp), tip):
+            if not run("update-ref", ended_ref(session, stamp), tip, ""):
                 return
         if not run("branch", "-D", session):
             return

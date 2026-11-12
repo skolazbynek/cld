@@ -727,6 +727,14 @@ class TestMoveAnchorCommitGit:
         assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
         assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == tip
 
+    def test_host_signing_does_not_apply_to_the_new_commit(self, git_repo, tmp_path):
+        _base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        _git(git_repo, "config", "commit.gpgsign", "true")
+        _git(git_repo, "config", "gpg.program", "false")
+        move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+        new = _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION))
+        assert "gpgsig" not in _git(git_repo, "cat-file", "-p", new)
+
     def test_a_ref_moved_meanwhile_fails_without_changes(self, git_repo, tmp_path):
         base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
         _git(git_repo, "update-ref", anchor_ref(GIT_SESSION), base)

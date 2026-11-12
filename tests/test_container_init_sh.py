@@ -218,6 +218,18 @@ class TestTicketClaudeMdGitRepos:
         assert "hidden ref\n  `refs/cld/anchor/t.lide-1`" in text
         assert "only `cld restart --reanchor` does" in text
 
+    @pytest.mark.parametrize(
+        "row",
+        ["| git | abc | isolated | jj |", "| api | git | isolated | jj |", "| api | abc | git | jj |"],
+        ids=["repo-name", "anchor", "mode"],
+    )
+    def test_a_jj_row_with_git_in_another_column_does_not_get_the_git_section(self, tmp_path, row):
+        """Only the backend column counts, not a repo named git or any other cell reading git."""
+        assert "Git repos" not in self._claude_md(tmp_path, [row])
+
+    def test_the_git_section_needs_only_the_last_column(self, tmp_path):
+        assert "## Git repos" in self._claude_md(tmp_path, ["| git | abc | isolated | git |"])
+
     def test_mixed_table_gets_the_git_section_too(self, tmp_path):
         assert "## Git repos" in self._claude_md(tmp_path, [self.JJ_ROW, self.GIT_ROW])
 

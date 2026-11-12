@@ -7,6 +7,7 @@ a daemon.
 
 import json
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1052,6 +1053,26 @@ class TestForgetGitSessionState:
         forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
         assert not self._archived(git_repo, "-detached")
         assert len(self._archived(git_repo)) == (1 if work else 0)
+
+    @pytest.mark.parametrize("detached", [False, True], ids=["branch-tip", "detached-head"])
+    def test_an_existing_archive_is_never_overwritten(self, git_repo, tmp_path, caplog, detached):
+        """Same stamp, e.g. two shutdowns within a second: the first archive stays and the
+        shutdown stops before it drops the branch or the anchor ref."""
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        tip = git_repo.run(["rev-parse", f"refs/heads/{self.SESSION}"]).stdout.strip()
+        if detached:
+            self._detach_with_commit(git_repo, workspace, tmp_path)
+        stamp = "20260101T000000Z"
+        taken = f"refs/cld/ended/{self.SESSION}/{stamp}" + ("-detached" if detached else "")
+        git_repo.run(["update-ref", taken, git_repo.run(["rev-parse", "HEAD"]).stdout.strip()])
+        before = self._refs(git_repo)[taken]
+        with patch("cld.ticket.datetime") as clock, caplog.at_level("WARNING"):
+            clock.now.return_value = datetime(2026, 1, 1, tzinfo=UTC)
+            forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
+        refs = self._refs(git_repo)
+        assert refs[taken] == before != tip
+        assert f"refs/cld/anchor/{self.SESSION}" in refs
+        assert "update-ref refs/cld/ended" in caplog.text
 
     def test_a_branch_checkout_is_not_archived_as_detached(self, git_repo, tmp_path):
         workspace = self._lifecycle(git_repo, tmp_path, work=True)

@@ -167,7 +167,15 @@ def check_file(path: str, anchors: list[Anchor]) -> str | None:
         if _log_ids(anchor.workspace, f"@ & change_id({anchor.anchor})+::"):
             return None
         return f"Rule 'file write outside anchor tree': {_outside_tree_reason(anchor)}"
-    if _git_head_in_tree(anchor):
+    try:
+        in_tree = _git_head_in_tree(anchor)
+    except RuntimeError as e:
+        # An escaping error would exit the hook with 1, which does not block the write.
+        return (
+            f"Rule 'file write outside anchor tree': cannot tell whether HEAD in {anchor.workspace} is in "
+            f"the anchor tree ({e}). Stop and report this; do not write files."
+        )
+    if in_tree:
         return None
     return f"Rule 'file write outside anchor tree': {_git_outside_tree_reason(anchor)}"
 

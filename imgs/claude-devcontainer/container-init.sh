@@ -83,7 +83,8 @@ Every bookmark you create starts with this ticket's identifier \`t.${ticket}\`.
 - Never use \`internal.\`: it belongs to host automation.
 EOF
     local has_git=0
-    [[ "$rows" == *"| git |"* ]] && has_git=1
+    # The backend is the last column: a repo called "git" must not match.
+    grep -qE '\| git \|[[:space:]]*$' <<<"$rows" && has_git=1
     if [ "$has_git" = 1 ]; then
         cat >> "$ticket_root/CLAUDE.md" <<EOF
 
