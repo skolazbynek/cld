@@ -260,7 +260,33 @@ _cld_git_boot_anchor() {
 # is shared with other tickets whose paths do not exist in this container, so
 # there is no blanket `git worktree prune`: only this session's own stale
 # registration is dropped, after its HEAD and branch are read, so a reattach
-# resumes where the lost worktree was.
+# resumes where the lost worktree was. A detached HEAD holding commits nothing else
+# holds is archived first (cld_archive_stale_head), so a failed add loses nothing.
+cld_archive_stale_head() {
+    # A stale registration is about to be dropped; a detached HEAD may be all that holds some
+    # commits (the add below can fail, or resume something else). Keep them under
+    # refs/cld/ended/<session>/<UTC stamp>-detached, the name shutdown uses (cld.names.ended_ref
+    # builds the same string; this file cannot import it). Nothing is archived when the commit is
+    # missing, already reachable from the session branch or the anchor ref, or already archived.
+    # Args: $1=origin $2=session $3=head
+    local origin="$1" session="$2" head="$3" held ref
+    git -C "$origin" cat-file -e "${head}^{commit}" 2>/dev/null || return 0
+    for held in "refs/heads/$session" "refs/cld/anchor/$session"; do
+        if git -C "$origin" merge-base --is-ancestor "$head" "$held" 2>/dev/null; then
+            return 0
+        fi
+    done
+    if [ -n "$(git -C "$origin" for-each-ref --points-at "$head" "refs/cld/ended/$session/")" ]; then
+        return 0
+    fi
+    ref="refs/cld/ended/$session/$(date -u +%Y%m%dT%H%M%SZ)-detached"
+    if git -C "$origin" update-ref "$ref" "$head" ""; then
+        echo "[cld] archived the old worktree HEAD ${head:0:12} as $ref"
+    else
+        echo "[WARN] could not archive the old worktree HEAD ${head:0:12}; keep it with: git update-ref <ref> $head" >&2
+    fi
+}
+
 cld_boot_worktree() {
     local origin="$1" workspace="$2" bookmark="$3" base_rev="$4" mode="${5:-isolated}"
     local ref="refs/cld/anchor/$bookmark"
@@ -276,6 +302,10 @@ cld_boot_worktree() {
     local stale stale_head="" stale_branch="" have_ref=0 have_branch=0
     if stale=$(cld_stale_worktree "$origin" "$workspace"); then
         read -r stale_head stale_branch <<<"$stale"
+        # Before the registration goes: a branch keeps its own commits, a detached HEAD does not.
+        if [ -z "$stale_branch" ] && [ -n "$stale_head" ]; then
+            cld_archive_stale_head "$origin" "$bookmark" "$stale_head"
+        fi
         # `remove -f -f` also drops a locked registration whose directory is gone.
         git -C "$origin" worktree remove -f -f "$workspace" || true
     fi

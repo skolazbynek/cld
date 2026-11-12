@@ -589,6 +589,66 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         assert self._anchor_of(result) == self._anchor_of(first)
         assert f"locked {self.BOOKMARK}" in self._worktrees(env, origin)[str(workspace)]
 
+    def _ended(self, env, origin: Path) -> dict[str, str]:
+        out = self._git(env, origin, "for-each-ref", "--format=%(refname) %(objectname)",
+                        f"refs/cld/ended/{self.BOOKMARK}/")
+        return dict(line.split() for line in out.splitlines())
+
+    def _lose_a_detached_commit(self, env, origin: Path, workspace: Path) -> str:
+        """Boot, commit on a detached HEAD, lose the directory; return that commit."""
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        self._git(env, workspace, "checkout", "-q", "--detach")
+        self._git(env, workspace, "commit", "-q", "--allow-empty", "-m", "detached work")
+        tip = self._git(env, workspace, "rev-parse", "HEAD")
+        shutil.rmtree(workspace)
+        return tip
+
+    def test_git_reattach_archives_the_detached_head_before_dropping_the_registration(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        tip = self._lose_a_detached_commit(env, origin, workspace)
+        result = self._boot_git(env, origin, workspace)
+        assert result.returncode == 0, result.stderr
+        archived = self._ended(env, origin)
+        assert list(archived.values()) == [tip]
+        assert re.fullmatch(rf"refs/cld/ended/{re.escape(self.BOOKMARK)}/\d{{8}}T\d{{6}}Z-detached", next(iter(archived)))
+        assert self._git(env, workspace, "rev-parse", "HEAD") == tip
+
+    def test_git_reattach_archives_a_detached_head_once(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        self._lose_a_detached_commit(env, origin, workspace)
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        shutil.rmtree(workspace)
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        assert len(self._ended(env, origin)) == 1
+
+    def test_git_reattach_archives_nothing_for_a_head_the_branch_holds(self, tmp_path, env):
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        self._git(env, workspace, "checkout", "-q", "--detach")
+        shutil.rmtree(workspace)
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        assert self._ended(env, origin) == {}
+
+    def test_git_failed_reattach_keeps_the_detached_commits(self, tmp_path, env):
+        """The add fails (no room for the directory) after the old registration is gone."""
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        tip = self._lose_a_detached_commit(env, origin, workspace)
+        tmp_path.chmod(0o555)
+        try:
+            result = self._boot_git(env, origin, workspace)
+        finally:
+            tmp_path.chmod(0o755)
+        assert result.returncode != 0
+        assert "git worktree add failed (reattach)" in result.stderr
+        assert str(workspace) not in self._worktrees(env, origin)
+        assert list(self._ended(env, origin).values()) == [tip]
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        assert self._git(env, origin, "merge-base", "--is-ancestor", tip, next(iter(self._ended(env, origin)))) == ""
+
     def test_git_reattach_resumes_another_checked_out_branch(self, tmp_path, env):
         origin = self._git_origin(tmp_path, env)
         workspace = tmp_path / "ws"
