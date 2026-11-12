@@ -608,6 +608,37 @@ class TestReanchorRestart:
         assert "lide-api: the detached HEAD keeps its work" in out
         assert "in the repo, where the branch is checked out (if anywhere): git rebase --onto N S t.lide-2600.mr" in out
 
+    def test_hints_are_printed_even_when_the_relaunch_fails(self, capsys):
+        """The anchor has moved by then, and a retry would resume the work outside the tree."""
+        manifest = self._manifest()
+        patches, backend, move = self._patches(manifest, backend=self._jj_backend("git"))
+        with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
+             patches["get_backend"], patches["find_anchor"], patches["resolver"], \
+             patches["move"], patches["revert"], patches["subprocess_run"], \
+             patch("cld.ticket._rebase_hints", return_value=[
+                 RebaseHint("git rebase --onto N S t.lide-2600", "branch t.lide-2600", True),
+             ]), \
+             patch("cld.ticket._launch", side_effect=RuntimeError("docker run failed")), \
+             patches["warm_start"], \
+             pytest.raises(RuntimeError, match="docker run failed"):
+            restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
+        out = capsys.readouterr().out
+        assert "lide-api: anchor " in out and "(undo: cld restart lide-2600 --reanchor lide-api@" in out
+        assert "git rebase --onto N S t.lide-2600" in out
+        assert "recreated" not in out
+
+    @pytest.mark.parametrize("mode", ["isolated", "shared"])
+    def test_the_anchor_mode_reaches_the_hints(self, mode):
+        manifest = self._manifest(mode=mode)
+        patches, backend, move = self._patches(manifest, backend=self._jj_backend("git"))
+        with patches["docker_status"], patches["read_manifest"], patches["session_state"], \
+             patches["get_backend"], patches["find_anchor"], patches["resolver"], \
+             patches["move"], patches["revert"], patches["subprocess_run"], \
+             patch("cld.ticket._rebase_hints", return_value=[]) as hints, \
+             patches["launch"], patches["warm_start"]:
+            restart_ticket(Config(), "lide-2600", ["lide-api@feature-x"])
+        assert hints.call_args.kwargs == {"shared": mode == "shared"}
+
     def test_no_hint_line_for_jj(self, capsys):
         manifest = self._manifest()
         patches, backend, move = self._patches(manifest)
@@ -765,6 +796,9 @@ class TestRebaseHints:
     def _hints(self, git_repo, old: str, workspace: Path):
         return _rebase_hints(git_repo, self.SESSION, old, str(workspace))
 
+    def _hints_shared(self, git_repo, old: str, workspace: Path):
+        return _rebase_hints(git_repo, self.SESSION, old, str(workspace), shared=True)
+
     def test_a_session_branch_that_followed_needs_none(self, git_repo, lifecycle):
         workspace, old, target = lifecycle
         self._move(git_repo, old, target)
@@ -837,6 +871,68 @@ class TestRebaseHints:
         assert git_repo.run(["rev-parse", f"{undone}^"]).stdout.strip() == base
         assert self._hints(git_repo, first, workspace) == [
             RebaseHint(f"git rebase --onto {undone} {old} {self.SESSION}.mr", f"branch {self.SESSION}.mr", True),
+        ]
+
+    def _foreign_commit(self, git_repo, parent: str, message: str) -> str:
+        return git_repo.run(["commit-tree", f"{parent}^{{tree}}", "-p", parent, "-m", message]).stdout.strip()
+
+    def test_only_this_tickets_own_branches_are_named(self, git_repo, lifecycle):
+        """Another ticket's branch, or one that only shares the name prefix, is never touched."""
+        workspace, old, target = lifecycle
+        work = self._commit(git_repo, workspace, "work")
+        for other in ("t.other", f"{self.SESSION}y", "feature", f"{self.SESSION}-mr"):
+            git_repo.run(["branch", other, work])
+        git_repo.run(["branch", f"{self.SESSION}.mr", work])
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}", f"branch {self.SESSION}", True),
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}.mr", f"branch {self.SESSION}.mr", False),
+        ]
+
+    def test_a_branch_holding_another_tickets_anchor_commit_is_skipped(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        base = git_repo.run(["rev-parse", f"{old}^"]).stdout.strip()
+        theirs = self._foreign_commit(git_repo, base, "cld anchor: t.other mode=isolated")
+        git_repo.run(["update-ref", "refs/cld/anchor/t.other", theirs])
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "-b", f"{self.SESSION}.mine"])
+        self._commit(git_repo, workspace, "work")
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "-b", f"{self.SESSION}.both", old])
+        git_repo.run(["-C", str(workspace), "merge", "-q", "--no-edit", "--allow-unrelated-histories", theirs])
+        git_repo.run(["-C", str(workspace), "checkout", "-q", self.SESSION])
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}.mine", f"branch {self.SESSION}.mine", False),
+        ]
+
+    def test_a_ticket_stacked_on_another_one_keeps_its_hints(self, git_repo, lifecycle):
+        """The other ticket's anchor commit below this ticket's own scratch commit does not hide its branches."""
+        workspace, old, target = lifecycle
+        base = git_repo.run(["rev-parse", f"{old}^"]).stdout.strip()
+        git_repo.run(["update-ref", "refs/cld/anchor/t.other", base])
+        self._commit(git_repo, workspace, "work")
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}", f"branch {self.SESSION}", True),
+        ]
+
+    def test_shared_mode_names_work_built_on_the_old_base_but_not_through_s(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        base = git_repo.run(["rev-parse", f"{old}^"]).stdout.strip()
+        git_repo.run(["branch", f"{self.SESSION}.side", self._foreign_commit(git_repo, base, "side work")])
+        git_repo.run(["-C", str(workspace), "checkout", "-q", "--detach", self._foreign_commit(git_repo, base, "loose")])
+        new = self._move(git_repo, old, target)
+        assert self._hints(git_repo, old, workspace) == []
+        assert self._hints_shared(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {base} {self.SESSION}.side", f"branch {self.SESSION}.side", False),
+            RebaseHint(f"git rebase --onto {new} {base}", "the detached HEAD", True),
+        ]
+
+    def test_shared_mode_prefers_the_scratch_commit_for_work_through_it(self, git_repo, lifecycle):
+        workspace, old, target = lifecycle
+        self._commit(git_repo, workspace, "work")
+        new = self._move(git_repo, old, target)
+        assert self._hints_shared(git_repo, old, workspace) == [
+            RebaseHint(f"git rebase --onto {new} {old} {self.SESSION}", f"branch {self.SESSION}", True),
         ]
 
     def test_no_registration_leaves_only_branches(self, git_repo, lifecycle):

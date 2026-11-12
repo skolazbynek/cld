@@ -153,9 +153,13 @@ changes and a ticket with no anchor ref. The session branch follows only when it
 scratch commit. Work that stays on the old one -- a session branch with work, another branch (`<id>.mr`), a
 detached HEAD -- would be resumed outside the anchor tree by the next reattach, where the guard blocks every
 write, so `cld restart` works out every such ref from the ticket's worktree registration
-(`git worktree list --porcelain`) and every local branch holding a scratch commit of the ticket outside the
-history of the new one, and prints one `git rebase --onto <new> <old> [<branch>]` for each, with where to run
-it (in the ticket worktree for what it has checked out). A target that is the old scratch commit or builds on
+(`git worktree list --porcelain`) and every local branch of the ticket (`<id>` and `<id>.*`, no other) holding
+a scratch commit of the ticket outside the history of the new one, and prints one
+`git rebase --onto <new> <old> [<branch>]` for each, with where to run it (in the ticket worktree for what it
+has checked out). A branch that holds another ticket's anchor commit (not one below this ticket's own) is
+left alone. In shared mode the old base counts as an old commit too, so work built on it but not through the
+scratch commit gets a hint (it was in the shared tree, and is outside it now). The hints are printed even
+when the relaunch fails, as the anchor has moved by then. A target that is the old scratch commit or builds on
 it is refused: jj moves S into its own descendants by rewriting them, git never rewrites the agent's commits.
 The printed undo is a reanchor onto the old base, which commits a new scratch commit again (the same one,
 within the same second) and gets its own hints. Unlike jj, the other children of the target are not moved.

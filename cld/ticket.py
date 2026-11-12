@@ -454,7 +454,9 @@ def _reanchor_restart(
             ops = move_anchor_commit(backend, s_hash, target, repo.anchor_mode, container)
             done.append((backend, ops))
             moved[name] = (repo.anchor_base, target)
-            hints[name] = _rebase_hints(backend, container, s_hash, f"{WORKSPACE_BASE}/{slug}/{name}")
+            hints[name] = _rebase_hints(
+                backend, container, s_hash, f"{WORKSPACE_BASE}/{slug}/{name}", shared=repo.anchor_mode == "shared",
+            )
     except RuntimeError as e:
         for backend, ops in reversed(done):
             revert_ops(backend, ops)
@@ -469,21 +471,24 @@ def _reanchor_restart(
 
     new_manifest = replace(manifest, repos=tuple(_moved_entry(r) for r in manifest.repos))
     subprocess.run(["docker", "rm", container], capture_output=True)
-    _launch(cfg, new_manifest)
-    for name, (old_base, new_base) in moved.items():
-        typer.echo(
-            f"  {name}: anchor {old_base[:12]} -> {new_base[:12]} "
-            f"(undo: cld restart {slug} --reanchor {name}@{old_base})"
-        )
-        for hint in hints[name]:
-            where = (
-                f"in the ticket worktree (`cld shell {slug}`, then cd to {name})"
-                if hint.in_worktree else "in the repo, where the branch is checked out (if anywhere)"
-            )
+    try:
+        _launch(cfg, new_manifest)
+    finally:
+        # The anchors have moved whether or not the launch worked: a retry resumes the old work.
+        for name, (old_base, new_base) in moved.items():
             typer.echo(
-                f"  {name}: {hint.what} keeps its work on the old anchor commit, so a restart would resume it "
-                f"outside the anchor tree; carry it over {where}: {hint.command}"
+                f"  {name}: anchor {old_base[:12]} -> {new_base[:12]} "
+                f"(undo: cld restart {slug} --reanchor {name}@{old_base})"
             )
+            for hint in hints[name]:
+                where = (
+                    f"in the ticket worktree (`cld shell {slug}`, then cd to {name})"
+                    if hint.in_worktree else "in the repo, where the branch is checked out (if anywhere)"
+                )
+                typer.echo(
+                    f"  {name}: {hint.what} keeps its work on the old anchor commit, so a restart would resume it "
+                    f"outside the anchor tree; carry it over {where}: {hint.command}"
+                )
     typer.echo(f"Ticket '{slug}' recreated with {len(moved)} repo anchor(s) moved.")
 
 
@@ -503,17 +508,22 @@ def _worktree_block(backend: VcsBackend, worktree_path: str) -> list[str]:
     return next((block for block in listing if block[:1] == [f"worktree {worktree_path}"]), [])
 
 
-def _rebase_hints(backend: VcsBackend, container: str, old_anchor: str, worktree_path: str) -> list[RebaseHint]:
+def _rebase_hints(
+    backend: VcsBackend, container: str, old_anchor: str, worktree_path: str, *, shared: bool = False,
+) -> list[RebaseHint]:
     """git only: the ``git rebase --onto`` commands for work that stayed on an old scratch commit
-    after the move: any local branch, and the detached HEAD of the ticket's worktree registration
-    (*worktree_path* in ``git worktree list``), that holds a scratch commit of this ticket but not
-    the current one. The session branch follows the move when it sits on the scratch commit;
-    a branch with work above it, another branch (``<id>.mr``) and a detached HEAD do not, and a
-    reattach would resume them outside the anchor tree.
+    after the move: a local branch of this ticket (*container* and ``<container>.*``), and the
+    detached HEAD of the ticket's worktree registration (*worktree_path* in ``git worktree list``),
+    that holds a scratch commit of this ticket but not the current one. The session branch follows the
+    move when it sits on the scratch commit; a branch with work above it, another branch (``<id>.mr``)
+    and a detached HEAD do not, and a reattach would resume them outside the anchor tree. A branch
+    that holds the anchor commit of another ticket is not touched.
 
     The old scratch commits are *old_anchor* and every scratch commit of the ticket that a branch or
     the worktree HEAD holds outside the history of the current one, so work stranded by an earlier
-    reanchor (and its undo) is found as well.
+    reanchor (and its undo) is found as well. In *shared* mode the old base (the parent of
+    *old_anchor*) counts too: work built on it, but not through the scratch commit, was inside the
+    shared tree and is outside it after the move.
     """
     if backend.name != "git":
         return []
@@ -525,23 +535,38 @@ def _rebase_hints(backend: VcsBackend, container: str, old_anchor: str, worktree
     def descends(ancestor: str, commit: str) -> bool:
         return backend.run(["merge-base", "--is-ancestor", ancestor, commit]).returncode == 0
 
+    def holders_of(commit: str) -> list[str]:
+        return git("for-each-ref", "--contains", commit, "--format=%(refname:lstrip=2)", "refs/heads/").splitlines()
+
     new = git("rev-parse", "--verify", "-q", f"{anchor_ref(container)}^{{commit}}")
     if not new:
         return []
     mine = _worktree_block(backend, worktree_path)
     head = next((line.removeprefix("HEAD ") for line in mine if line.startswith("HEAD ")), "")
     checked_out = next((line.removeprefix("branch refs/heads/") for line in mine if line.startswith("branch refs/heads/")), "")
+    own = {
+        branch for branch in git("for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads/").splitlines()
+        if branch == container or branch.startswith(f"{container}.")
+    }
+    # Another ticket's anchor commit below a branch puts that branch in the other ticket's tree,
+    # unless it lies below this ticket's own anchor too (a ticket stacked on another one).
+    anchors = [line.split() for line in git("for-each-ref", "--format=%(refname) %(objectname)", "refs/cld/anchor/").splitlines()]
+    foreign = {
+        branch for ref, commit in anchors
+        if ref != anchor_ref(container) and not descends(commit, old_anchor) for branch in holders_of(commit)
+    }
 
+    tips = [*(f"refs/heads/{branch}" for branch in sorted(own)), *([head] if head else [])]
     scratch = git(
-        "rev-list", "--branches", *([head] if head else []), "--fixed-strings",
-        f"--grep=cld anchor: {container} mode=", "--not", new,
-    ).split()
-    olds = list(dict.fromkeys([old_anchor, *scratch]))
+        "rev-list", *tips, "--fixed-strings", f"--grep=cld anchor: {container} mode=", "--not", new,
+    ).split() if tips else []
+    base = git("rev-parse", "--verify", "-q", f"{old_anchor}^") if shared else ""
+    olds = list(dict.fromkeys([old_anchor, *scratch, *([base] if base else [])]))
     outside = set(git("for-each-ref", "--no-contains", new, "--format=%(refname:lstrip=2)", "refs/heads/").splitlines())
     holders: dict[str, list[str]] = {}
     for old in olds:
-        for branch in git("for-each-ref", "--contains", old, "--format=%(refname:lstrip=2)", "refs/heads/").splitlines():
-            if branch in outside:
+        for branch in holders_of(old):
+            if branch in outside and branch in own and branch not in foreign:
                 holders.setdefault(branch, []).append(old)
     hints = [
         RebaseHint(f"git rebase --onto {new} {found[0]} {branch}", f"branch {branch}", branch == checked_out)
