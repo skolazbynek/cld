@@ -621,20 +621,28 @@ def _teardown(container: str) -> None:
             "anyway; forget its per-repo state manually with "
             "`jj bookmark forget %s && jj workspace forget %s` in each mounted jj repo "
             "(in a git repo: `git worktree list`, unlock and remove this ticket's worktree, "
-            "`git branch -D %s`, then `git update-ref -d %s`).",
-            container, e, container, container, container, anchor_ref(container),
+            "archive the branch tip with `git update-ref %s <tip> \"\"`, `git branch -D %s`, "
+            "then `git update-ref -d %s`).",
+            container, e, container, container, ended_ref(container, "<stamp>"), container, anchor_ref(container),
         )
     _stop_and_remove(container)
-    for repo in manifest.repos if manifest else ():
-        _forget_repo(repo, container, manifest.ticket)
+    forgotten = {repo.name: _forget_repo(repo, container, manifest.ticket) for repo in manifest.repos} if manifest else {}
     typer.echo(
         f"Shut down ticket container: {container} (commits survive in every repo store)"
     )
     for repo in manifest.repos if manifest else ():
-        if _is_git(repo.path):
+        if not _is_git(repo.path):
+            continue
+        if forgotten[repo.name]:
             typer.echo(
                 f"  {repo.name} (git): branch {container} and its worktree forgotten; "
                 f"work on the branch is kept under {ended_ref(container, '<time>')}"
+            )
+        else:
+            typer.echo(
+                f"  {repo.name} (git): NOT cleaned up, see the warning above; "
+                "the branch, the worktree registration and the anchor ref may still be there",
+                err=True,
             )
 
 
@@ -657,16 +665,15 @@ def shutdown_all_tickets() -> None:
         _teardown(name)
 
 
-def _forget_repo(repo: RepoManifestEntry, container: str, ticket: str) -> None:
+def _forget_repo(repo: RepoManifestEntry, container: str, ticket: str) -> bool:
     """``forget_session_state`` for one manifest repo; a git repo also needs the container-side
     path of its worktree, which the host cannot derive from the repo."""
     if _is_git(repo.path):
-        forget_session_state(repo.path, container, f"{WORKSPACE_BASE}/{ticket}/{repo.name}")
-    else:
-        forget_session_state(repo.path, container)
+        return forget_session_state(repo.path, container, f"{WORKSPACE_BASE}/{ticket}/{repo.name}")
+    return forget_session_state(repo.path, container)
 
 
-def forget_session_state(repo_root_str: str, session: str, worktree_path: str = "") -> None:
+def forget_session_state(repo_root_str: str, session: str, worktree_path: str = "") -> bool:
     """Drop the session's bookmark and workspace registration from a repo's jj store.
 
     Shared by the v1 agent/task-agent teardown and per-repo ticket
@@ -677,6 +684,9 @@ def forget_session_state(repo_root_str: str, session: str, worktree_path: str = 
 
     A git repo is forgotten only when *worktree_path* (the ticket's worktree inside the
     container) is given; the task-agent callers have none and leave git alone.
+
+    Returns whether everything asked for was done (nothing asked counts as done), so a caller
+    prints its success line only then; every failure has been logged with the manual steps.
     """
     repo_root = Path(repo_root_str)
     if not repo_root.is_dir():
@@ -686,7 +696,7 @@ def forget_session_state(repo_root_str: str, session: str, worktree_path: str = 
             "(a git repo: `git worktree list`, then `git branch -D %s`)",
             session, repo_root, session, session, session,
         )
-        return
+        return False
     try:
         backend = get_backend(repo_root)
     except RuntimeError as e:
@@ -696,30 +706,32 @@ def forget_session_state(repo_root_str: str, session: str, worktree_path: str = 
             "(a git repo: `git worktree list`, then `git branch -D %s`)",
             session, repo_root, e, repo_root, session, session, session,
         )
-        return
+        return False
     if backend.name != "jj":
         if not worktree_path:
-            return
+            return True
         if reason := check_git_store(backend.repo_root):
             log.warning(
                 "Not cleaning up session state for %s in %s: %s, so no host git runs there. "
                 "Fix the repo, then end the session by hand: `git worktree list`, unlock and remove "
-                "this ticket's worktree, `git branch -D %s`, `git update-ref -d %s`",
-                session, repo_root, reason, session, anchor_ref(session),
+                "this ticket's worktree, archive the branch tip with `git update-ref %s <tip> \"\"`, "
+                "`git branch -D %s`, `git update-ref -d %s`",
+                session, repo_root, reason, ended_ref(session, "<stamp>"), session, anchor_ref(session),
             )
-            return
-        _forget_git_session_state(backend, session, worktree_path)
-        return
+            return False
+        return _forget_git_session_state(backend, session, worktree_path)
     if reason := check_jj_ids(backend.repo_root):
         log.warning(
             "Not cleaning up session state for %s in %s: %s, so no host jj runs there. "
             "Fix the repo, then: cd %s && jj bookmark forget %s && jj workspace forget %s",
             session, repo_root, reason, repo_root, session, session,
         )
-        return
+        return False
+    forgotten = True
     for cmd in (["bookmark", "forget", session], ["workspace", "forget", session]):
         result = backend.run(cmd)
         if result.returncode != 0:
+            forgotten = False
             log.warning(
                 "jj %s failed (rc=%d): %s. "
                 "The next launch may reattach to stale state; "
@@ -727,9 +739,10 @@ def forget_session_state(repo_root_str: str, session: str, worktree_path: str = 
                 " ".join(cmd), result.returncode, result.stderr.strip(),
                 repo_root, " ".join(cmd),
             )
+    return forgotten
 
 
-def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: str) -> None:
+def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: str) -> bool:
     """git shutdown: end the session's lifecycle, keeping the work.
 
     Order matters: git refuses to delete a checked-out branch, so the worktree
@@ -740,6 +753,7 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
     it, and the next start reattaches. Stops at the first failure with the
     manual command, like the jj forget. The archive refs are create-only (an empty
     old value): an archive that exists under the same stamp is never overwritten.
+    Returns whether every step worked.
     """
     repo_root = backend.repo_root
     anchor = anchor_ref(session)
@@ -768,19 +782,18 @@ def _forget_git_session_state(backend: VcsBackend, session: str, worktree_path: 
         if (head and "detached" in mine and not contains(f"refs/heads/{session}", head)
                 and not contains(anchor, head)):
             if not run("update-ref", ended_ref(session, f"{stamp}-detached"), head, ""):
-                return
+                return False
         # A lock whose directory is gone is what keeps the registration (and a detached HEAD) alive.
         backend.run([*NO_HOOKS, "worktree", "unlock", worktree_path])
         if not run("worktree", "remove", "--force", worktree_path):
-            return
+            return False
     if tip := rev(f"refs/heads/{session}"):
         if tip != rev(anchor):
             if not run("update-ref", ended_ref(session, stamp), tip, ""):
-                return
+                return False
         if not run("branch", "-D", session):
-            return
-    if rev(anchor):
-        run("update-ref", "-d", anchor)
+            return False
+    return not rev(anchor) or run("update-ref", "-d", anchor)
 
 
 # --- Status / logs ----------------------------------------------------------------

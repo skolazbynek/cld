@@ -272,7 +272,8 @@ For each manifest entry, in manifest order:
    no blanket `git worktree prune` -- the store is shared with other tickets whose worktree paths do not
    exist in this container -- only this session's own stale registration is removed, after a detached HEAD
    holding commits nothing else holds is archived (`refs/cld/ended/t.<slug>/<stamp>-detached`, the name
-   shutdown uses), so a failed add loses nothing. First launch resolves
+   shutdown uses). When the archive ref cannot be written the boot stops and the registration is kept;
+   once it is written, a failed add loses nothing. First launch resolves
    `<anchor_base>` to a commit, adds the worktree and stages S (below). A ticket with a branch but no anchor
    ref (from before the scratch commit) reattaches with the base as anchor and a warning.
 3. First launch only: stage scratch B via
@@ -341,7 +342,7 @@ failing repo is named.
    worktree registration (after archiving a detached HEAD that holds its own
    commits as `refs/cld/ended/<id>/<stamp>-detached`), archive the branch tip as
    `refs/cld/ended/<id>/<stamp>` when it holds work above the scratch commit,
-   delete the branch, delete `refs/cld/anchor/<id>` last. The anchor ref is the
+   delete the branch, delete `refs/cld/anchor/<id>` last. `forget_session_state` returns whether every step worked; the shutdown output prints the per-repo "forgotten" line only then (a repo that was not cleaned up gets a notice on stderr and the manual steps in the log, the archive `git update-ref` before `git branch -D`). The anchor ref is the
    lifecycle-alive marker, so a partial failure leaves it and the next start
    reattaches; each failure is a warning naming the manual command. This also removes the
    v1 asymmetry where restart needed a special USR1 signal to *avoid*

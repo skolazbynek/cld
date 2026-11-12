@@ -661,6 +661,26 @@ class TestBootWithReadOnlyWorkingCopy(_RealJjOrigin):
         assert self._boot_git(env, origin, workspace).returncode == 0
         assert self._git(env, origin, "merge-base", "--is-ancestor", tip, next(iter(self._ended(env, origin)))) == ""
 
+    def test_git_reattach_fails_and_keeps_the_registration_when_the_archive_cannot_be_written(self, tmp_path, env):
+        """Dropping the registration without the archive would lose the detached commits."""
+        origin = self._git_origin(tmp_path, env)
+        workspace = tmp_path / "ws"
+        tip = self._lose_a_detached_commit(env, origin, workspace)
+        refs = origin / ".git/refs/cld"
+        refs.chmod(0o555)
+        try:
+            result = self._boot_git(env, origin, workspace)
+        finally:
+            refs.chmod(0o755)
+        assert result.returncode != 0
+        assert "could not archive the old worktree HEAD" in result.stderr
+        assert "its registration is kept" in result.stderr
+        assert "worktree add" not in result.stderr
+        assert "locked" in " ".join(self._worktrees(env, origin)[str(workspace)])
+        assert self._ended(env, origin) == {}
+        assert self._boot_git(env, origin, workspace).returncode == 0
+        assert list(self._ended(env, origin).values()) == [tip]
+
     def test_git_reattach_resumes_another_checked_out_branch(self, tmp_path, env):
         origin = self._git_origin(tmp_path, env)
         workspace = tmp_path / "ws"

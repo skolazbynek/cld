@@ -41,7 +41,7 @@ from cld.ticket import (
     wait_ticket_ready,
 )
 from cld.vcs.anchor import move_anchor_commit
-from cld.vcs.git import NO_HOOKS
+from cld.vcs.git import NO_HOOKS, check_git_store
 from cld.vcs.scratch import stage_in_workspace
 
 
@@ -1001,6 +1001,20 @@ class TestShutdownTicket:
         forget.assert_not_called()
         assert "manually" in caplog.text
 
+    @pytest.mark.parametrize("worked", [True, False], ids=["forgotten", "failed"])
+    def test_the_git_success_line_needs_a_forget_that_worked(self, capsys, worked):
+        manifest = _manifest()
+        with patch("cld.ticket._docker_status", return_value="running"), \
+             patch("cld.ticket.read_manifest", return_value=manifest), \
+             patch("cld.ticket._stop_and_remove"), \
+             patch("cld.ticket._is_git", return_value=True), \
+             patch("cld.ticket.forget_session_state", side_effect=[worked, True]):
+            shutdown_ticket("lide-2600")
+        captured = capsys.readouterr()
+        assert ("lide-api (git): branch t.lide-2600 and its worktree forgotten" in captured.out) is worked
+        assert ("lide-api (git): NOT cleaned up" in captured.err) is not worked
+        assert "diskuze-api (git): branch t.lide-2600 and its worktree forgotten" in captured.out
+
     def test_absent_is_a_polite_noop(self, capsys):
         with patch("cld.ticket._docker_status", return_value="absent"), \
              patch("cld.ticket._stop_and_remove") as stop:
@@ -1052,6 +1066,24 @@ class TestForgetSessionState:
             forget_session_state(str(tmp_path), "a.r.x")
         assert backend.run.call_count == 2
 
+    def test_the_result_says_whether_everything_was_forgotten(self, tmp_path):
+        backend = MagicMock()
+        backend.name = "jj"
+        with patch("cld.ticket.get_backend", return_value=backend):
+            backend.run.return_value = MagicMock(returncode=0, stderr="")
+            assert forget_session_state(str(tmp_path), "t.x") is True
+            backend.run.side_effect = [MagicMock(returncode=0, stderr=""), MagicMock(returncode=1, stderr="no")]
+            assert forget_session_state(str(tmp_path), "t.x") is False
+        with patch("cld.ticket.get_backend", side_effect=RuntimeError("no vcs")):
+            assert forget_session_state(str(tmp_path), "t.x") is False
+        assert forget_session_state(str(tmp_path / "gone"), "t.x") is False
+
+    def test_a_git_repo_with_nothing_asked_counts_as_done(self, tmp_path):
+        backend = MagicMock()
+        backend.name = "git"
+        with patch("cld.ticket.get_backend", return_value=backend):
+            assert forget_session_state(str(tmp_path), "a.r.x") is True
+
     def test_missing_repo_root_never_touches_the_backend(self, tmp_path):
         with patch("cld.ticket.get_backend") as get_backend_mock:
             forget_session_state(str(tmp_path / "gone"), "a.r.x")
@@ -1067,6 +1099,13 @@ class TestForgetGitSessionState:
     branch, and the anchor ref last (it is the lifecycle-alive marker)."""
 
     SESSION = "t.x"
+
+    @pytest.fixture(autouse=True)
+    def _scripted_repo_is_not_read(self, monkeypatch):
+        """/repo of the scripted backend is a repo no test creates; under the broker it is the real store."""
+        monkeypatch.setattr(
+            "cld.ticket.check_git_store", lambda repo: None if repo == Path("/repo") else check_git_store(repo),
+        )
 
     def _lifecycle(self, git_repo, tmp_path, work: bool) -> str:
         """Boot-like state: a locked worktree on the session branch with a pinned scratch commit,
@@ -1174,6 +1213,25 @@ class TestForgetGitSessionState:
         workspace = self._lifecycle(git_repo, tmp_path, work=True)
         forget_session_state(str(git_repo.repo_root), self.SESSION, workspace)
         assert not self._archived(git_repo, "-detached")
+
+    def test_the_result_is_true_only_when_every_step_worked(self, git_repo, tmp_path):
+        workspace = self._lifecycle(git_repo, tmp_path, work=True)
+        assert forget_session_state(str(git_repo.repo_root), self.SESSION, workspace) is True
+        assert forget_session_state(str(git_repo.repo_root), self.SESSION, workspace) is True
+
+    @pytest.mark.parametrize("fail", ["update-ref refs/cld/ended", "worktree remove", "branch -D", "update-ref -d"])
+    def test_a_failed_step_is_reported_as_failed(self, tmp_path, caplog, fail):
+        backend = self._scripted_backend(fail=fail, detached=fail.startswith("update-ref refs"))
+        with patch("cld.ticket.get_backend", return_value=backend), caplog.at_level("WARNING"):
+            assert forget_session_state(str(tmp_path), self.SESSION, "/workspace/x/api") is False
+
+    def test_a_refused_store_is_reported_as_failed_with_the_archive_first(self, git_repo, tmp_path, caplog):
+        git_repo.run(["config", "extensions.worktreeConfig", "true"])
+        with caplog.at_level("WARNING"):
+            assert forget_session_state(str(git_repo.repo_root), self.SESSION, str(tmp_path / "ws")) is False
+        hint = caplog.text
+        assert 'git update-ref refs/cld/ended/t.x/<stamp> <tip> ""' in hint
+        assert hint.index("git update-ref refs/cld/ended") < hint.index("git branch -D")
 
     def test_a_failed_detached_archive_keeps_the_registration(self, tmp_path, caplog):
         backend = self._scripted_backend(detached=True, fail="update-ref refs/cld/ended")

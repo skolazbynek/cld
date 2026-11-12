@@ -261,14 +261,15 @@ _cld_git_boot_anchor() {
 # there is no blanket `git worktree prune`: only this session's own stale
 # registration is dropped, after its HEAD and branch are read, so a reattach
 # resumes where the lost worktree was. A detached HEAD holding commits nothing else
-# holds is archived first (cld_archive_stale_head), so a failed add loses nothing.
+# holds is archived first (cld_archive_stale_head); when that fails the boot stops with the
+# registration kept, and once it has worked a failed add loses nothing.
 cld_archive_stale_head() {
     # A stale registration is about to be dropped; a detached HEAD may be all that holds some
     # commits (the add below can fail, or resume something else). Keep them under
     # refs/cld/ended/<session>/<UTC stamp>-detached, the name shutdown uses (cld.names.ended_ref
     # builds the same string; this file cannot import it). Nothing is archived when the commit is
     # missing, already reachable from the session branch or the anchor ref, or already archived.
-    # Args: $1=origin $2=session $3=head
+    # Returns non-zero when the archive ref cannot be written. Args: $1=origin $2=session $3=head
     local origin="$1" session="$2" head="$3" held ref
     git -C "$origin" cat-file -e "${head}^{commit}" 2>/dev/null || return 0
     for held in "refs/heads/$session" "refs/cld/anchor/$session"; do
@@ -283,7 +284,8 @@ cld_archive_stale_head() {
     if git -C "$origin" update-ref "$ref" "$head" ""; then
         echo "[cld] archived the old worktree HEAD ${head:0:12} as $ref"
     else
-        echo "[WARN] could not archive the old worktree HEAD ${head:0:12}; keep it with: git update-ref <ref> $head" >&2
+        echo "[ERROR] could not archive the old worktree HEAD ${head:0:12} as $ref" >&2
+        return 1
     fi
 }
 
@@ -303,8 +305,11 @@ cld_boot_worktree() {
     if stale=$(cld_stale_worktree "$origin" "$workspace"); then
         read -r stale_head stale_branch <<<"$stale"
         # Before the registration goes: a branch keeps its own commits, a detached HEAD does not.
-        if [ -z "$stale_branch" ] && [ -n "$stale_head" ]; then
-            cld_archive_stale_head "$origin" "$bookmark" "$stale_head"
+        if [ -z "$stale_branch" ] && [ -n "$stale_head" ] &&
+                ! cld_archive_stale_head "$origin" "$bookmark" "$stale_head"; then
+            echo "Error: boot stopped so that commits of the old worktree are not lost: its registration is kept." >&2
+            echo "Fix the store (permissions, space), or keep ${stale_head:0:12} with 'git update-ref <ref> $stale_head' in the origin, then restart." >&2
+            return 1
         fi
         # `remove -f -f` also drops a locked registration whose directory is gone.
         git -C "$origin" worktree remove -f -f "$workspace" || true
