@@ -136,7 +136,9 @@ def _git_head_in_tree(anchor: Anchor) -> bool:
     """True if HEAD is the anchor or descends from it. File writes land in the working tree,
     never in HEAD, so HEAD in ``A::`` is the git analogue of jj's ``@`` in ``A+::``: the anchor
     is the scratch commit a git workspace starts at. Raises RuntimeError when HEAD or the
-    anchor does not resolve (a missing anchor object: an amended or dropped scratch commit)."""
+    anchor does not resolve (a missing anchor object: an amended or dropped scratch commit). A
+    timeout or a failure to start git escapes as ``subprocess.TimeoutExpired`` or ``OSError``;
+    the callers deny on all three."""
     ancestor = subprocess.run(
         ["git", "-C", anchor.workspace, "merge-base", "--is-ancestor", anchor.anchor, "HEAD"],
         capture_output=True, text=True, timeout=JJ_TIMEOUT,
@@ -169,7 +171,7 @@ def check_file(path: str, anchors: list[Anchor]) -> str | None:
         return f"Rule 'file write outside anchor tree': {_outside_tree_reason(anchor)}"
     try:
         in_tree = _git_head_in_tree(anchor)
-    except RuntimeError as e:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
         # An escaping error would exit the hook with 1, which does not block the write.
         return (
             f"Rule 'file write outside anchor tree': cannot tell whether HEAD in {anchor.workspace} is in "
@@ -388,7 +390,7 @@ def check_bash(command: str, cwd: str, anchors: list[Anchor]) -> str | None:
 def _git_drift(anchor: Anchor) -> list[str]:
     try:
         in_tree = _git_head_in_tree(anchor)
-    except RuntimeError:
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return [
             f"{anchor.repo}: HEAD or the anchor {anchor.anchor} no longer resolves. "
             "Stop and report this; do not write files."

@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from cld.vcs.anchor_guard import _simple_commands, parse_jj
+from cld.vcs import anchor_guard
+from cld.vcs.anchor_guard import Anchor, _simple_commands, parse_jj
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HOOK = PROJECT_ROOT / "cld" / "vcs" / "anchor_guard.py"
@@ -507,6 +508,38 @@ class TestGitFileRule:
         reason = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
         assert "cannot tell whether HEAD" in reason
         assert "do not write files" in reason
+
+    GIT_FAILURES = [
+        subprocess.TimeoutExpired("git", 10), FileNotFoundError("git"), PermissionError("git"), OSError("no fork"),
+    ]
+    GIT_FAILURE_IDS = ["timeout", "git-missing", "permission", "os-error"]
+
+    @pytest.fixture
+    def failing_git(self, monkeypatch: pytest.MonkeyPatch, git_repo: tuple[Path, Callable[..., str]], request):
+        """Every guard call of git fails to run, in the way of ``request.param``."""
+
+        def run(*args, **kwargs):
+            raise request.param
+
+        anchor = Anchor(
+            repo="g", workspace=str(git_repo[0].resolve()), anchor=git_repo[1]("rev-parse", "HEAD"),
+            mode="isolated", backend="git",
+        )
+        monkeypatch.setattr(anchor_guard.subprocess, "run", run)
+        return anchor
+
+    @pytest.mark.parametrize("failing_git", GIT_FAILURES, ids=GIT_FAILURE_IDS, indirect=True)
+    def test_a_git_that_cannot_run_denies_the_file_write(self, failing_git: Anchor) -> None:
+        """An exception that escapes the hook exits with 1, which does not block the write."""
+        reason = anchor_guard.check_file(f"{failing_git.workspace}/a.txt", [failing_git])
+        assert reason is not None
+        assert "cannot tell whether HEAD" in reason and "do not write files" in reason
+
+    @pytest.mark.parametrize("failing_git", GIT_FAILURES, ids=GIT_FAILURE_IDS, indirect=True)
+    def test_a_git_that_cannot_run_blocks_on_drift(self, failing_git: Anchor) -> None:
+        reason = anchor_guard.check_drift([failing_git])
+        assert reason is not None
+        assert "g: HEAD or the anchor" in reason and "do not write files" in reason
 
 
 @needs_jj
