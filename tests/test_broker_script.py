@@ -1710,6 +1710,64 @@ class TestStoreMountParity:
         with pytest.raises(broker.StoreRefused, match="extensions.worktreeConfig"):
             broker.store_mounts(str(repo), "/repo")
 
+    CONFIG_CASES = [
+        b"[extensions]\rworktreeConfig = true\n", b"[extensions]\n\r\tworktreeConfig = true\n",
+        b"[include]\n\tpath = evil.cfg\n", b'[includeIf "gitdir:**"]\n\tpath = ./evil.cfg\n',
+        b"[INCLUDE]\r\n\tPath = \"evil.cfg\" ; c\r\n", b"[include] path = ../shared.cfg\n",
+        b"[include]\n\tpath = ~/x\n", b"[core]\n\tpath = evil.cfg\n", b"[include]\n\t# path = a\n",
+    ]
+
+    @pytest.mark.parametrize("config", CONFIG_CASES)
+    def test_config_parsers_agree_with_the_launchers(self, tmp_path, config):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        (repo / ".git/config").write_bytes(config)
+        assert broker.config_include_paths(config) == cld_git.config_include_paths(config)
+        assert broker.worktree_config_problem(str(repo), ".git") == cld_git.check_worktree_config(repo, ".git")
+
+    @pytest.mark.parametrize("planted", ["config.worktree", "worktrees/t/config.worktree"])
+    def test_planted_config_worktree_agrees_with_the_launchers(self, tmp_path, planted):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        (repo / ".git" / planted).parent.mkdir(parents=True, exist_ok=True)
+        (repo / ".git" / planted).write_text("")
+        assert cld_git.check_worktree_config(repo)
+        assert broker.worktree_config_problem(str(repo), ".git") == cld_git.check_worktree_config(repo, ".git")
+
+    @pytest.mark.parametrize("config", [b"[extensions]\rworktreeConfig = true\n", b"[include]\n\tpath = evil.cfg\n"],
+                             ids=["lone-cr", "include"])
+    def test_the_broker_refuses_what_the_launcher_refuses_on_a_git_only_store(self, tmp_path, config):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        (repo / ".git/config").write_bytes(config)
+        with pytest.raises(broker.StoreRefused, match="cannot mount its store safely"):
+            broker.store_layout(str(repo))
+
+    def test_the_broker_refuses_a_planted_config_worktree_on_a_git_only_store(self, tmp_path):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        (repo / ".git/config.worktree").write_text("")
+        with pytest.raises(broker.StoreRefused, match=r"\.git/config\.worktree exists"):
+            broker.store_layout(str(repo))
+
+    @pytest.mark.parametrize("layout", ["colocated", "internal"])
+    @pytest.mark.parametrize("damage", ["extension", "include", "planted"])
+    def test_a_jj_store_gets_a_broker_note_and_is_mounted(self, tmp_path, capsys, layout, damage):
+        """Like the other non-fatal notes of the broker: a line on stderr, no denial."""
+        repo = _make_store(tmp_path / "repo", layout)
+        git_dir = repo / (".git" if layout == "colocated" else ".jj/repo/store/git")
+        match damage:
+            case "extension":
+                (git_dir / "config").write_text("[extensions]\n\tworktreeConfig = true\n")
+            case "include":
+                (git_dir / "config").write_text("[include]\n\tpath = evil.cfg\n")
+            case "planted":
+                (git_dir / "config.worktree").write_text("")
+        assert broker.store_layout(str(repo)).jj
+        assert broker.store_mounts(str(repo), "/repo")
+        err = capsys.readouterr().err
+        assert err.startswith("[cld-broker] repo ") and "warning only" in err
+
+    def test_a_clean_jj_store_gets_no_note(self, tmp_path, capsys):
+        broker.store_layout(str(_make_store(tmp_path / "repo", "colocated")))
+        assert capsys.readouterr().err == ""
+
     @pytest.mark.parametrize("layout", ["colocated", "internal"])
     def test_neither_refuses_worktree_config_on_a_jj_store(self, tmp_path, monkeypatch, layout):
         repo = _make_store(tmp_path / "repo", layout)
@@ -2042,6 +2100,34 @@ class TestGitTicketRevision:
         tip = broker.LabelCaller(self.SESSION, "ticket", "").revision(str(git_store))
         assert tip == self._rev(git_store, self.SESSION)
         assert tip != self._rev(git_store, "HEAD")
+
+    def _git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@localhost", *args],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_host_git_ignores_a_replace_ref_the_container_wrote(self, git_store):
+        (git_store / "f").write_text("x")
+        self._git(git_store, "add", "f")
+        self._git(git_store, "commit", "-q", "-m", "third")
+        third, first = self._rev(git_store, "HEAD"), self._rev(git_store, self.SESSION)
+        real_tree = self._git(git_store, "--no-replace-objects", "rev-parse", f"{third}^{{tree}}")
+        self._git(git_store, "replace", third, first)
+        assert self._git(git_store, "rev-parse", f"{third}^{{tree}}") != real_tree
+        assert broker.host_git(str(git_store), "rev-parse", f"{third}^{{tree}}") == real_tree
+
+    def test_host_git_ignores_a_graft_file_the_container_wrote(self, git_store):
+        first, second = self._rev(git_store, self.SESSION), self._rev(git_store, "HEAD")
+        (git_store / ".git/info").mkdir(exist_ok=True)
+        (git_store / ".git/info/grafts").write_text(f"{second}\n")
+        assert subprocess.run(["git", "-C", str(git_store), "merge-base", "--is-ancestor", first, second],
+                              capture_output=True).returncode == 1
+        assert broker.host_git(str(git_store), "merge-base", "--is-ancestor", first, second) == ""
+
+    def test_host_git_runs_with_both_variables_set(self, git_store, tmp_path, monkeypatch):
+        monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))
+        _fakebin(tmp_path, monkeypatch, git='echo "$GIT_NO_REPLACE_OBJECTS $GIT_GRAFT_FILE" >> "$FAKE_GIT_LOG"\n')
+        broker.host_git(str(git_store), "rev-parse", "HEAD")
+        assert (tmp_path / "git.log").read_text() == "1 /dev/null\n"
 
     def test_a_missing_session_branch_is_unresolved(self, git_store):
         assert broker.LabelCaller("t.other", "ticket", "").revision(str(git_store)) is None

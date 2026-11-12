@@ -97,14 +97,34 @@ container that mounts a store uses this set (3.4 and section 5).
 3. `git_target`, resolved against `H/.jj/repo/store`, must be `H/.git` or `H/.jj/repo/store/git`.
 4. `G/hooks` missing: create it empty (0755).
 5. `lstat` every source. Refuse a symlink, or a dir where a file is expected, or the reverse.
-6. git-only store: refuse when `.git/config` sets `extensions.worktreeConfig` (any value, any letter
-   case). Host git then also reads `.git/config.worktree` and `.git/worktrees/*/config.worktree`, which
-   no row protects: a container could set `core.hooksPath` (a planted `reference-transaction` hook ran on
-   host `update-ref`, `branch -D`) or `core.fsmonitor` (fires on read commands) and have the host act on
-   it. The key is read by the file, with no git or jj run (`cld/vcs/git.py:check_worktree_config`). jj
-   stores are not refused: no host git hook runs there. Host git also runs no hook on the ref changes
-   of shutdown and `--reanchor` (`-c core.hooksPath=/dev/null`, defense in depth), and none of the host
-   git calls of a git ticket (shutdown, the branch lookup) run on a store that fails this check.
+6. Store config and `config.worktree`. With `extensions.worktreeConfig` on, host git (and host jj,
+   through its git layer) also reads `G/config.worktree` and `G/worktrees/*/config.worktree`, which no
+   row protects: a container could set `core.hooksPath` (a planted `reference-transaction` hook ran on
+   host `update-ref`, `branch -D`), `core.fsmonitor` (fires on read commands such as `git status`) or
+   `core.sshCommand` (runs on host `jj git fetch`) and have the host act on it. The same holds for a
+   config that includes a file inside `G` (`include.path`, `includeIf.*.path`, relative paths resolve
+   against `G`). The checks read the files, with no git or jj run (`cld/vcs/git.py:check_worktree_config`;
+   the key is found in any letter case and with `\r` as whitespace, as git reads it):
+   - git-only store: refuse when `.git/config` sets `extensions.worktreeConfig` (any value), includes a
+     file inside `.git`, or when `.git/config.worktree` or any `.git/worktrees/*/config.worktree`
+     exists (also with the extension off: it becomes active once the host turns the extension on), or
+     when `.git/worktrees` is not a directory.
+   - jj store: **warn only** (user decision), in the launcher preflight and as a `[cld-broker]` note
+     on stderr in the broker. jj has priority and such stores exist for sparse-checkout. The warning
+     names the risk and the fix: `git config --unset extensions.worktreeConfig` once sparse-checkout is
+     not needed. "No host git hook runs there" does not hold: host `git status` and `jj git fetch`
+     act on `core.fsmonitor` and `core.sshCommand` there. The residual risk stays with the user.
+
+   Host git also runs no hook on the ref changes of shutdown and `--reanchor`
+   (`-c core.hooksPath=/dev/null`, defense in depth), and none of the host git calls of a git ticket
+   (shutdown, the branch lookup) run on a store that fails this check.
+7. Replace refs and grafts. A container can write `refs/replace/*` and `.git/info/grafts`, which show
+   host `commit-tree <target>^{tree}` (`--reanchor`) and `merge-base --is-ancestor` (the target
+   refusal, the shutdown "already held" check) fake objects and parents. Every host git command cld
+   issues on a git store runs with `GIT_NO_REPLACE_OBJECTS=1` and `GIT_GRAFT_FILE=/dev/null`
+   (`GitBackend.run`, `STORE_ENV`; the broker's `host_git`). Both are needed: the first does not
+   switch off the graft file. Residual risk: the host user's own git commands in their checkout still
+   honour a replace ref or graft a container wrote, as the store is shared. cld does not fix that.
 
 Refusal: `cld: repo '<name>': <reason> -- cannot mount its store safely`, exit 1, no container.
 
@@ -245,7 +265,9 @@ Docker resolves only the copy's path, which no container can write. Callers that
   already migrated into host config; the check in section 9 finds it.
 - Submodules are refused (13). `.git/info` and `objects/info/alternates` stay writable.
   `config.worktree` stays writable too, so a git-only store that turns on `extensions.worktreeConfig`
-  is refused (3.2 step 6).
+  (or holds a `config.worktree`, or includes a file inside the git dir) is refused, and a jj store
+  with any of these is warned about (3.2 step 6). Replace refs and grafts a container writes are
+  switched off for cld's own host git, not for the user's commands in their checkout (3.2 step 7).
 - Tracked or once-committed `.env` files are in the store (A7).
 
 ## 8. What breaks or changes for users
@@ -389,8 +411,9 @@ Deviations from the sections above. Host checks: `MANUAL_TESTS.md` section 10.
 
 - **Row 11** (`G/commondir`, read-only, holds `.`) is new; the preflight creates it.
 - **More refusals, all before any host jj:** a foreign `commondir`; a `G/modules` dir (submodules
-  are not supported yet); on a git-only store, `extensions.worktreeConfig` in `.git/config` (3.2 step 6,
-  also in the broker's `store_layout`, so `host_git` and the runner mounts refuse it); any container that mounts the repo without the `store-v1` label (a
+  are not supported yet); on a git-only store, `extensions.worktreeConfig` in `.git/config`, a config include inside `.git`,
+  or a `config.worktree` file (3.2 step 6, also in the broker's `store_layout`, so `host_git` and the
+  runner mounts refuse it; a jj store gets a warning instead); any container that mounts the repo without the `store-v1` label (a
   refusal, not the warning of 3.4). `claude-base` also carries `org.cld.boot-api=2`.
 - **`ignore_gitignore` is off.** D6 and 4.1 were not built. Listed files are skipped with a
   warning, and `link_workspace_files` is removed.

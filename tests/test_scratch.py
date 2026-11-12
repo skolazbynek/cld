@@ -744,6 +744,49 @@ class TestMoveAnchorCommitGit:
         assert _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}") == s_hash
 
 
+class TestHostGitIgnoresReplaceRefsAndGrafts:
+    """A container can write ``refs/replace/*`` and ``.git/info/grafts``; host git must not see them."""
+
+    def test_both_variables_reach_git(self, git_repo):
+        shown = git_repo.run(["-c", "alias.show-env=!printenv GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE", "show-env"])
+        assert shown.stdout.split() == ["1", "/dev/null"]
+
+    def test_git_prints_no_graft_deprecation_hint(self, git_repo):
+        assert git_repo.run(["log", "--oneline", "-1"]).stderr == ""
+
+    def test_a_caller_environment_is_kept_next_to_them(self, git_repo):
+        shown = git_repo.run(
+            ["-c", "alias.show-env=!printenv CLD_PROBE GIT_GRAFT_FILE", "show-env"],
+            env={**os.environ, "CLD_PROBE": "kept"},
+        )
+        assert shown.stdout.split() == ["kept", "/dev/null"]
+
+    def test_the_new_scratch_commit_takes_the_real_tree_of_the_target(self, git_repo, tmp_path):
+        base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)
+        real_tree = _git(git_repo, "--no-replace-objects", "rev-parse", f"{target}^{{tree}}")
+        _git(git_repo, "replace", target, base)
+        assert _git(git_repo, "rev-parse", f"{target}^{{tree}}") != real_tree
+
+        move_anchor_commit(git_repo, s_hash, target, "isolated", GIT_SESSION)
+
+        new = _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION))
+        assert _git(git_repo, "--no-replace-objects", "rev-parse", f"{new}^{{tree}}") == real_tree
+
+    def test_a_graft_does_not_hide_that_the_target_builds_on_s(self, git_repo, tmp_path):
+        _base, s_hash, _target, _peer = _git_stage(git_repo, tmp_path, work=True)
+        tip = _git(git_repo, "rev-parse", f"refs/heads/{GIT_SESSION}")
+        (git_repo.repo_root / ".git/info").mkdir(exist_ok=True)
+        (git_repo.repo_root / ".git/info/grafts").write_text(f"{tip}\n")
+        hidden = subprocess.run(
+            ["git", "-C", str(git_repo.repo_root), "merge-base", "--is-ancestor", s_hash, tip], capture_output=True,
+        )
+        assert hidden.returncode == 1
+
+        with pytest.raises(RuntimeError, match="is the anchor commit .* or builds on it"):
+            move_anchor_commit(git_repo, s_hash, tip, "isolated", GIT_SESSION)
+        assert _git(git_repo, "rev-parse", anchor_ref(GIT_SESSION)) == s_hash
+
+
 class TestHostRefChangesRunNoHooks:
     """With extensions.worktreeConfig on, a config.worktree the container wrote sets core.hooksPath
     for host git. The preflight refuses such a store; the ref changes also pass -c core.hooksPath."""

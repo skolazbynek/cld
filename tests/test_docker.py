@@ -2222,6 +2222,121 @@ class TestStorePreflight:
             file.write(config)
         assert prepare_store_mounts(repo).git_dir == ".git"
 
+    @pytest.mark.parametrize("layout_id", ["colocated", "internal"])
+    def test_worktree_config_on_a_jj_store_warns_and_launches(self, bare_repo, fake_jj, caplog, layout_id):
+        """A jj store keeps launching, but the log names the risk and how to remove the extension."""
+        found, repo = bare_repo
+        if found != layout_id:
+            pytest.skip("other layout")
+        (repo / ".jj/repo/config-id").write_text("id")
+        (repo / ".jj/workspace-config-id").write_text("id")
+        with (repo / _GIT_DIRS[layout_id] / "config").open("a") as file:
+            file.write("[extensions]\n\tworktreeConfig = true\n")
+        with caplog.at_level(logging.WARNING, logger="cld"):
+            assert prepare_store_mounts(repo, "api").jj
+        warning = caplog.text
+        assert "repo 'api'" in warning and "extensions.worktreeConfig" in warning
+        assert "core.sshCommand" in warning and "core.fsmonitor" in warning
+        assert "git config --unset extensions.worktreeConfig" in warning
+
+    @pytest.mark.parametrize("config", ["[extensions]\rworktreeConfig = true\n", "[extensions]\n\r\tworktreeConfig = true\n"],
+                             ids=["lone-cr", "newline-cr-indent"])
+    def test_worktree_config_behind_a_carriage_return_is_refused(self, store_repo, config):
+        """git counts a carriage return as whitespace, so these set the extension too."""
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        with (repo / ".git/config").open("ab") as file:
+            file.write(config.encode())
+        subprocess.run(["git", "config", "--file", ".git/config.worktree", "cld.probe", "yes"], cwd=repo, check=True)
+        assert subprocess.run(
+            ["git", "config", "cld.probe"], cwd=repo, capture_output=True, text=True,
+        ).stdout.strip() == "yes"
+        assert ".git/config sets extensions.worktreeConfig" in _refusal(repo)
+
+    @pytest.mark.parametrize("where", ["config.worktree", "worktrees/ticket/config.worktree"], ids=["main", "linked"])
+    def test_a_planted_config_worktree_is_refused_with_the_extension_off(self, store_repo, where):
+        """It becomes active the moment the host turns the extension on."""
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        planted = repo / ".git" / where
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("[core]\n\tfsmonitor = /tmp/evil\n")
+        message = _refusal(repo)
+        assert f".git/{where} exists" in message and "becomes active" in message
+
+    def test_a_worktrees_folder_that_is_not_a_directory_is_refused(self, store_repo, tmp_path):
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        (repo / ".git/worktrees").symlink_to(tmp_path)
+        assert ".git/worktrees (not a directory) exists" in _refusal(repo)
+
+    @pytest.mark.parametrize("layout_id", ["colocated", "internal"])
+    def test_a_planted_config_worktree_on_a_jj_store_only_warns(self, bare_repo, fake_jj, caplog, layout_id):
+        found, repo = bare_repo
+        if found != layout_id:
+            pytest.skip("other layout")
+        (repo / ".jj/repo/config-id").write_text("id")
+        (repo / ".jj/workspace-config-id").write_text("id")
+        (repo / _GIT_DIRS[layout_id] / "config.worktree").write_text("[core]\n\tfsmonitor = /tmp/evil\n")
+        with caplog.at_level(logging.WARNING, logger="cld"):
+            assert prepare_store_mounts(repo, "api").jj
+        assert f"{_GIT_DIRS[layout_id]}/config.worktree exists" in caplog.text
+
+    INCLUDES = [
+        ("[include]\n\tpath = evil.cfg\n", "evil.cfg"),
+        ('[includeIf "gitdir:**"]\n\tpath = ./evil.cfg\n', "./evil.cfg"),
+        ("[INCLUDE]\r\n\tPath = \"evil.cfg\" ; comment\r\n", "evil.cfg"),
+        ("[include] path = evil.cfg\n", "evil.cfg"),
+    ]
+
+    @pytest.mark.parametrize("config, value", INCLUDES, ids=["relative", "include-if", "crlf-quoted", "same-line"])
+    def test_an_include_inside_the_git_dir_is_refused_on_a_git_only_store(self, store_repo, config, value):
+        """Real git reads the included file, relative to the git dir, so its settings reach host git."""
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        (repo / ".git/evil.cfg").write_text("[core]\n\tsshCommand = evil\n")
+        with (repo / ".git/config").open("a") as file:
+            file.write(config)
+        assert subprocess.run(
+            ["git", "config", "core.sshCommand"], cwd=repo, capture_output=True, text=True,
+        ).stdout.strip() == "evil"
+        message = _refusal(repo)
+        assert f".git/config includes '{value}'" in message and "inside the git dir" in message
+
+    def test_an_absolute_include_inside_the_git_dir_is_refused(self, store_repo):
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        with (repo / ".git/config").open("a") as file:
+            file.write(f"[include]\n\tpath = {repo / '.git/hooks/../evil.cfg'}\n")
+        assert "inside the git dir" in _refusal(repo)
+
+    @pytest.mark.parametrize("path", ["../shared.cfg", "/etc/gitconfig", "~/shared.cfg"])
+    def test_an_include_outside_the_git_dir_is_left_alone(self, store_repo, path):
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store is checked")
+        with (repo / ".git/config").open("a") as file:
+            file.write(f"[include]\n\tpath = {path}\n")
+        assert prepare_store_mounts(repo).git_dir == ".git"
+
+    @pytest.mark.parametrize("layout_id", ["colocated", "internal"])
+    def test_an_include_inside_the_git_dir_of_a_jj_store_only_warns(self, bare_repo, fake_jj, caplog, layout_id):
+        found, repo = bare_repo
+        if found != layout_id:
+            pytest.skip("other layout")
+        (repo / ".jj/repo/config-id").write_text("id")
+        (repo / ".jj/workspace-config-id").write_text("id")
+        with (repo / _GIT_DIRS[layout_id] / "config").open("a") as file:
+            file.write("[include]\n\tpath = evil.cfg\n")
+        with caplog.at_level(logging.WARNING, logger="cld"):
+            assert prepare_store_mounts(repo, "api").jj
+        assert "includes 'evil.cfg'" in caplog.text
+
     @pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
     def test_a_config_that_is_not_a_regular_file_is_a_reason(self, tmp_path, kind):
         """The host-side git calls after shutdown have no mount-row check behind this one."""

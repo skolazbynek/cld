@@ -64,7 +64,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache, cached_property
@@ -200,10 +200,11 @@ def load_conf() -> None:
 # ---- process helpers -------------------------------------------------------
 
 def _capture(argv: Sequence[str], stderr: int | None = subprocess.DEVNULL,
-             cwd: str | None = None) -> subprocess.CompletedProcess[bytes]:
-    """Run *argv* with stdout captured. A missing binary is exit 127, as in a shell."""
+             cwd: str | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run *argv* with stdout captured, in the environment *env* (default: the broker's own).
+    A missing binary is exit 127, as in a shell."""
     try:
-        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=stderr, cwd=cwd)
+        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=stderr, cwd=cwd, env=env)
     except OSError as e:
         if stderr is None:
             print(f"{argv[0]}: {e.strerror}", file=sys.stderr)
@@ -215,9 +216,9 @@ def _text(result: subprocess.CompletedProcess[bytes]) -> str:
     return os.fsdecode(result.stdout).rstrip("\n")
 
 
-def _out(*argv: str) -> str | None:
+def _out(*argv: str, env: Mapping[str, str] | None = None) -> str | None:
     """stdout of *argv*, stderr discarded; None if it failed."""
-    result = _capture(argv)
+    result = _capture(argv, env=env)
     return None if result.returncode else _text(result)
 
 
@@ -468,9 +469,17 @@ def _require_kind(repo: str, rel: str, expected: str) -> None:
 # equal GIT_DIRS and COMMONDIR_PLACEHOLDER of cld/vcs/jj.py (TestStoreMountParity).
 _GIT_DIRS = (".git", ".jj/repo/store/git")
 _COMMONDIR_PLACEHOLDER = "."
-# The key `extensions.worktreeConfig` of a git-only repo, which makes host git read the
-# `config.worktree` files the agent can write: WORKTREE_CONFIG_KEY of cld/vcs/git.py.
-_WORKTREE_CONFIG_KEY = re.compile(rb"(?:^|\])[ \t]*worktreeconfig(?![\w-])", re.IGNORECASE | re.MULTILINE)
+# The key `extensions.worktreeConfig`, which makes host git read the `config.worktree` files the
+# agent can write: WORKTREE_CONFIG_KEY of cld/vcs/git.py, with the same mini config parser below.
+_WORKTREE_CONFIG_KEY = re.compile(rb"(?:^|\])[ \t\r]*worktreeconfig(?![\w-])", re.IGNORECASE | re.MULTILINE)
+_BLANK = " \t\r"
+_CONFIG_HEADER = re.compile(r'\[[ \t\r]*([^\]\s"]+)(?:[ \t\r]+"(?:[^"\\\n]|\\.)*")?[ \t\r]*\]')
+_CONFIG_KEY = re.compile(r"([A-Za-z][A-Za-z0-9-]*)[ \t\r]*(?:=[ \t\r]*(.*))?$")
+_ESCAPES = {"n": "\n", "t": "\t", "b": "\b"}
+# In the environment of every host git command on a git store: the agent can write `refs/replace/*`
+# and `<git dir>/info/grafts`, which show commit-tree and merge-base fake objects and parents.
+# STORE_ENV of cld/vcs/git.py.
+_STORE_GIT_ENV = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"}
 
 
 def check_git_dir(repo: str, git_dir: str) -> None:
@@ -491,17 +500,93 @@ def check_git_dir(repo: str, git_dir: str) -> None:
         raise _unsafe_store(repo, f"{git_dir}/modules exists: git submodules are not supported yet")
 
 
-def check_worktree_config(repo: str) -> None:
-    """The launcher's cld/vcs/git.py:check_worktree_config for a git-only repo: `.git/config`
-    must not set `extensions.worktreeConfig`, or host git would read `config.worktree` files
-    (hooks, fsmonitor) that the agent writes and no row protects. Raises StoreRefused."""
+def _config_value(raw: str) -> str:
+    """A config value as git reads it: quotes and escapes resolved, an unquoted `#` or `;` starting a comment."""
+    value, quoted, chars = "", False, iter(raw)
+    for char in chars:
+        if char == "\\":
+            escaped = next(chars, "")
+            value += _ESCAPES.get(escaped, escaped)
+        elif char == '"':
+            quoted = not quoted
+        elif char in "#;" and not quoted:
+            break
+        else:
+            value += char
+    return value.strip(_BLANK)
+
+
+def config_include_paths(data: bytes) -> list[str]:
+    """The values of `include.path` and `includeIf.<condition>.path` in the config *data*."""
+    section, found = "", []
+    for line in data.decode(errors="surrogateescape").split("\n"):
+        rest = line.lstrip(_BLANK)
+        while rest and rest[0] not in "#;":
+            if rest[0] == "[":
+                if not (header := _CONFIG_HEADER.match(rest)):
+                    break
+                section = header[1].lower().split(".")[0]
+                rest = rest[header.end():].lstrip(_BLANK)
+                continue
+            key = _CONFIG_KEY.match(rest)
+            if key and key[2] is not None and key[1].lower() == "path" and section in ("include", "includeif"):
+                found.append(_config_value(key[2]))
+            break
+    return found
+
+
+def _include_inside_git_dir(git_dir: str, value: str) -> bool:
+    """Whether the include path *value* of the config in *git_dir* names a file inside it. A relative
+    path resolves against the folder of the including file: the git dir."""
+    target = os.path.normpath(os.path.join(git_dir, os.path.expanduser(value)))
+    roots = {os.path.normpath(git_dir), os.path.realpath(git_dir)}
+    return any(path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+               for path in {target, os.path.realpath(target)} for root in roots)
+
+
+def _planted_worktree_configs(repo: str, git_dir: str) -> list[str]:
+    """The `config.worktree` files of the git dir that exist, whatever the extension says: one
+    becomes active once the host turns the extension on. Paths are relative to *repo*."""
+    found = [f"{git_dir}/config.worktree"] if _kind(f"{repo}/{git_dir}/config.worktree") is not None else []
+    if (kind := _kind(f"{repo}/{git_dir}/worktrees")) is None:
+        return found
+    if kind != "dir":
+        return [*found, f"{git_dir}/worktrees (not a directory)"]
+    with os.scandir(f"{repo}/{git_dir}/worktrees") as entries:
+        return found + sorted(f"{git_dir}/worktrees/{entry.name}/config.worktree" for entry in entries
+                              if _kind(f"{entry.path}/config.worktree") is not None)
+
+
+def worktree_config_problem(repo: str, git_dir: str) -> str | None:
+    """The launcher's cld/vcs/git.py:check_worktree_config: why host git must not run on the store with
+    the git dir *git_dir* of *repo*, None when it may. The git dir is read-write for the agent, so
+    `<git dir>/config` must not set `extensions.worktreeConfig` or include a file inside the git dir,
+    and no `config.worktree` file may exist, or host git would read settings no row protects
+    (hooks, fsmonitor, ssh command). Raises StoreRefused when a path cannot be examined."""
+    config = f"{git_dir}/config"
     try:
-        data = read_repo_file(repo, ".git/config")
+        data = read_repo_file(repo, config)
     except SecretsRefused as e:
-        raise _unsafe_store(repo, f".git/config cannot be read: {e}") from None
-    if data is not None and _WORKTREE_CONFIG_KEY.search(data):
-        raise _unsafe_store(repo, ".git/config sets extensions.worktreeConfig: host git would read config.worktree "
-                                  "files the container can write (hooks, fsmonitor). Check them, then unset it")
+        return f"{config} cannot be read: {e}"
+    if data is None:
+        return None
+    if _WORKTREE_CONFIG_KEY.search(data):
+        return (f"{config} sets extensions.worktreeConfig: a container can plant config.worktree files that host git "
+                "(status) and host jj (git fetch) act on, with core.sshCommand, core.fsmonitor or core.hooksPath. "
+                "Check them, then run `git config --unset extensions.worktreeConfig` (once sparse-checkout is not needed)")
+    if included := next((v for v in config_include_paths(data) if _include_inside_git_dir(f"{repo}/{git_dir}", v)), None):
+        return (f"{config} includes '{included}', a file inside the git dir that the container can write "
+                "(hooks, fsmonitor, ssh command). Check it, then remove the include")
+    if planted := _planted_worktree_configs(repo, git_dir):
+        return (f"{planted[0]} exists: the container can write it, and it becomes active once extensions.worktreeConfig "
+                "is turned on (core.sshCommand, core.fsmonitor, core.hooksPath). Check it, then delete it")
+    return None
+
+
+def check_worktree_config(repo: str, git_dir: str = ".git") -> None:
+    """worktree_config_problem as a refusal, for a git-only repo, whose host git it would steer. Raises StoreRefused."""
+    if problem := worktree_config_problem(repo, git_dir):
+        raise _unsafe_store(repo, problem)
 
 
 def check_jj_ids(repo: str) -> None:
@@ -557,9 +642,10 @@ def _git_only(repo: str) -> bool:
 def host_git(repo: str, *args: str) -> str | None:
     """stdout of host ``git --git-dir <repo>/.git <args>``, None if it failed. For a git-only repo
     (no ``.jj``) after the same store checks the runner mount makes, so git never loads the config
-    or hooks of a git dir the container can write. Raises StoreRefused."""
+    or hooks of a git dir the container can write, and with replace refs and grafts switched off
+    (`_STORE_GIT_ENV`). Raises StoreRefused."""
     layout = store_layout(repo)
-    return _out("git", "--git-dir", f"{repo}/{layout.git_dir}", *args)
+    return _out("git", "--git-dir", f"{repo}/{layout.git_dir}", *args, env={**os.environ, **_STORE_GIT_ENV})
 
 
 def git_branch_tip(repo: str, branch: str) -> str | None:
@@ -629,7 +715,11 @@ def store_layout(repo: str) -> StoreLayout:
         if rel in (f"{layout.git_dir}/hooks", f"{layout.git_dir}/commondir") and _kind(f"{repo}/{rel}") is None:
             raise _not_prepared(repo)
         _require_kind(repo, rel, expected)
-    if not layout.jj:
+    if layout.jj:
+        if problem := worktree_config_problem(repo, layout.git_dir):
+            print(f"[cld-broker] repo {repo}: {problem}. A jj store is mounted anyway, so this is a warning only.",
+                  file=sys.stderr)
+    else:
         check_worktree_config(repo)
     return layout
 

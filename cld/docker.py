@@ -529,10 +529,11 @@ def prepare_store_mounts(host_repo: Path, name: str = "") -> StoreLayout:
 
     Finds the layout, checks the jj version and the settings the read-only
     rows protect, and creates what may be created: the two jj ids, an empty
-    ``hooks`` folder and the ``commondir`` placeholder. A git-only store that
-    sets ``extensions.worktreeConfig`` is refused as well: host git would read
-    the ``config.worktree`` files no row protects. Exits with a refusal rather
-    than mount an unsafe store.
+    ``hooks`` folder and the ``commondir`` placeholder. A git-only store whose
+    config sets ``extensions.worktreeConfig`` or includes a file inside the git
+    dir, or that holds a ``config.worktree`` file, is refused as well: host git
+    would read settings no row protects. A jj store with any of these only
+    logs a warning. Exits with a refusal rather than mount an unsafe store.
     """
     name = name or host_repo.name
     if _kind(host_repo / ".jj") is not None:
@@ -560,8 +561,10 @@ def prepare_store_mounts(host_repo: Path, name: str = "") -> StoreLayout:
     if _kind(host_repo / commondir) is None:
         (host_repo / commondir).write_text(COMMONDIR_PLACEHOLDER)
     _check_rows(name, host_repo, layout)
-    if not layout.jj and (reason := check_worktree_config(host_repo)):
-        _refuse_store(name, reason)
+    if reason := check_worktree_config(host_repo, layout.git_dir):
+        if not layout.jj:
+            _refuse_store(name, reason)
+        log.warning("repo '%s': %s. A jj store is launched anyway, so this is a warning only.", name, reason)
     return layout
 
 
