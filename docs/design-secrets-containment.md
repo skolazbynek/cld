@@ -108,9 +108,11 @@ container that mounts a store uses this set (3.4 and section 5).
    - git-only store: refuse when `.git/config` sets `extensions.worktreeConfig` (any value), includes a
      file inside `.git`, or when `.git/config.worktree` or any `.git/worktrees/*/config.worktree`
      exists (also with the extension off: it becomes active once the host turns the extension on), or
-     when `.git/worktrees` is not a directory.
+     when `.git/worktrees` is not a directory or cannot be read (`.git/worktrees (cannot be read: ...)`
+     in the reason), or when `.git/shallow` exists (see step 7).
    - jj store: **warn only** (user decision), in the launcher preflight and as a `[cld-broker]` note
-     on stderr in the broker. jj has priority and such stores exist for sparse-checkout. The warning
+     on stderr in the broker; this includes an unreadable `worktrees` folder and a `shallow` file, which
+     never crash a jj launch or make the broker refuse the store. jj has priority and such stores exist for sparse-checkout. The warning
      names the risk and the fix: `git config --unset extensions.worktreeConfig` once sparse-checkout is
      not needed. "No host git hook runs there" does not hold: host `git status` and `jj git fetch`
      act on `core.fsmonitor` and `core.sshCommand` there. The residual risk stays with the user.
@@ -118,12 +120,21 @@ container that mounts a store uses this set (3.4 and section 5).
    Host git also runs no hook on the ref changes of shutdown and `--reanchor`
    (`-c core.hooksPath=/dev/null`, defense in depth), and none of the host git calls of a git ticket
    (shutdown, the branch lookup) run on a store that fails this check.
-7. Replace refs and grafts. A container can write `refs/replace/*` and `.git/info/grafts`, which show
+7. Replace refs, grafts, commit-graph and shallow file. A container can write `refs/replace/*` and `.git/info/grafts`, which show
    host `commit-tree <target>^{tree}` (`--reanchor`) and `merge-base --is-ancestor` (the target
    refusal, the shutdown "already held" check) fake objects and parents. Every host git command cld
    issues on a git store runs with `GIT_NO_REPLACE_OBJECTS=1` and `GIT_GRAFT_FILE=/dev/null`
    (`GitBackend.run`, `STORE_ENV`; the broker's `host_git`). Both are needed: the first does not
-   switch off the graft file. Residual risk: the host user's own git commands in their checkout still
+   switch off the graft file. The same calls run with `-c core.commitGraph=false` (`STORE_GIT_FLAGS`):
+   the container can also write `objects/info/commit-graph`, which git trusts for parents and root trees
+   without reading the commits, so a forged file would answer `merge-base --is-ancestor` and
+   `for-each-ref --contains` wrongly (shutdown could skip the detached archive, the `--reanchor` target
+   refusal and the rebase hints could be fooled). A `<git dir>/shallow` file cuts history the same way,
+   and `GIT_GRAFT_FILE` does not switch it off. There is no documented switch, so a git-only store with
+   a `shallow` file is refused (preflight and the shutdown store check, like `config.worktree`) and a jj
+   store gets a warning. A truly shallow host clone must be unshallowed (`git fetch --unshallow`) to be
+   used with ticket containers. The include parser behind the step 6 check skips a leading byte-order
+   mark and joins a backslash line continuation (also before a CRLF), as git does. Residual risk: the host user's own git commands in their checkout still
    honour a replace ref or graft a container wrote, as the store is shared. cld does not fix that.
 
 Refusal: `cld: repo '<name>': <reason> -- cannot mount its store safely`, exit 1, no container.
@@ -266,8 +277,9 @@ Docker resolves only the copy's path, which no container can write. Callers that
 - Submodules are refused (13). `.git/info` and `objects/info/alternates` stay writable.
   `config.worktree` stays writable too, so a git-only store that turns on `extensions.worktreeConfig`
   (or holds a `config.worktree`, or includes a file inside the git dir) is refused, and a jj store
-  with any of these is warned about (3.2 step 6). Replace refs and grafts a container writes are
-  switched off for cld's own host git, not for the user's commands in their checkout (3.2 step 7).
+  with any of these is warned about (3.2 step 6). Replace refs, grafts and a commit-graph a container
+  writes are switched off for cld's own host git, not for the user's commands in their checkout, and a
+  `shallow` file is refused on a git-only store (3.2 step 7).
 - Tracked or once-committed `.env` files are in the store (A7).
 
 ## 8. What breaks or changes for users
@@ -412,7 +424,7 @@ Deviations from the sections above. Host checks: `MANUAL_TESTS.md` section 10.
 - **Row 11** (`G/commondir`, read-only, holds `.`) is new; the preflight creates it.
 - **More refusals, all before any host jj:** a foreign `commondir`; a `G/modules` dir (submodules
   are not supported yet); on a git-only store, `extensions.worktreeConfig` in `.git/config`, a config include inside `.git`,
-  or a `config.worktree` file (3.2 step 6, also in the broker's `store_layout`, so `host_git` and the
+  a `config.worktree` file, an unreadable `worktrees` folder, or a `shallow` file (3.2 steps 6 and 7, also in the broker's `store_layout`, so `host_git` and the
   runner mounts refuse it; a jj store gets a warning instead); any container that mounts the repo without the `store-v1` label (a
   refusal, not the warning of 3.4). `claude-base` also carries `org.cld.boot-api=2`.
 - **`ignore_gitignore` is off.** D6 and 4.1 were not built. Listed files are skipped with a

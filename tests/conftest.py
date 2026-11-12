@@ -1,9 +1,11 @@
 """Shared pytest fixtures: env cleanup, VCS repos, docker helpers."""
 
+import hashlib
 import json
 import logging
 import os
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -111,6 +113,50 @@ def _init_git(path):
         cwd=path, check=True, capture_output=True,
     )
     return GitBackend(path)
+
+
+def forge_commit_graph_parent(git_dir: Path, commit: str, parent: str) -> None:
+    """Write ``objects/info/commit-graph`` of *git_dir* so that it names *parent* as the first
+    parent of *commit*, as a container with write access to the store could. The commits stay as
+    they are: only a git that trusts the graph is fooled."""
+    subprocess.run(
+        ["git", "--git-dir", str(git_dir), "-c", "commitGraph.generationVersion=1", "commit-graph", "write",
+         "--reachable"], check=True, capture_output=True,
+    )
+    path = git_dir / "objects/info/commit-graph"
+    data = bytearray(path.read_bytes())
+    chunks = {}
+    for i in range(data[6] + 1):
+        chunk_id, offset = struct.unpack(">4sQ", data[8 + 12 * i:20 + 12 * i])
+        chunks[chunk_id] = offset
+    oids = [data[chunks[b"OIDL"] + 20 * i:chunks[b"OIDL"] + 20 * i + 20].hex()
+            for i in range((chunks[b"CDAT"] - chunks[b"OIDL"]) // 20)]
+    entry = chunks[b"CDAT"] + 36 * oids.index(commit)
+    struct.pack_into(">I", data, entry + 20, oids.index(parent))
+    generation_and_time = struct.unpack(">Q", data[entry + 28:entry + 36])[0]
+    # a generation above the new parent's, which keeps the graph consistent for git
+    struct.pack_into(">Q", data, entry + 28, (generation_and_time & 0x3ffffffff) | (5 << 34))
+    data[-20:] = hashlib.sha1(bytes(data[:-20])).digest()
+    path.chmod(0o644)
+    path.write_bytes(bytes(data))
+
+
+@pytest.fixture
+def unreadable_dir():
+    """``make(path)`` creates the directory *path* with no permission bits; they come back after the test."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads any directory")
+    made: list[Path] = []
+
+    def make(path: Path) -> Path:
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0)
+        made.append(path)
+        return path
+
+    yield make
+    for path in made:
+        path.chmod(0o755)
 
 
 @pytest.fixture

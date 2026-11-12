@@ -27,6 +27,7 @@ import pytest
 from cld import docker as cld_docker
 from cld.vcs import git as cld_git
 from cld.vcs import jj as cld_jj
+from tests.conftest import forge_commit_graph_parent
 
 BROKER_PY = Path(__file__).resolve().parent.parent / "broker" / "cld-broker.py"
 
@@ -1695,6 +1696,8 @@ class TestStoreMountParity:
     def test_worktree_config_rules_match_the_launchers(self):
         assert broker._WORKTREE_CONFIG_KEY.pattern == cld_git.WORKTREE_CONFIG_KEY.pattern
         assert broker._WORKTREE_CONFIG_KEY.flags == cld_git.WORKTREE_CONFIG_KEY.flags
+        assert broker._STORE_GIT_ENV == cld_git.STORE_ENV
+        assert broker._STORE_GIT_FLAGS == cld_git.STORE_GIT_FLAGS
 
     @pytest.mark.parametrize("config", ["[extensions]\n\tworktreeConfig = true\n", "[extensions] worktreeconfig\n"],
                              ids=["key", "same-line"])
@@ -1715,6 +1718,9 @@ class TestStoreMountParity:
         b"[include]\n\tpath = evil.cfg\n", b'[includeIf "gitdir:**"]\n\tpath = ./evil.cfg\n',
         b"[INCLUDE]\r\n\tPath = \"evil.cfg\" ; c\r\n", b"[include] path = ../shared.cfg\n",
         b"[include]\n\tpath = ~/x\n", b"[core]\n\tpath = evil.cfg\n", b"[include]\n\t# path = a\n",
+        b"\xef\xbb\xbf[include]\n\tpath = evil.cfg\n", b"[include]\n\tpath = ../\\\n.git/evil.cfg\n",
+        b"[include]\r\n\tpath = ../\\\r\n.git/evil.cfg\r\n", b"[core]\n\t# c \\\n[include]\n\tpath = evil.cfg\n",
+        b"[include]\n\tpath = a\\\\\n[include]\n\tpath = evil.cfg\n",
     ]
 
     @pytest.mark.parametrize("config", CONFIG_CASES)
@@ -1746,8 +1752,49 @@ class TestStoreMountParity:
         with pytest.raises(broker.StoreRefused, match=r"\.git/config\.worktree exists"):
             broker.store_layout(str(repo))
 
+    def test_a_shallow_file_agrees_with_the_launchers(self, tmp_path):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        (repo / ".git/shallow").write_text("")
+        assert cld_git.check_worktree_config(repo)
+        assert broker.worktree_config_problem(str(repo), ".git") == cld_git.check_worktree_config(repo, ".git")
+
+    def test_the_broker_refuses_a_shallow_file_on_a_git_only_store(self, tmp_path):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        (repo / ".git/shallow").write_text("")
+        with pytest.raises(broker.StoreRefused, match=r"\.git/shallow exists.*git fetch --unshallow"):
+            broker.store_layout(str(repo))
+
+    def test_an_unreadable_worktrees_folder_agrees_with_the_launchers(self, tmp_path, unreadable_dir):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        unreadable_dir(repo / ".git/worktrees")
+        assert cld_git.check_worktree_config(repo)
+        assert broker.worktree_config_problem(str(repo), ".git") == cld_git.check_worktree_config(repo, ".git")
+
+    def test_the_broker_refuses_an_unreadable_worktrees_folder_on_a_git_only_store(self, tmp_path, unreadable_dir):
+        repo = _make_store(tmp_path / "repo", "git-only")
+        unreadable_dir(repo / ".git/worktrees")
+        with pytest.raises(broker.StoreRefused, match=r"\.git/worktrees \(cannot be read: .*\) exists"):
+            broker.store_layout(str(repo))
+
     @pytest.mark.parametrize("layout", ["colocated", "internal"])
-    @pytest.mark.parametrize("damage", ["extension", "include", "planted"])
+    def test_an_unreadable_worktrees_entry_on_a_jj_store_only_warns(self, tmp_path, capsys, unreadable_dir, layout):
+        repo = _make_store(tmp_path / "repo", layout)
+        git_dir = repo / (".git" if layout == "colocated" else ".jj/repo/store/git")
+        unreadable_dir(git_dir / "worktrees/ticket")
+        assert broker.store_layout(str(repo)).jj
+        assert "cannot be read" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("layout", ["colocated", "internal"])
+    def test_an_unreadable_worktrees_folder_on_a_jj_store_only_warns(self, tmp_path, capsys, unreadable_dir, layout):
+        repo = _make_store(tmp_path / "repo", layout)
+        git_dir = repo / (".git" if layout == "colocated" else ".jj/repo/store/git")
+        unreadable_dir(git_dir / "worktrees")
+        assert broker.store_layout(str(repo)).jj
+        assert broker.store_mounts(str(repo), "/repo")
+        assert "cannot be read" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("layout", ["colocated", "internal"])
+    @pytest.mark.parametrize("damage", ["extension", "include", "planted", "shallow"])
     def test_a_jj_store_gets_a_broker_note_and_is_mounted(self, tmp_path, capsys, layout, damage):
         """Like the other non-fatal notes of the broker: a line on stderr, no denial."""
         repo = _make_store(tmp_path / "repo", layout)
@@ -1759,6 +1806,8 @@ class TestStoreMountParity:
                 (git_dir / "config").write_text("[include]\n\tpath = evil.cfg\n")
             case "planted":
                 (git_dir / "config.worktree").write_text("")
+            case "shallow":
+                (git_dir / "shallow").write_text("")
         assert broker.store_layout(str(repo)).jj
         assert broker.store_mounts(str(repo), "/repo")
         err = capsys.readouterr().err
@@ -2123,11 +2172,30 @@ class TestGitTicketRevision:
                               capture_output=True).returncode == 1
         assert broker.host_git(str(git_store), "merge-base", "--is-ancestor", first, second) == ""
 
+    def test_host_git_ignores_a_commit_graph_the_container_wrote(self, git_store):
+        """The graph is trusted for ancestry: a forged parent link answers `--contains`."""
+        main_tip = self._rev(git_store, "HEAD")
+        self._git(git_store, "checkout", "-q", "-b", "side", self.SESSION)
+        self._git(git_store, "commit", "-q", "--allow-empty", "-m", "side")
+        side = self._rev(git_store, "HEAD")
+        self._git(git_store, "commit", "-q", "--allow-empty", "-m", "side2")
+        self._git(git_store, "checkout", "-q", "-")
+        forge_commit_graph_parent(git_store / ".git", side, main_tip)
+        contains = ["for-each-ref", "--contains", main_tip, "--format=%(refname:short)", "refs/heads/"]
+        assert "side" in self._git(git_store, *contains).split()
+        assert "side" not in (broker.host_git(str(git_store), *contains) or "").split()
+
     def test_host_git_runs_with_both_variables_set(self, git_store, tmp_path, monkeypatch):
         monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))
         _fakebin(tmp_path, monkeypatch, git='echo "$GIT_NO_REPLACE_OBJECTS $GIT_GRAFT_FILE" >> "$FAKE_GIT_LOG"\n')
         broker.host_git(str(git_store), "rev-parse", "HEAD")
         assert (tmp_path / "git.log").read_text() == "1 /dev/null\n"
+
+    def test_host_git_runs_with_the_commit_graph_off(self, git_store, tmp_path, monkeypatch):
+        monkeypatch.setenv("FAKE_GIT_LOG", str(tmp_path / "git.log"))
+        _fakebin(tmp_path, monkeypatch, git='echo "$*" >> "$FAKE_GIT_LOG"\n')
+        broker.host_git(str(git_store), "rev-parse", "HEAD")
+        assert (tmp_path / "git.log").read_text() == f"-c core.commitGraph=false --git-dir {git_store}/.git rev-parse HEAD\n"
 
     def test_a_missing_session_branch_is_unresolved(self, git_store):
         assert broker.LabelCaller("t.other", "ticket", "").revision(str(git_store)) is None

@@ -21,6 +21,7 @@ from cld.vcs.scratch import (
     stage_from_env,
     stage_in_workspace,
 )
+from tests.conftest import forge_commit_graph_parent
 
 
 def _add_second_commit(path: Path) -> str:
@@ -760,6 +761,23 @@ class TestHostGitIgnoresReplaceRefsAndGrafts:
             env={**os.environ, "CLD_PROBE": "kept"},
         )
         assert shown.stdout.split() == ["kept", "/dev/null"]
+
+    def test_a_forged_commit_graph_does_not_show_a_fake_ancestor(self, git_repo):
+        """The graph is trusted for ancestry: a forged parent link answers `merge-base` and `--contains`."""
+        main_tip = _git(git_repo, "commit-tree", "-p", "HEAD", "-m", "main", "HEAD^{tree}")
+        _git(git_repo, "update-ref", "refs/heads/main-line", main_tip)
+        _git(git_repo, "checkout", "-q", "-b", "side")
+        _git(git_repo, "commit", "-q", "--allow-empty", "-m", "side")
+        side = _git(git_repo, "rev-parse", "HEAD")
+        _git(git_repo, "commit", "-q", "--allow-empty", "-m", "side2")
+        side_tip = _git(git_repo, "rev-parse", "HEAD")
+        forge_commit_graph_parent(git_repo.repo_root / ".git", side, main_tip)
+        plain = ["git", "-C", str(git_repo.repo_root), "merge-base", "--is-ancestor", main_tip, side_tip]
+        assert subprocess.run(plain, capture_output=True).returncode == 0
+
+        assert git_repo.run(["merge-base", "--is-ancestor", main_tip, side_tip]).returncode == 1
+        containing = git_repo.run(["for-each-ref", "--contains", main_tip, "--format=%(refname:short)", "refs/heads/"])
+        assert containing.stdout.split() == ["main-line"]
 
     def test_the_new_scratch_commit_takes_the_real_tree_of_the_target(self, git_repo, tmp_path):
         base, s_hash, target, _peer = _git_stage(git_repo, tmp_path)

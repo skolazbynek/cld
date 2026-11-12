@@ -480,6 +480,9 @@ _ESCAPES = {"n": "\n", "t": "\t", "b": "\b"}
 # and `<git dir>/info/grafts`, which show commit-tree and merge-base fake objects and parents.
 # STORE_ENV of cld/vcs/git.py.
 _STORE_GIT_ENV = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"}
+# In front of every host git command on a git store: the agent can write `objects/info/commit-graph`,
+# which git trusts for ancestry without reading the commits. STORE_GIT_FLAGS of cld/vcs/git.py.
+_STORE_GIT_FLAGS = ("-c", "core.commitGraph=false")
 
 
 def check_git_dir(repo: str, git_dir: str) -> None:
@@ -500,26 +503,35 @@ def check_git_dir(repo: str, git_dir: str) -> None:
         raise _unsafe_store(repo, f"{git_dir}/modules exists: git submodules are not supported yet")
 
 
-def _config_value(raw: str) -> str:
-    """A config value as git reads it: quotes and escapes resolved, an unquoted `#` or `;` starting a comment."""
-    value, quoted, chars = "", False, iter(raw)
-    for char in chars:
-        if char == "\\":
-            escaped = next(chars, "")
-            value += _ESCAPES.get(escaped, escaped)
-        elif char == '"':
-            quoted = not quoted
-        elif char in "#;" and not quoted:
-            break
-        else:
-            value += char
+def _config_value(raw: str | None, lines: Iterator[str]) -> str:
+    """A config value as git reads it: quotes and escapes resolved, an unquoted `#` or `;` starting a
+    comment. A backslash at the end of the line (also before a CRLF) continues the value in the next
+    of *lines*; a comment never continues."""
+    value, quoted = "", False
+    while raw is not None:
+        chars = iter(raw.removesuffix("\r"))
+        raw = None
+        for char in chars:
+            if char == "\\":
+                if (escaped := next(chars, None)) is None:
+                    raw = next(lines, None)
+                else:
+                    value += _ESCAPES.get(escaped, escaped)
+            elif char == '"':
+                quoted = not quoted
+            elif char in "#;" and not quoted:
+                break
+            else:
+                value += char
     return value.strip(_BLANK)
 
 
 def config_include_paths(data: bytes) -> list[str]:
-    """The values of `include.path` and `includeIf.<condition>.path` in the config *data*."""
+    """The values of `include.path` and `includeIf.<condition>.path` in the config *data*. A leading
+    byte-order mark is skipped, as git does."""
     section, found = "", []
-    for line in data.decode(errors="surrogateescape").split("\n"):
+    lines = iter(data.decode(errors="surrogateescape").removeprefix("\ufeff").split("\n"))
+    for line in lines:
         rest = line.lstrip(_BLANK)
         while rest and rest[0] not in "#;":
             if rest[0] == "[":
@@ -530,7 +542,7 @@ def config_include_paths(data: bytes) -> list[str]:
                 continue
             key = _CONFIG_KEY.match(rest)
             if key and key[2] is not None and key[1].lower() == "path" and section in ("include", "includeif"):
-                found.append(_config_value(key[2]))
+                found.append(_config_value(key[2], lines))
             break
     return found
 
@@ -552,9 +564,14 @@ def _planted_worktree_configs(repo: str, git_dir: str) -> list[str]:
         return found
     if kind != "dir":
         return [*found, f"{git_dir}/worktrees (not a directory)"]
-    with os.scandir(f"{repo}/{git_dir}/worktrees") as entries:
-        return found + sorted(f"{git_dir}/worktrees/{entry.name}/config.worktree" for entry in entries
-                              if _kind(f"{entry.path}/config.worktree") is not None)
+    try:
+        with os.scandir(f"{repo}/{git_dir}/worktrees") as entries:
+            return found + sorted(f"{git_dir}/worktrees/{entry.name}/config.worktree" for entry in entries
+                                  if _kind(f"{entry.path}/config.worktree") is not None)
+    except OSError as e:
+        return [*found, f"{git_dir}/worktrees (cannot be read: {e.strerror})"]
+    except StoreRefused:  # `_kind` of an entry
+        return [*found, f"{git_dir}/worktrees (cannot be read: an entry cannot be examined)"]
 
 
 def worktree_config_problem(repo: str, git_dir: str) -> str | None:
@@ -580,6 +597,10 @@ def worktree_config_problem(repo: str, git_dir: str) -> str | None:
     if planted := _planted_worktree_configs(repo, git_dir):
         return (f"{planted[0]} exists: the container can write it, and it becomes active once extensions.worktreeConfig "
                 "is turned on (core.sshCommand, core.fsmonitor, core.hooksPath). Check it, then delete it")
+    if _kind(f"{repo}/{git_dir}/shallow") is not None:
+        return (f"{git_dir}/shallow exists: the container can write it, and it cuts the history host git sees "
+                "(merge-base, for-each-ref --contains). Check it, then delete it; a truly shallow clone needs "
+                "`git fetch --unshallow` first")
     return None
 
 
@@ -642,10 +663,10 @@ def _git_only(repo: str) -> bool:
 def host_git(repo: str, *args: str) -> str | None:
     """stdout of host ``git --git-dir <repo>/.git <args>``, None if it failed. For a git-only repo
     (no ``.jj``) after the same store checks the runner mount makes, so git never loads the config
-    or hooks of a git dir the container can write, and with replace refs and grafts switched off
-    (`_STORE_GIT_ENV`). Raises StoreRefused."""
+    or hooks of a git dir the container can write, and with replace refs, grafts and the commit-graph
+    switched off (`_STORE_GIT_ENV`, `_STORE_GIT_FLAGS`). Raises StoreRefused."""
     layout = store_layout(repo)
-    return _out("git", "--git-dir", f"{repo}/{layout.git_dir}", *args, env={**os.environ, **_STORE_GIT_ENV})
+    return _out("git", *_STORE_GIT_FLAGS, "--git-dir", f"{repo}/{layout.git_dir}", *args, env={**os.environ, **_STORE_GIT_ENV})
 
 
 def git_branch_tip(repo: str, branch: str) -> str | None:

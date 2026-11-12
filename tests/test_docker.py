@@ -54,7 +54,7 @@ from cld.run import launch_run
 from cld.ticket import _bookmark_tip, forget_session_state, restart_ticket, start_ticket
 from cld.vcs import get_backend
 from cld.vcs.anchor import resolve_anchor
-from cld.vcs.git import check_worktree_config
+from cld.vcs.git import check_git_store, check_worktree_config, config_include_paths
 from cld.vcs.jj import COMMONDIR_PLACEHOLDER, JJ_ID_FILES, check_git_dir, check_jj_ids
 
 
@@ -2285,14 +2285,63 @@ class TestStorePreflight:
             assert prepare_store_mounts(repo, "api").jj
         assert f"{_GIT_DIRS[layout_id]}/config.worktree exists" in caplog.text
 
+    def test_a_shallow_file_is_refused_on_a_git_only_store(self, store_repo):
+        """`GIT_GRAFT_FILE` does not switch it off: host git would read the cut history."""
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        (repo / ".git/shallow").write_text("")
+        message = _refusal(repo)
+        assert ".git/shallow exists" in message and "git fetch --unshallow" in message
+        assert ".git/shallow exists" in check_git_store(repo)
+
+    @pytest.mark.parametrize("layout_id", ["colocated", "internal"])
+    def test_a_shallow_file_on_a_jj_store_only_warns(self, bare_repo, fake_jj, caplog, layout_id):
+        found, repo = bare_repo
+        if found != layout_id:
+            pytest.skip("other layout")
+        (repo / ".jj/repo/config-id").write_text("id")
+        (repo / ".jj/workspace-config-id").write_text("id")
+        (repo / _GIT_DIRS[layout_id] / "shallow").write_text("")
+        with caplog.at_level(logging.WARNING, logger="cld"):
+            assert prepare_store_mounts(repo, "api").jj
+        assert f"{_GIT_DIRS[layout_id]}/shallow exists" in caplog.text
+
+    def test_an_unreadable_worktrees_folder_is_refused_on_a_git_only_store(self, store_repo, unreadable_dir):
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        unreadable_dir(repo / ".git/worktrees")
+        assert ".git/worktrees (cannot be read: Permission denied) exists" in _refusal(repo)
+        assert "cannot be read" in check_git_store(repo)
+
+    @pytest.mark.parametrize("layout_id", ["colocated", "internal"])
+    def test_an_unreadable_worktrees_folder_on_a_jj_store_only_warns(
+        self, bare_repo, fake_jj, caplog, unreadable_dir, layout_id,
+    ):
+        found, repo = bare_repo
+        if found != layout_id:
+            pytest.skip("other layout")
+        (repo / ".jj/repo/config-id").write_text("id")
+        (repo / ".jj/workspace-config-id").write_text("id")
+        unreadable_dir(repo / _GIT_DIRS[layout_id] / "worktrees")
+        with caplog.at_level(logging.WARNING, logger="cld"):
+            assert prepare_store_mounts(repo, "api").jj
+        assert f"{_GIT_DIRS[layout_id]}/worktrees (cannot be read" in caplog.text
+
     INCLUDES = [
         ("[include]\n\tpath = evil.cfg\n", "evil.cfg"),
         ('[includeIf "gitdir:**"]\n\tpath = ./evil.cfg\n', "./evil.cfg"),
         ("[INCLUDE]\r\n\tPath = \"evil.cfg\" ; comment\r\n", "evil.cfg"),
         ("[include] path = evil.cfg\n", "evil.cfg"),
+        ("[include]\n\tpath = ../\\\n.git/evil.cfg\n", "../.git/evil.cfg"),
+        ("[include]\r\n\tpath = ../\\\r\n.git/evil.cfg\r\n", "../.git/evil.cfg"),
     ]
 
-    @pytest.mark.parametrize("config, value", INCLUDES, ids=["relative", "include-if", "crlf-quoted", "same-line"])
+    @pytest.mark.parametrize(
+        "config, value", INCLUDES,
+        ids=["relative", "include-if", "crlf-quoted", "same-line", "continuation", "continuation-crlf"],
+    )
     def test_an_include_inside_the_git_dir_is_refused_on_a_git_only_store(self, store_repo, config, value):
         """Real git reads the included file, relative to the git dir, so its settings reach host git."""
         layout_id, repo = store_repo
@@ -2306,6 +2355,45 @@ class TestStorePreflight:
         ).stdout.strip() == "evil"
         message = _refusal(repo)
         assert f".git/config includes '{value}'" in message and "inside the git dir" in message
+
+    def test_an_include_behind_a_byte_order_mark_is_refused_on_a_git_only_store(self, store_repo):
+        """Real git skips a byte-order mark at the start of the config, so the include is read."""
+        layout_id, repo = store_repo
+        if layout_id != "git-only":
+            pytest.skip("only a git-only store has host git run on it")
+        (repo / ".git/evil.cfg").write_text("[core]\n\tsshCommand = evil\n")
+        config = repo / ".git/config"
+        config.write_bytes(b"\xef\xbb\xbf[include]\n\tpath = evil.cfg\n" + config.read_bytes())
+        assert subprocess.run(
+            ["git", "config", "core.sshCommand"], cwd=repo, capture_output=True, text=True,
+        ).stdout.strip() == "evil"
+        assert ".git/config includes 'evil.cfg'" in _refusal(repo)
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            b"\xef\xbb\xbf[include]\n\tpath = evil.cfg\n",
+            b"[include]\n\tpath = ../\\\n.git/evil.cfg\n",
+            b"[include]\r\n\tpath = ../\\\r\n.git/evil.cfg\r\n",
+            b'[include]\n\tpath = "../\\\n.git/evil.cfg"\n',
+            b"[include]\n\tpath = a\\\nb\\\nc\n[include]\n\tpath = d\n",
+            b"[core]\n\t# comment \\\n[include]\n\tpath = evil.cfg\n",
+            b"[include]\n\tpath = a # comment \\\n[include]\n\tpath = evil.cfg\n",
+            b"[include]\n\tpath = a\\\\\n[include]\n\tpath = evil.cfg\n",
+            b"[core]\n\t# comment \\\n[include]\n\tpath = ../\\\n.git/evil.cfg\n",
+        ],
+        ids=["bom", "continuation", "continuation-crlf", "continuation-quoted", "continued-twice",
+             "comment-does-not-continue", "value-comment-does-not-continue", "escaped-backslash",
+             "after-a-comment"],
+    )
+    def test_include_paths_are_what_git_reads(self, tmp_path, config):
+        file = tmp_path / "config"
+        file.write_bytes(config)
+        read = subprocess.run(
+            ["git", "config", "--file", str(file), "--null", "--get-all", "include.path"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split("\0")[:-1]
+        assert config_include_paths(config) == read
 
     def test_an_absolute_include_inside_the_git_dir_is_refused(self, store_repo):
         layout_id, repo = store_repo
