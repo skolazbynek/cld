@@ -107,7 +107,7 @@ result bookmark. New rule:
 | Broker caller id, `~/.cld/broker-jobs/<id>/`, `gql-<id>` | `<id>` |
 | Anchor marker `cld anchor: <id> mode=...` | `<id>` |
 | git anchor pin, hidden ref (`names.anchor_ref`; copied in `vcs-lib.sh`) | `refs/cld/anchor/<id>` |
-| git archive of the session branch tip at shutdown (`names.ended_ref`) | `refs/cld/ended/<id>/<UTC stamp>`; detached-HEAD work `.../<stamp>-detached` |
+| git archive of the session branch tip at shutdown (`names.ended_ref`) | `refs/cld/ended/<id>/<UTC stamp>`; detached-HEAD work `.../<stamp>-detached` (also written by a reattach boot, in `vcs-lib.sh`, before it drops a lost worktree's registration); create-only |
 | Telemetry `service.name` | `<id>` (history restarts under the new name) |
 | `agent-output-<id>/` in run and chain commits | `<id>` |
 | `.cld/chains/<id>/` state folder, `chain-outputs/<chain>/` | chain `<id>` / `<chain>` |

@@ -298,7 +298,8 @@ starts from the product logic:
    watchman debounce is empirically under ~6 s. v1 docs call N-writer
    contention "the most likely place this POC surprises us"; v2 shifts the
    shape (N repos × 1 container) but does not resolve it.
-3. **Carried overlap-check gaps**: git backends skipped entirely, fail-open on
+3. **Carried overlap-check gaps**: git backends skipped (git has the scratch
+   commit now, but no reach model over it; see gap 8), fail-open on
    revset errors, exact-string repo path matching (symlinks bypass),
    running-containers-only, check-then-launch race. Should be fixed while the
    check is touched for per-repo labels; not designed here.
@@ -314,8 +315,12 @@ starts from the product logic:
 7. **Registry renames** orphan persisted manifests (manifest stores name +
    path; a rename changes the subdir name on next recreate).
 8. **Mixed jj/git repo sets** are allowed (per-repo backend detection exists),
-   but git repos get weaker guarantees everywhere (no overlap check, worktree
-   semantics); state this in user-facing docs.
+   but git repos get narrower guarantees (narrowed: docs/design-ticket-containers.md
+   section 3). A git ticket has the scratch commit pinned by `refs/cld/anchor/<id>`,
+   the guard's file-write and drift checks, `--reanchor` and broker tests/GraphQL on
+   committed work. Still jj only: the overlap check, watchman snapshots (only commits
+   persist), commit immutability and git command parsing in the guard, task-agents,
+   and broker `run`/`chain`. State this in user-facing docs (README *Git users*).
 9. **Docs drift to clean with v2**: README's stale workspace claims
    (`.cld/workspaces/<session>`, `cleanup-workspace.sh` — neither exists), the
    scratch.py-vs-entrypoint anchor contradiction, and the retired

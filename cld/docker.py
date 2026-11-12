@@ -1229,9 +1229,12 @@ def resolve_anchor_checked(
     whose manifest cannot be read has unknown repo paths, so it counts as
     unverifiable against *every* repo checked, with the same block/warn split.
 
-    jj-only -- peer-side anchor staging has no git equivalent; git repos keep
-    weaker guarantees. Anchoring on a finished (reaped) sibling's deliverable
-    branch still passes in either mode.
+    jj-only: the overlap check itself skips a git repo (no reach model over
+    the git scratch commit), so two git tickets, or a git ticket and a
+    headless container, are never compared. A git ticket does get its scratch
+    commit (staged in the container, pinned by ``refs/cld/anchor/<id>``), the
+    guard's file-write and drift checks and ``--reanchor``. Anchoring on a
+    finished (reaped) sibling's deliverable branch still passes in either mode.
 
     ``exclude_session``, when set, drops the occupant record whose ``name``
     matches it before the check runs -- a ticket reanchoring itself must not

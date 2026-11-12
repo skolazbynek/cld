@@ -97,6 +97,14 @@ container that mounts a store uses this set (3.4 and section 5).
 3. `git_target`, resolved against `H/.jj/repo/store`, must be `H/.git` or `H/.jj/repo/store/git`.
 4. `G/hooks` missing: create it empty (0755).
 5. `lstat` every source. Refuse a symlink, or a dir where a file is expected, or the reverse.
+6. git-only store: refuse when `.git/config` sets `extensions.worktreeConfig` (any value, any letter
+   case). Host git then also reads `.git/config.worktree` and `.git/worktrees/*/config.worktree`, which
+   no row protects: a container could set `core.hooksPath` (a planted `reference-transaction` hook ran on
+   host `update-ref`, `branch -D`) or `core.fsmonitor` (fires on read commands) and have the host act on
+   it. The key is read by the file, with no git or jj run (`cld/vcs/git.py:check_worktree_config`). jj
+   stores are not refused: no host git hook runs there. Host git also runs no hook on the ref changes
+   of shutdown and `--reanchor` (`-c core.hooksPath=/dev/null`, defense in depth), and none of the host
+   git calls of a git ticket (shutdown, the branch lookup) run on a store that fails this check.
 
 Refusal: `cld: repo '<name>': <reason> -- cannot mount its store safely`, exit 1, no container.
 
@@ -149,7 +157,7 @@ can write is mounted anyway. Remaining mounts: `home_mounts_always`, SSL certs, 
 
 `run_tests` (`broker/cld-broker.py:457-464`) and `do_graphql_start` (`:995-1011`) replace
 `-v <repo>:/repo` with the 3.1 set at `R=/repo`, built by the broker's own
-`store_mounts(repo, "/repo")` (it cannot import cld). It runs preflight steps 1, 3 and 5, and only
+`store_mounts(repo, "/repo")` (it cannot import cld). It runs preflight steps 1, 3, 5 and 6, and only
 the check in step 2: it creates nothing and never runs `jj config`, keeping its store-reading
 posture. A missing id or `hooks` gives exit 3: `denied: <repo> store is not prepared -- start a
 ticket on it once`. Every host `jj` call the broker makes on a repo (`:235`, `:344`, `:382`, and
@@ -235,8 +243,9 @@ Docker resolves only the copy's path, which no container can write. Callers that
   the profile's reviewed revision (profile 5.2). jj config is out of reach (rows 4 and 10; user
   config is never mounted), except an alias planted earlier by a full-checkout container and
   already migrated into host config; the check in section 9 finds it.
-- Submodules are refused (13). `.git/info`, `config.worktree` and `objects/info/alternates`
-  stay writable.
+- Submodules are refused (13). `.git/info` and `objects/info/alternates` stay writable.
+  `config.worktree` stays writable too, so a git-only store that turns on `extensions.worktreeConfig`
+  is refused (3.2 step 6).
 - Tracked or once-committed `.env` files are in the store (A7).
 
 ## 8. What breaks or changes for users
@@ -380,7 +389,8 @@ Deviations from the sections above. Host checks: `MANUAL_TESTS.md` section 10.
 
 - **Row 11** (`G/commondir`, read-only, holds `.`) is new; the preflight creates it.
 - **More refusals, all before any host jj:** a foreign `commondir`; a `G/modules` dir (submodules
-  are not supported yet); any container that mounts the repo without the `store-v1` label (a
+  are not supported yet); on a git-only store, `extensions.worktreeConfig` in `.git/config` (3.2 step 6,
+  also in the broker's `store_layout`, so `host_git` and the runner mounts refuse it); any container that mounts the repo without the `store-v1` label (a
   refusal, not the warning of 3.4). `claude-base` also carries `org.cld.boot-api=2`.
 - **`ignore_gitignore` is off.** D6 and 4.1 were not built. Listed files are skipped with a
   warning, and `link_workspace_files` is removed.

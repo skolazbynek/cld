@@ -150,8 +150,17 @@ revision defaults to `@`, the repo's working copy on the host. Refuses on a live
 the scratch commit is immutable, so a new empty one is committed on the target host-side (`git commit-tree`),
 and `refs/cld/anchor/<id>` moves onto it with a compare-and-swap; it refuses a scratch commit that carries
 changes and a ticket with no anchor ref. The session branch follows only when it still points at the old
-scratch commit. A branch with work stays on it, and `cld restart` prints the `git rebase --onto <new> <old>
-<branch>` to run in the container. Unlike jj, the other children of the target are not moved.
+scratch commit. Work that stays on the old one -- a session branch with work, another branch (`<id>.mr`), a
+detached HEAD -- would be resumed outside the anchor tree by the next reattach, where the guard blocks every
+write, so `cld restart` works out every such ref from the ticket's worktree registration
+(`git worktree list --porcelain`) and every local branch holding a scratch commit of the ticket outside the
+history of the new one, and prints one `git rebase --onto <new> <old> [<branch>]` for each, with where to run
+it (in the ticket worktree for what it has checked out). A target that is the old scratch commit or builds on
+it is refused: jj moves S into its own descendants by rewriting them, git never rewrites the agent's commits.
+The printed undo is a reanchor onto the old base, which commits a new scratch commit again (the same one,
+within the same second) and gets its own hints. Unlike jj, the other children of the target are not moved.
+The host commands that change refs run with `-c core.hooksPath=/dev/null`, and `commit-tree` with
+`commit.gpgsign=false`.
 
 ## 3. The effective-anchor problem
 
@@ -206,7 +215,10 @@ Why this beats the two channels the spec named:
   check runs host-side and manifest `path` is the host path.
 - Git repos have the same scratch commit, found through `refs/cld/anchor/<id>` (isolated: S, shared: S's
   parent), but the overlap check still skips the git backend (no `merge-base` reach model), so no
-  effective anchor is derived there. Git stays weaker for that (spec gap 8, narrowed).
+  effective anchor is derived there. Git stays weaker for that (spec gap 8, narrowed): a git ticket has
+  the scratch commit, the guard's file-write and drift checks, `--reanchor` and broker tests on committed
+  work; the overlap check, watchman snapshots, the commit immutability layer, git command parsing in the
+  guard, task-agents and broker `run`/`chain` are still jj only.
 
 ## 4. Boot contract
 
@@ -254,7 +266,9 @@ For each manifest entry, in manifest order:
    or the branch existing in the store: the worktree is re-added on the branch (or the detached HEAD) of
    this session's own stale registration, else on the branch, else on a new branch at the anchor ref. There is
    no blanket `git worktree prune` -- the store is shared with other tickets whose worktree paths do not
-   exist in this container -- only this session's own stale registration is removed. First launch resolves
+   exist in this container -- only this session's own stale registration is removed, after a detached HEAD
+   holding commits nothing else holds is archived (`refs/cld/ended/t.<slug>/<stamp>-detached`, the name
+   shutdown uses), so a failed add loses nothing. First launch resolves
    `<anchor_base>` to a commit, adds the worktree and stages S (below). A ticket with a branch but no anchor
    ref (from before the scratch commit) reattaches with the base as anchor and a warning.
 3. First launch only: stage scratch B via
@@ -264,7 +278,9 @@ For each manifest entry, in manifest order:
    v2 tickets have no brief, so the envelope wire is dead weight for them; B's
    shape (payload file + `cld anchor: <session> mode=<mode>` description) is
    unchanged, per the §8 ruling. On git the same module commits S in the worktree (`git commit
-   --allow-empty --no-verify`, signing off) and pins it with `refs/cld/anchor/<session>` (created only if
+   --allow-empty --no-verify`, signing off; a missing name or email falls back to `cld` / `cld@localhost`,
+   only when `git config` reads it empty, so a host identity that does not reach the container never
+   fails the boot) and pins it with `refs/cld/anchor/<session>` (created only if
    absent). The ref lives outside `refs/heads` on purpose, so no branch list shows it and `git push --all`
    skips it; the session branch moves with the work, so the ref is how a restart finds S. If staging fails
    the worktree and branch are removed, so the next boot is a clean first launch.

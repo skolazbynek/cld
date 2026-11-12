@@ -690,7 +690,9 @@ resolve_task_agent_anchor(cfg: Config, repo_root: Path, revision: str) -> str
   values for every **running** task-agent in **this repo** (§C.3), drop empties, and run
   one revset (`X & (a1:: | a2:: | …)`). Non-empty → `RuntimeError` naming the owning agent
   and telling the caller to reap it first. Returns `X` so the caller doesn't resolve twice.
-  jj-only: on a git backend, log and skip (peer-side staging is jj-only anyway).
+  jj-only: on a git backend, log and skip. (The note "peer-side staging is jj-only anyway" is
+  superseded: a git ticket now stages a scratch commit too, see docs/design-ticket-containers.md
+  section 3; the overlap check and task-agents are still jj only.)
 
 **6. Entrypoint (`imgs/claude-devcontainer/entrypoint-claude-devcontainer.sh`)**
 

@@ -201,7 +201,8 @@ name unconfirmed in the docs, read both). Resolve with `realpath`.
    write lands in the working tree, never in `HEAD`, so `HEAD` in `A::` is
    the analogue of jj's `@` in `A+::`. (Before, a strict descendant was
    required and every first edit was refused.) A `HEAD` or anchor that does
-   not resolve (an amended or dropped scratch commit) also denies.
+   not resolve (an amended or dropped scratch commit) also denies, with a reason that names the failed
+   check: an error escaping the hook would exit 1, which does not block the write.
 4. Anything else (scratchpad, `~/.claude`, `/tmp`, the host mount via a
    symlink) → allow. The host repo mount is out of scope by decision.
 
